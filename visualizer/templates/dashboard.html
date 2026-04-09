@@ -1,0 +1,170 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Galao{% endblock %}
+{% block content %}
+
+<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
+  <button id="btn-test" onclick="sendTestTrades()"
+    style="background:#1a3a1a;color:#3fb950;border:1px solid #3fb950;padding:5px 14px;
+           border-radius:4px;cursor:pointer;font-family:monospace;font-size:12px;font-weight:bold">
+    Send Test
+  </button>
+  <span id="test-status" style="font-size:12px;color:#8b949e"></span>
+</div>
+
+<div class="card-row" style="margin-bottom:12px">
+  <div class="stat-card"><div class="val" id="s-pending">--</div><div class="lbl">PENDING</div></div>
+  <div class="stat-card"><div class="val" id="s-submitted">--</div><div class="lbl">SUBMITTED</div></div>
+  <div class="stat-card"><div class="val" id="s-filled">--</div><div class="lbl">FILLED</div></div>
+  <div class="stat-card"><div class="val" id="s-closed">--</div><div class="lbl">CLOSED TODAY</div></div>
+  <div class="stat-card"><div class="val" id="s-errors">--</div><div class="lbl">ERRORS</div></div>
+  <div class="stat-card" style="min-width:180px">
+    <div class="val" id="s-pnl" style="font-size:16px">--</div>
+    <div class="lbl">UNREALIZED P&L (pts)</div>
+  </div>
+</div>
+
+<div style="display:flex;gap:16px;align-items:flex-start">
+
+  <!-- ── Price Ladder ───────────────────────────────────────────── -->
+  <div class="card" style="min-width:380px;flex:0 0 380px">
+    <h2>Price Ladder <span id="refresh-indicator" style="font-size:10px;color:#6e7681"></span></h2>
+    <div id="ladder" class="ladder" style="margin-top:8px">
+      <div style="color:#6e7681;font-size:11px">Loading...</div>
+    </div>
+  </div>
+
+  <!-- ── Active commands ───────────────────────────────────────── -->
+  <div class="card" style="flex:1;overflow-x:auto">
+    <h2>Active Commands</h2>
+    <table>
+      <thead><tr>
+        <th>ID</th><th>Sym</th><th>Dir</th><th>Type</th>
+        <th>Entry</th><th>TP</th><th>SL</th><th>Bkt</th>
+        <th>Status</th><th>Fill</th><th>Updated</th>
+      </tr></thead>
+      <tbody id="active-tbody"></tbody>
+    </table>
+  </div>
+
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+function activeRow(r){
+  const upd = r.updated_at ? r.updated_at.slice(11,19) : '';
+  return `<tr>
+    <td>${r.id}</td>
+    <td>${r.symbol}</td>
+    <td>${dir(r.direction)}</td>
+    <td>${et(r.entry_type)}</td>
+    <td>${r.entry_price}</td>
+    <td>${r.tp_price}</td>
+    <td>${r.sl_price}</td>
+    <td>${r.bracket_size}</td>
+    <td>${badge(r.status)}</td>
+    <td>${fmt(r.fill_price)}</td>
+    <td class="ts">${upd}</td>
+  </tr>`;
+}
+
+autoRefreshTable(
+  '/api/commands?status_in=PENDING,SUBMITTING,SUBMITTED,FILLED&limit=30',
+  'active-tbody', activeRow, 5000
+);
+
+function refreshStats(){
+  fetch('/api/stats').then(r=>r.json()).then(d=>{
+    document.getElementById('s-pending').textContent   = d.PENDING   || 0;
+    document.getElementById('s-submitted').textContent = (d.SUBMITTED||0)+(d.SUBMITTING||0);
+    document.getElementById('s-filled').textContent    = d.FILLED    || 0;
+    document.getElementById('s-closed').textContent    = d.CLOSED    || 0;
+    document.getElementById('s-errors').textContent    = d.ERROR     || 0;
+    const pnl = d.unrealized_pnl;
+    const el = document.getElementById('s-pnl');
+    el.textContent = pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) : '--';
+    el.className = 'val ' + (pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : '');
+  });
+}
+refreshStats();
+setInterval(refreshStats, 5000);
+
+function refreshLadder(){
+  fetch('/api/nearby').then(r=>r.json()).then(d=>{
+    const el = document.getElementById('ladder');
+    if(!d.lines || !d.lines.length){
+      el.innerHTML = '<div style="color:#6e7681;font-size:11px">No critical lines loaded</div>';
+      return;
+    }
+    const price = d.price;
+    let html = '';
+
+    // Sort all lines by price descending (resistance above, support below)
+    const sorted = [...d.lines].sort((a,b) => b.line.price - a.line.price);
+
+    sorted.forEach(item => {
+      const lp   = item.line.price;
+      const dist = (lp - price).toFixed(2);
+      const sign = dist >= 0 ? '+' : '';
+      const isCurrent = Math.abs(lp - price) < 1.0;
+      const distClass = dist >= 0 ? 'above' : 'below';
+      const lineClass = item.line.line_type;
+
+      // Build command pills
+      const cmds = item.commands || [];
+      const pills = cmds.slice(0,4).map(c =>
+        `<span class="badge ${c.status}" title="${c.direction} ${c.entry_type} #${c.id}">`+
+        `${c.direction[0]}${c.entry_type[0]} #${c.id}</span>`
+      ).join(' ');
+
+      html += `<div class="ladder-row ${lineClass} ${isCurrent?'current':''}">
+        <span class="ladder-price">${lp.toFixed(2)}</span>
+        <span class="ladder-dist ${distClass}">${sign}${dist}</span>
+        <span class="ladder-type">${item.line.line_type.slice(0,4)} S${item.line.line.strength}</span>
+        <span class="ladder-cmds">${pills || '<span style="color:#6e7681;font-size:10px">no cmds</span>'}</span>
+      </div>`;
+    });
+
+    // Current price marker
+    // Insert in correct position (already sorted above, marker shown via 'current' class)
+    el.innerHTML = `<div style="font-size:11px;color:#8b949e;margin-bottom:6px">
+      Dist from <b style="color:#3fb950">${price ? price.toFixed(2) : '--'}</b></div>` + html;
+    document.getElementById('refresh-indicator').textContent = new Date().toTimeString().slice(0,8);
+  });
+}
+refreshLadder();
+setInterval(refreshLadder, 5000);
+
+function sendTestTrades(){
+  const btn = document.getElementById('btn-test');
+  const st  = document.getElementById('test-status');
+  btn.disabled = true;
+  btn.textContent = 'Sending...';
+  st.style.color = '#8b949e';
+  st.textContent = '';
+
+  fetch('/api/test-trades', {method:'POST'})
+    .then(r => r.json())
+    .then(d => {
+      if(d.error){
+        st.style.color = '#f85149';
+        st.textContent = '✗ ' + d.error;
+      } else {
+        st.style.color = '#3fb950';
+        const summary = d.commands.map(c =>
+          `#${c.id} ${c.direction} ${c.entry_type} @${c.entry_price}`
+        ).join('  |  ');
+        st.textContent = `✓ ${d.count} orders inserted near ${d.price.toFixed(2)} — ${summary}`;
+      }
+    })
+    .catch(e => {
+      st.style.color = '#f85149';
+      st.textContent = '✗ ' + e;
+    })
+    .finally(() => {
+      btn.disabled = false;
+      btn.textContent = 'Send Test';
+    });
+}
+</script>
+{% endblock %}

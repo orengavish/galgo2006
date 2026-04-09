@@ -1,0 +1,641 @@
+"""
+visualizer/app.py
+Flask web app for Galao monitoring.
+
+Routes:
+  GET /           -> dashboard (session state, positions, orders)
+  GET /orders     -> all commands table
+  GET /logs       -> log viewer (filterable by level, component)
+  GET /preflight  -> last preflight results
+  GET /release-notes -> release notes reader
+
+  API (JSON):
+  GET /api/state         -> system_state table
+  GET /api/commands      -> commands (filterable ?status=FILLED&symbol=MES)
+  GET /api/positions     -> open positions
+  GET /api/ib-events     -> IB events log
+  GET /api/logs          -> log file contents (?component=broker&level=ERROR)
+  GET /api/preflight     -> last preflight results
+
+Usage:
+    python visualizer/app.py                # run server
+    python visualizer/app.py --self-test    # headless test
+
+Self-test:
+    python visualizer/app.py --self-test
+"""
+
+import sys
+import argparse
+from pathlib import Path
+from datetime import datetime, timezone
+
+# Add project root to path when run directly
+_HERE = Path(__file__).parent
+_ROOT = _HERE.parent
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
+
+from flask import Flask, jsonify, request, render_template_string
+from lib.config_loader import get_config
+from lib.logger import get_logger
+from lib.db import get_db, init_db
+
+log = get_logger("visualizer")
+
+app = Flask(__name__, template_folder="templates", static_folder="static")
+_cfg = None
+_db_path = None
+
+
+def _get_cfg():
+    global _cfg
+    if _cfg is None:
+        _cfg = get_config()
+    return _cfg
+
+
+def _get_db_path():
+    global _db_path
+    if _db_path is None:
+        _db_path = Path(_get_cfg().paths.db)
+    return _db_path
+
+
+def _rows_to_list(rows) -> list:
+    return [dict(r) for r in rows]
+
+
+# ── API routes ────────────────────────────────────────────────────────────────
+
+@app.route("/api/state")
+def api_state():
+    with get_db(_get_db_path()) as con:
+        rows = con.execute("SELECT * FROM system_state ORDER BY key").fetchall()
+    return jsonify(_rows_to_list(rows))
+
+
+@app.route("/api/commands")
+def api_commands():
+    status = request.args.get("status")
+    symbol = request.args.get("symbol")
+    limit  = int(request.args.get("limit", 200))
+
+    query  = "SELECT * FROM commands WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status=?"
+        params.append(status)
+    if symbol:
+        query += " AND symbol=?"
+        params.append(symbol)
+    query += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(query, params).fetchall()
+    return jsonify(_rows_to_list(rows))
+
+
+@app.route("/api/positions")
+def api_positions():
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(
+            "SELECT * FROM positions WHERE status='OPEN' ORDER BY id DESC"
+        ).fetchall()
+    return jsonify(_rows_to_list(rows))
+
+
+@app.route("/api/ib-events")
+def api_ib_events():
+    limit = int(request.args.get("limit", 100))
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(
+            "SELECT * FROM ib_events ORDER BY id DESC LIMIT ?", (limit,)
+        ).fetchall()
+    return jsonify(_rows_to_list(rows))
+
+
+@app.route("/api/preflight")
+def api_preflight():
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(
+            "SELECT * FROM system_state WHERE key LIKE 'preflight_%' ORDER BY key"
+        ).fetchall()
+    results = {}
+    for row in rows:
+        parts = row["value"].split("|", 2)
+        results[row["key"]] = {
+            "status":  parts[0] if len(parts) > 0 else "",
+            "time":    parts[1] if len(parts) > 1 else "",
+            "detail":  parts[2] if len(parts) > 2 else "",
+        }
+    return jsonify(results)
+
+
+@app.route("/api/release-notes")
+def api_release_notes():
+    program = request.args.get("program")
+    query  = "SELECT * FROM release_notes WHERE 1=1"
+    params = []
+    if program:
+        query += " AND program=?"
+        params.append(program)
+    query += " ORDER BY id DESC"
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(query, params).fetchall()
+    return jsonify(_rows_to_list(rows))
+
+
+@app.route("/api/logs")
+def api_logs():
+    """Return last N lines from a component's log file, optionally filtered by level."""
+    component = request.args.get("component", "broker")
+    level     = request.args.get("level", "").upper()
+    limit     = int(request.args.get("limit", 200))
+
+    cfg = _get_cfg()
+    log_path = Path(cfg.paths.logs) / f"{component}.log"
+    if not log_path.exists():
+        return jsonify({"lines": [], "error": f"Log file not found: {log_path.name}"})
+
+    with open(log_path, encoding="utf-8", errors="replace") as f:
+        all_lines = f.readlines()
+
+    if level:
+        all_lines = [l for l in all_lines if f"| {level}" in l]
+
+    lines = all_lines[-limit:]
+    return jsonify({"component": component, "level": level,
+                    "count": len(lines), "lines": lines})
+
+
+# ── HTML routes ───────────────────────────────────────────────────────────────
+
+_DASHBOARD_TMPL = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="refresh" content="10">
+  <title>Galao Dashboard</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 20px; }
+    h1   { color: #58a6ff; }
+    h2   { color: #79c0ff; margin-top: 30px; }
+    a    { color: #58a6ff; }
+    table { border-collapse: collapse; width: 100%; margin-top: 8px; }
+    th   { background: #161b22; color: #8b949e; padding: 6px 10px; text-align: left; }
+    td   { padding: 5px 10px; border-top: 1px solid #21262d; font-size: 13px; }
+    .PASS, .RUNNING { color: #3fb950; }
+    .FAIL, .ERROR   { color: #f85149; }
+    .SKIP, .PENDING { color: #d29922; }
+    .SUBMITTED, .FILLED { color: #58a6ff; }
+    .CLOSED     { color: #8b949e; }
+    .nav { margin-bottom: 20px; }
+    .nav a { margin-right: 16px; }
+    .badge { padding: 2px 8px; border-radius: 10px; font-size: 11px;
+             background: #21262d; }
+  </style>
+</head>
+<body>
+  <h1>Galao System Dashboard</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/orders">All Orders</a>
+    <a href="/logs">Logs</a>
+    <a href="/preflight">Pre-flight</a>
+    <a href="/release-notes">Release Notes</a>
+  </div>
+
+  <h2>System State</h2>
+  <table>
+    <tr><th>Key</th><th>Value</th><th>Updated</th></tr>
+    {% for row in state %}
+    <tr>
+      <td>{{ row.key }}</td>
+      <td class="{{ row.value.split('|')[0] }}">{{ row.value }}</td>
+      <td>{{ row.updated_at }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <h2>Active Commands (last 50)</h2>
+  <table>
+    <tr><th>ID</th><th>Symbol</th><th>Dir</th><th>Type</th>
+        <th>Entry</th><th>TP</th><th>SL</th><th>Bracket</th>
+        <th>Status</th><th>Fill</th><th>Updated</th></tr>
+    {% for cmd in commands %}
+    <tr>
+      <td>{{ cmd.id }}</td>
+      <td>{{ cmd.symbol }}</td>
+      <td>{{ cmd.direction }}</td>
+      <td>{{ cmd.entry_type }}</td>
+      <td>{{ cmd.entry_price }}</td>
+      <td>{{ cmd.tp_price }}</td>
+      <td>{{ cmd.sl_price }}</td>
+      <td>{{ cmd.bracket_size }}</td>
+      <td class="{{ cmd.status }}"><span class="badge">{{ cmd.status }}</span></td>
+      <td>{{ cmd.fill_price or '' }}</td>
+      <td>{{ cmd.updated_at }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+
+  <p style="color:#8b949e; font-size:12px; margin-top:30px;">
+    Auto-refresh every 10s &bull;
+    {{ now }}
+  </p>
+</body>
+</html>"""
+
+
+@app.route("/")
+def dashboard():
+    with get_db(_get_db_path()) as con:
+        state = _rows_to_list(con.execute(
+            "SELECT * FROM system_state WHERE key NOT LIKE 'preflight_%' ORDER BY key"
+        ).fetchall())
+        commands = _rows_to_list(con.execute(
+            "SELECT * FROM commands WHERE status NOT IN ('CLOSED','CANCELLED')"
+            " ORDER BY id DESC LIMIT 50"
+        ).fetchall())
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+    return render_template_string(_DASHBOARD_TMPL,
+                                  state=state, commands=commands, now=now)
+
+
+_ORDERS_TMPL = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Galao Orders</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 20px; }
+    h1 { color: #58a6ff; }
+    a  { color: #58a6ff; }
+    .nav { margin-bottom: 20px; }
+    .nav a { margin-right: 16px; }
+    table { border-collapse: collapse; width: 100%; }
+    th { background: #161b22; color: #8b949e; padding: 6px 10px; text-align: left; }
+    td { padding: 5px 10px; border-top: 1px solid #21262d; font-size: 12px; }
+    .PASS,.RUNNING,.CLOSED { color: #3fb950; }
+    .FAIL,.ERROR { color: #f85149; }
+    .PENDING { color: #d29922; }
+    .FILLED,.SUBMITTED { color: #58a6ff; }
+    select, input { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+                    padding: 4px 8px; margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h1>All Orders</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/orders">All Orders</a>
+    <a href="/logs">Logs</a>
+    <a href="/preflight">Pre-flight</a>
+    <a href="/release-notes">Release Notes</a>
+  </div>
+  <form method="get">
+    Status: <select name="status">
+      <option value="">All</option>
+      {% for s in statuses %}
+      <option value="{{ s }}" {% if s == current_status %}selected{% endif %}>{{ s }}</option>
+      {% endfor %}
+    </select>
+    Symbol: <input type="text" name="symbol" value="{{ current_symbol }}" size="6">
+    <button type="submit">Filter</button>
+  </form>
+  <p>{{ commands|length }} row(s)</p>
+  <table>
+    <tr><th>ID</th><th>Created</th><th>Symbol</th><th>Line</th><th>Type</th>
+        <th>Dir</th><th>Entry</th><th>TP</th><th>SL</th><th>Bracket</th><th>Strength</th>
+        <th>Status</th><th>Fill</th><th>Exit</th><th>PnL</th><th>Reason</th></tr>
+    {% for cmd in commands %}
+    <tr>
+      <td>{{ cmd.id }}</td>
+      <td>{{ cmd.created_at }}</td>
+      <td>{{ cmd.symbol }}</td>
+      <td>{{ cmd.line_price }}</td>
+      <td>{{ cmd.entry_type }}</td>
+      <td>{{ cmd.direction }}</td>
+      <td>{{ cmd.entry_price }}</td>
+      <td>{{ cmd.tp_price }}</td>
+      <td>{{ cmd.sl_price }}</td>
+      <td>{{ cmd.bracket_size }}</td>
+      <td>{{ cmd.line_strength }}</td>
+      <td class="{{ cmd.status }}">{{ cmd.status }}</td>
+      <td>{{ cmd.fill_price or '' }}</td>
+      <td>{{ cmd.exit_price or '' }}</td>
+      <td>{{ cmd.pnl_points or '' }}</td>
+      <td>{{ cmd.exit_reason or '' }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</body>
+</html>"""
+
+
+@app.route("/orders")
+def orders_page():
+    status = request.args.get("status", "")
+    symbol = request.args.get("symbol", "")
+    query  = "SELECT * FROM commands WHERE 1=1"
+    params = []
+    if status:
+        query += " AND status=?"; params.append(status)
+    if symbol:
+        query += " AND symbol=?"; params.append(symbol)
+    query += " ORDER BY id DESC LIMIT 500"
+
+    with get_db(_get_db_path()) as con:
+        commands = _rows_to_list(con.execute(query, params).fetchall())
+
+    statuses = ["PENDING","SUBMITTING","SUBMITTED","FILLED",
+                "EXITING","CLOSED","CANCELLED","ERROR","RECONCILE_REQUIRED"]
+    return render_template_string(_ORDERS_TMPL, commands=commands,
+                                  statuses=statuses,
+                                  current_status=status,
+                                  current_symbol=symbol)
+
+
+_LOGS_TMPL = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Galao Logs</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 20px; }
+    h1 { color: #58a6ff; }
+    a  { color: #58a6ff; }
+    .nav { margin-bottom: 20px; }
+    .nav a { margin-right: 16px; }
+    pre { background: #161b22; padding: 12px; border-radius: 6px;
+          font-size: 12px; overflow-x: auto; white-space: pre-wrap; }
+    .ERROR, .CRITICAL { color: #f85149; }
+    .WARNING { color: #d29922; }
+    .INFO { color: #c9d1d9; }
+    .DEBUG { color: #8b949e; }
+    select, input { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+                    padding: 4px 8px; margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Log Viewer</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/orders">All Orders</a>
+    <a href="/logs">Logs</a>
+    <a href="/preflight">Pre-flight</a>
+    <a href="/release-notes">Release Notes</a>
+  </div>
+  <form method="get">
+    Component: <select name="component">
+      {% for c in components %}
+      <option value="{{ c }}" {% if c == current_component %}selected{% endif %}>{{ c }}</option>
+      {% endfor %}
+    </select>
+    Level: <select name="level">
+      <option value="">All</option>
+      {% for l in levels %}
+      <option value="{{ l }}" {% if l == current_level %}selected{% endif %}>{{ l }}</option>
+      {% endfor %}
+    </select>
+    <button type="submit">Filter</button>
+  </form>
+  <p>{{ line_count }} line(s) from logs/{{ current_component }}.log</p>
+  <pre>{% for line in lines %}<span class="{{ line.split('|')[1].strip() if '|' in line else '' }}">{{ line }}</span>{% endfor %}</pre>
+</body>
+</html>"""
+
+
+@app.route("/logs")
+def logs_page():
+    cfg = _get_cfg()
+    log_dir = Path(cfg.paths.logs)
+    components = sorted([p.stem for p in log_dir.glob("*.log")]) if log_dir.exists() else ["broker"]
+    levels = ["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"]
+
+    component = request.args.get("component", components[0] if components else "broker")
+    level = request.args.get("level", "")
+
+    data = api_logs().get_json()
+    lines = data.get("lines", [])
+    return render_template_string(_LOGS_TMPL, lines=lines, line_count=len(lines),
+                                  components=components, levels=levels,
+                                  current_component=component, current_level=level)
+
+
+_PREFLIGHT_TMPL = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Galao Pre-flight</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 20px; }
+    h1 { color: #58a6ff; }
+    a  { color: #58a6ff; }
+    .nav { margin-bottom: 20px; }
+    .nav a { margin-right: 16px; }
+    table { border-collapse: collapse; width: 60%; }
+    th { background: #161b22; color: #8b949e; padding: 6px 10px; text-align: left; }
+    td { padding: 5px 10px; border-top: 1px solid #21262d; }
+    .PASS { color: #3fb950; }
+    .FAIL { color: #f85149; }
+  </style>
+</head>
+<body>
+  <h1>Pre-flight Results</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/orders">All Orders</a>
+    <a href="/logs">Logs</a>
+    <a href="/preflight">Pre-flight</a>
+    <a href="/release-notes">Release Notes</a>
+  </div>
+  <table>
+    <tr><th>Check</th><th>Status</th><th>Time</th><th>Detail</th></tr>
+    {% for key, val in results.items() %}
+    <tr>
+      <td>{{ key }}</td>
+      <td class="{{ val.status }}">{{ val.status }}</td>
+      <td>{{ val.time }}</td>
+      <td>{{ val.detail }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% if not results %}
+  <p>No pre-flight results yet. Run <code>python preflight.py</code> first.</p>
+  {% endif %}
+</body>
+</html>"""
+
+
+@app.route("/preflight")
+def preflight_page():
+    results = api_preflight().get_json()
+    return render_template_string(_PREFLIGHT_TMPL, results=results)
+
+
+_RELNOTES_TMPL = """<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>Galao Release Notes</title>
+  <style>
+    body { font-family: monospace; background: #0d1117; color: #c9d1d9; margin: 20px; }
+    h1 { color: #58a6ff; }
+    a  { color: #58a6ff; }
+    .nav { margin-bottom: 20px; }
+    .nav a { margin-right: 16px; }
+    .note { background: #161b22; border: 1px solid #30363d; border-radius: 6px;
+            padding: 12px 16px; margin-bottom: 12px; }
+    .note h3 { margin: 0 0 6px 0; color: #79c0ff; }
+    .note .meta { color: #8b949e; font-size: 12px; margin-bottom: 8px; }
+    pre { background: #0d1117; padding: 8px; border-radius: 4px; font-size: 12px;
+          white-space: pre-wrap; margin: 0; }
+    input, button { background: #161b22; color: #c9d1d9; border: 1px solid #30363d;
+                    padding: 4px 8px; margin-right: 8px; }
+  </style>
+</head>
+<body>
+  <h1>Release Notes</h1>
+  <div class="nav">
+    <a href="/">Dashboard</a>
+    <a href="/orders">All Orders</a>
+    <a href="/logs">Logs</a>
+    <a href="/preflight">Pre-flight</a>
+    <a href="/release-notes">Release Notes</a>
+  </div>
+  <form method="get">
+    Program: <input type="text" name="program" value="{{ current_program }}" size="20">
+    <button type="submit">Filter</button>
+    {% if current_program %}<a href="/release-notes">Clear</a>{% endif %}
+  </form>
+  <p>{{ notes|length }} note(s)</p>
+  {% for note in notes %}
+  <div class="note">
+    <h3>{{ note.program }} v{{ note.version }}</h3>
+    <div class="meta">{{ note.created_at }}</div>
+    <div>{{ note.summary }}</div>
+    {% if note.details %}
+    <pre>{{ note.details }}</pre>
+    {% endif %}
+  </div>
+  {% endfor %}
+</body>
+</html>"""
+
+
+@app.route("/release-notes")
+def release_notes_page():
+    program = request.args.get("program", "")
+    query = "SELECT * FROM release_notes WHERE 1=1"
+    params = []
+    if program:
+        query += " AND program=?"; params.append(program)
+    query += " ORDER BY id DESC"
+    with get_db(_get_db_path()) as con:
+        notes = _rows_to_list(con.execute(query, params).fetchall())
+    return render_template_string(_RELNOTES_TMPL, notes=notes, current_program=program)
+
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+def self_test() -> bool:
+    """
+    Headless self-test: starts Flask test client, checks all routes return 200,
+    and validates API JSON shapes. No browser opened.
+    """
+    import tempfile
+    try:
+        from lib.logger import reset_loggers
+        from lib.db import init_db, set_system_state
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "test.db"
+            init_db(db_path)
+
+            # Seed some data
+            with get_db(db_path) as con:
+                set_system_state(con, "SESSION", "RUNNING")
+                con.execute("""
+                    INSERT INTO release_notes (program, version, summary)
+                    VALUES ('test_prog', '0.1.0', 'Test note')
+                """)
+                con.execute("""
+                    INSERT INTO system_state (key, value)
+                    VALUES ('preflight_db', 'PASS|2026-04-07T10:00:00Z|')
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """)
+
+            global _db_path
+            _db_path = db_path
+
+            app.config["TESTING"] = True
+            client = app.test_client()
+
+            routes = [
+                ("/",              200),
+                ("/orders",        200),
+                ("/logs",          200),
+                ("/preflight",     200),
+                ("/release-notes", 200),
+                ("/api/state",     200),
+                ("/api/commands",  200),
+                ("/api/positions", 200),
+                ("/api/ib-events", 200),
+                ("/api/preflight", 200),
+                ("/api/release-notes", 200),
+                ("/api/logs?component=visualizer", 200),
+            ]
+
+            for route, expected_code in routes:
+                resp = client.get(route)
+                assert resp.status_code == expected_code, \
+                    f"Route {route}: expected {expected_code}, got {resp.status_code}"
+
+            # Validate /api/state JSON shape
+            resp = client.get("/api/state")
+            data = resp.get_json()
+            assert isinstance(data, list), "/api/state should return a list"
+
+            # Validate /api/preflight JSON shape
+            resp = client.get("/api/preflight")
+            pf = resp.get_json()
+            assert "preflight_db" in pf, f"Missing preflight_db: {pf}"
+            assert pf["preflight_db"]["status"] == "PASS"
+
+            # Validate /api/release-notes
+            resp = client.get("/api/release-notes")
+            rn = resp.get_json()
+            assert isinstance(rn, list) and len(rn) >= 1
+            assert rn[0]["program"] == "test_prog"
+
+            # Filter by status
+            resp = client.get("/api/commands?status=PENDING")
+            assert isinstance(resp.get_json(), list)
+
+            _db_path = None
+            reset_loggers()
+
+        print("[self-test] visualizer: PASS")
+        return True
+
+    except Exception as e:
+        print(f"[self-test] visualizer: FAIL -- {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Galao visualizer")
+    parser.add_argument("--self-test", action="store_true")
+    args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if self_test() else 1)
+
+    cfg = get_config()
+    init_db(Path(cfg.paths.db))
+    log.info(f"Visualizer starting on {cfg.visualizer.host}:{cfg.visualizer.port}")
+    app.run(host=cfg.visualizer.host, port=cfg.visualizer.port, debug=False)

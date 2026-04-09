@@ -1,0 +1,214 @@
+# Galao System — Release Notes
+
+---
+
+## v0.1.0 — 2026-04-06
+
+**Initial design and documentation release.**
+
+### Decisions Made
+- Architecture: 5 components — Decider, Broker, Fetcher, Visualizer (later), Analyzer (later)
+- Inter-component communication: SQLite DB only (no direct coupling)
+- IB connections: two simultaneous — LIVE (data) + PAPER (trading)
+- Trading port: PAPER only until explicitly approved for LIVE
+- Instruments: futures micro contracts only, up to 5 symbols
+- Strategy: critical lines (manual CSV input for now), both directions per line
+- Bracket sizes: symmetric, configurable subset of [2, 4, 8, 16] points
+- Replenishment: owned by Decider (Option A) — Decider polls DB for fills, writes replenishment commands
+- Shutdown mechanism: T-60min cancel pending → tighten brackets → orderly exit → panic mode
+- DB: SQLite with WAL mode
+- History data: CSV files per symbol per date
+- All scripts: must implement `--self-test` flag
+
+### Documents Created
+- `rules_book.md` v0.1.0
+- `design_book.md` v0.1.0
+- `tech_solutions_book.md` v0.1.0
+- `release_notes.md` v0.1.0
+
+---
+
+## v0.5.3 — 2026-04-07
+
+### New Document: Trader Book
+- Created `docs/trader_book.md` — manual for a human broker
+- Covers: order types in plain English, decision rule, bracket parameters, session timing
+- 8 examples: morning setup, price movement, entering position, TP exit, SL exit + cool-down,
+  stagnation exit, emergency exit, end-of-day shutdown
+- Replenishment guide with worked example
+- Quick reference card (cheat sheet)
+
+### Tech Solutions Book v0.3.0
+- Added section 9: Order Type Mental Model
+- LMT/STP decision table confirmed by both Claude and GPT
+- Example with current price 6200 and lines at 6150, 6250, 6400
+
+---
+
+## v0.5.2 — 2026-04-07
+
+### Walkthrough Book v0.2.0 — Hardened as Implementation Spec
+
+Following ChatGPT review. All decisions confirmed by user.
+
+**Added to walkthrough_book.md:**
+- Section 0: Engine Contract — 13 invariants (I-01 to I-13)
+- Section 0.1: Config values table — all timeouts/thresholds labeled as configurable
+- Section 0.2: Full command status state machine with allowed transitions only
+  - New states: `SUBMITTING` (claim lock), `EXITING`, `RECONCILE_REQUIRED`
+- Section 0.3: 7 failure & reconciliation scenarios with detection + resolution
+
+**Key decisions locked:**
+- Shutdown = replenishment fully dead immediately (I-07)
+- Virtual strategy legs, not broker net positions (I-12)
+- Partial fills ignored in V1 (I-13)
+- Single broker process only (I-10)
+- PnL source of truth = `positions` table (I-11)
+- Replenishment exactly once per fill (I-03)
+
+**Updated design_book.md:**
+- `commands.status` expanded to full 9-state set
+- Added `replenishment_issued`, `claimed_at` fields to commands table
+
+**Updated rules_book.md:**
+- R-ORD-12: SUBMITTING claim lock rule
+- R-ORD-13: Partial fills ignored V1
+- R-ORD-14: Virtual legs declaration
+- R-SHD-07: Replenishment fully dead on shutdown
+
+---
+
+## v0.5.1 — 2026-04-07
+
+### New Document: Walkthrough Book
+- Created `docs/walkthrough_book.md`
+- Full lifecycle trace for a single critical line (MES 6250, strength=2)
+- Covers: day start, DB writes, IB submission, fill detection, OCO activation, stagnation, TP/SL/stagnation exits, replenishment with cool-down, IB status query patterns, shutdown sequence
+- Includes exact SQL, IB order IDs, timestamps, and full flow diagram
+
+---
+
+## v0.5.0 — 2026-04-07
+
+### Regression Testing Added
+
+- New program: `regression.py` — on-demand, 3 layers
+- Layer 1: self-tests on all components
+- Layer 2: feature/logic tests using `test_galao.db` (no IB)
+- Layer 3: real IB integration — hard fail if IB unavailable, no-fill order test (LMT BUY at price-500, cancel immediately)
+- Output: `[PASS/FAIL/SKIP]` per test + summary line, logged to `logs/regression.log`
+- Flags: `--quick`, `--layer3-only`, `--program <name>`
+- Rule: every new feature requires a Layer 2 regression test
+- Rule: regression must fully pass before version bump
+
+### Documents Updated
+- `rules_book.md` → v0.5.0 (section 14: Regression Testing Rules)
+- `design_book.md` → v0.5.0 (section 9: full regression spec)
+
+---
+
+## v0.4.0 — 2026-04-07
+
+### Dev Rules Finalized
+
+**Versioning workflow:**
+- Before any edit: copy file to `versions/{filename}.{YYYYMMDD_HHMM}`
+- After: self-test → release notes → announce complete
+- Release notes stored in DB table `release_notes` + readable via `release_notes.py --program <name>`
+
+**Logging:**
+- All levels required (DEBUG/INFO/WARNING/ERROR/CRITICAL)
+- Every IB interaction logged at minimum INFO
+- Each component has its own log file in `logs/`
+- Log viewer required in Visualizer (filterable by level + component)
+
+**Error handling:**
+- IB disconnect: 5 retries over 5 minutes → abort
+- DB write fail: log to file → abort
+- Alerting: errors written to DB → Visualizer displays them
+
+**Code structure:** Max 500 lines per file. `lib/` is flat.
+
+**Startup pre-flight:** LIVE port + PAPER port + price fetch + DB test. Any failure = hard abort.
+
+**Config:** Startup only. No mid-session changes.
+
+**New files added to structure:**
+- `release_notes.py` — CLI reader with `--program` filter
+- `preflight.py` — startup checklist
+- `lib/logger.py` — shared logging setup
+- `versions/` — timestamped file snapshots
+
+**New DB table:** `release_notes` (id, timestamp, program, version, change_type, description)
+
+### Documents Updated
+- `rules_book.md` → v0.4.0 (full restructure — 14 sections)
+- `design_book.md` → v0.4.0
+- `.cursorrules` → updated with workflow, logging, error handling
+
+---
+
+## v0.3.0 — 2026-04-06
+
+### Gemini Brainstorm Review — Decisions Made
+
+**Adopted from Gemini:**
+- **LMT/STP toggle:** Entry order type now depends on current price vs line price (see rules R-ORD-02 to R-ORD-05). Fixes bug where LMT order on wrong side of line fills immediately.
+- **Stagnation kill-switch:** Position open >60s AND price moved <0.5pt → market exit. Reason logged as `STAGNATION`.
+- **SL cool-down:** 30s wait after stop-loss hit before re-arming line. Avoids whipsaw.
+- **Tick rounding:** All prices rounded to nearest 0.25 (MES tick) at Decider command generation.
+- **Max 1 contract** per order during learning phase.
+
+**Confirmed vs Gemini:**
+- Both LONG and SHORT at every line (Gemini only showed LONG).
+- Bracket values remain fully configurable (Gemini's [1.5,3.0,6.0,12.0] vs ours [2,4,8,16] — both valid).
+- All new position management params (stagnation_seconds, stagnation_min_move_points, sl_cooldown_seconds) added to config.yaml.
+
+**New exit reasons in DB:** `STAGNATION` added alongside TP / SL / SHUTDOWN_ORDERLY / SHUTDOWN_PANIC.
+
+### Documents Updated
+- `rules_book.md` → v0.3.0
+- `design_book.md` → v0.3.0
+- `.cursorrules` → updated
+
+---
+
+## v0.2.0 — 2026-04-06
+
+### Design Decisions Finalized
+- **IB ports:** LIVE=4001, PAPER=4002 (IB Gateway, not TWS)
+- **Client IDs:** Pool approach — LIVE=[101,102,103], PAPER=[201,301,401]
+- **Entry order type:** LMT (Limit) — bounce strategy, not STP breakout
+- **Both directions per line:** LMT BUY + LMT SELL at every critical line regardless of label
+- **Critical lines format:** `levels_daily_YYYYMMDD.txt`, format: `SYMBOL, PRICE, STRENGTH`
+- **Strength scale:** 1-3 (1=weak, 3=strong)
+- **DB:** `galao.db` extending V1 `trading_data.db` schema
+- **System purpose:** Learning platform for A/B testing bracket sizes and line strengths
+- **A/B test variables:** bracket_size (config) and line_strength (critical lines file)
+- **Analyzer:** Later — not in current build scope
+- **Visualizer:** Priority — must include DB viewer
+
+### V1 Codebase Analyzed
+- Located: `C:\Users\gaviShalev\Documents\Galgo\Python3\trading-analysis-system-V1`
+- Reuse plan documented in design_book.md section 9
+
+### Documents Updated
+- `rules_book.md` → v0.2.0 (added A/B testing rules, corrected order types, ports, critical lines format)
+- `design_book.md` → v0.2.0 (full rewrite with all confirmed decisions)
+- `tech_solutions_book.md` → v0.2.0 (corrected ports, client ID pool, LMT entry order)
+- `.cursorrules` → updated with all confirmed rules
+
+---
+
+## v0.1.1 — 2026-04-06
+
+### IDE Setup
+- Selected IDE: Cursor
+- Created `.cursorrules` at project root with full project context and hard rules
+- Added Cursor setup section to `tech_solutions_book.md` (section 9)
+- Recommended extensions: Python, Pylance, SQLite Viewer
+- Recommended terminal layout: 4-pane split (Decider / Broker / Fetcher / SQLite)
+
+---
+
+<!-- New releases go above this line, most recent first -->

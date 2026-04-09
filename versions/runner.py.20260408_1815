@@ -1,0 +1,184 @@
+"""
+runner.py
+Launches all Galao components in a single command.
+Runs preflight first (hard abort on failure), then starts
+broker, decider, position_manager, and visualizer as subprocesses.
+Ctrl+C shuts everything down cleanly.
+
+Usage:
+    python runner.py              # full session
+    python runner.py --no-preflight   # skip preflight (dev/test)
+    python runner.py --self-test
+
+Self-test:
+    python runner.py --self-test
+"""
+
+import sys
+import time
+import signal
+import argparse
+import subprocess
+from datetime import datetime, timezone
+from pathlib import Path
+
+from lib.config_loader import get_config
+from lib.logger import get_logger
+
+log = get_logger("runner")
+
+_procs: list[subprocess.Popen] = []
+_stopping = False
+
+
+def _now_utc() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
+def _shutdown(sig=None, frame=None):
+    global _stopping
+    if _stopping:
+        return
+    _stopping = True
+    log.info("Runner shutting down — stopping all components")
+    for p in _procs:
+        if p.poll() is None:
+            try:
+                p.terminate()
+            except Exception:
+                pass
+    # Give them 5 seconds to exit cleanly
+    deadline = time.time() + 5
+    for p in _procs:
+        remaining = max(0, deadline - time.time())
+        try:
+            p.wait(timeout=remaining)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    log.info("All components stopped")
+
+
+signal.signal(signal.SIGINT,  _shutdown)
+signal.signal(signal.SIGTERM, _shutdown)
+
+
+def _start(name: str, cmd: list[str]) -> subprocess.Popen:
+    """Start a component subprocess, inherit stdout/stderr to console."""
+    log.info(f"Starting {name}: {' '.join(cmd)}")
+    p = subprocess.Popen(cmd, cwd=str(Path(__file__).parent))
+    _procs.append(p)
+    return p
+
+
+def run(skip_preflight: bool = False):
+    cfg = get_config()
+
+    print(f"\n{'='*55}")
+    print(f"  GALAO ENGINE  —  {_now_utc()}")
+    print(f"  DB    : {cfg.paths.db}")
+    print(f"  Logs  : {cfg.paths.logs}/")
+    print(f"  Web   : http://{cfg.visualizer.host}:{cfg.visualizer.port}")
+    print(f"{'='*55}\n")
+
+    # 1. Pre-flight (blocking — hard abort on failure)
+    if not skip_preflight:
+        log.info("Running pre-flight checks...")
+        result = subprocess.run(
+            [sys.executable, "preflight.py"],
+            cwd=str(Path(__file__).parent)
+        )
+        if result.returncode != 0:
+            log.error("Pre-flight FAILED — aborting session")
+            sys.exit(1)
+        log.info("Pre-flight PASSED")
+    else:
+        log.warning("Pre-flight skipped (--no-preflight)")
+
+    # 2. Launch components
+    components = [
+        ("decider",          [sys.executable, "decider.py"]),
+        ("broker",           [sys.executable, "broker.py"]),
+        ("position_manager", [sys.executable, "position_manager.py"]),
+        ("visualizer",       [sys.executable, "visualizer/app.py"]),
+    ]
+
+    for name, cmd in components:
+        _start(name, cmd)
+        time.sleep(0.5)  # small stagger so logs don't collide at startup
+
+    log.info(f"All components running. Dashboard: "
+             f"http://{cfg.visualizer.host}:{cfg.visualizer.port}")
+    log.info("Press Ctrl+C to stop")
+
+    # 3. Monitor — restart crashed components (except visualizer)
+    restartable = {"decider", "broker", "position_manager"}
+    proc_map = {name: p for (name, _), p in zip(components, _procs)}
+    cmd_map  = {name: cmd for name, cmd in components}
+
+    while not _stopping:
+        time.sleep(5)
+        for name, p in list(proc_map.items()):
+            if _stopping:
+                break
+            if name not in restartable:
+                continue
+            if p.poll() is not None:
+                rc = p.returncode
+                log.warning(f"{name} exited (rc={rc}) — restarting in 3s")
+                time.sleep(3)
+                if not _stopping:
+                    new_p = _start(name, cmd_map[name])
+                    proc_map[name] = new_p
+
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+def self_test() -> bool:
+    """
+    Self-test: verify config loads, all component scripts exist,
+    and preflight runs without error (uses --self-test on each).
+    """
+    try:
+        cfg = get_config()
+
+        # 1. All component scripts exist
+        scripts = [
+            "preflight.py", "decider.py", "broker.py",
+            "position_manager.py", "visualizer/app.py",
+        ]
+        for s in scripts:
+            p = Path(__file__).parent / s
+            assert p.exists(), f"Missing script: {s}"
+
+        # 2. Config has visualizer section
+        assert hasattr(cfg, "visualizer"), "Config missing visualizer section"
+        assert cfg.visualizer.port == 5000
+
+        # 3. Preflight self-test passes
+        r = subprocess.run(
+            [sys.executable, "preflight.py", "--self-test"],
+            capture_output=True, text=True,
+            cwd=str(Path(__file__).parent)
+        )
+        assert r.returncode == 0, f"preflight --self-test failed: {r.stdout}{r.stderr}"
+
+        print("[self-test] runner: PASS")
+        return True
+
+    except Exception as e:
+        print(f"[self-test] runner: FAIL -- {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Galao runner — starts all components")
+    parser.add_argument("--self-test",     action="store_true")
+    parser.add_argument("--no-preflight",  action="store_true",
+                        help="Skip pre-flight checks (dev/testing only)")
+    args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if self_test() else 1)
+
+    run(skip_preflight=args.no_preflight)

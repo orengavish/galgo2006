@@ -1,0 +1,10 @@
+__pycache__/
+*.py[cod]
+*.log
+data/galao.db
+data/fetch_progress.db
+data/*.db-wal
+data/*.db-shm
+logs/
+*.pptx
+.claude/

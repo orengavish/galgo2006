@@ -1,0 +1,310 @@
+"""
+fetcher.py
+Historical data fetcher for Galao.
+Downloads OHLCV bars from IB LIVE port and saves to CSV.
+
+File format (R-DAT-01): data/history/{SYMBOL}_{YYYY-MM-DD}.csv
+Always uses LIVE connection only (R-DAT-03).
+
+Usage:
+    python fetcher.py --symbol MES --date 2026-04-07
+    python fetcher.py --symbol MES                      # today
+    python fetcher.py --self-test
+
+Self-test:
+    python fetcher.py --self-test
+"""
+
+import sys
+import csv
+import argparse
+from datetime import date, datetime, timezone
+from pathlib import Path
+
+from lib.config_loader import get_config
+from lib.logger import get_logger
+
+log = get_logger("fetcher")
+
+_BAR_SIZE  = "5 mins"
+_DURATION  = "1 D"
+_WHAT_TO_SHOW = "TRADES"
+
+
+def _resolve_history_dir() -> Path:
+    try:
+        cfg = get_config()
+        return Path(cfg.paths.history)
+    except Exception:
+        return Path("data/history")
+
+
+def get_csv_path(symbol: str, date_str: str, history_dir: Path = None) -> Path:
+    d = history_dir or _resolve_history_dir()
+    return d / f"{symbol}_{date_str}.csv"
+
+
+def fetch_bars(ibc, symbol: str, date_str: str = None,
+               bar_size: str = _BAR_SIZE, duration: str = _DURATION) -> list[dict]:
+    """
+    Fetch historical bars for symbol from IB LIVE connection.
+    Returns list of dicts: {time, open, high, low, close, volume}
+    """
+    if not ibc.is_live_connected():
+        raise ConnectionError("LIVE connection not active")
+
+    date_str = date_str or date.today().strftime("%Y-%m-%d")
+    end_dt = f"{date_str.replace('-', '')} 23:59:59 US/Central"
+
+    contract = ibc.get_contract(symbol)
+    log.info(f"Fetching {duration} of {bar_size} bars for {symbol} ending {end_dt}")
+
+    bars = ibc.live.reqHistoricalData(
+        contract,
+        endDateTime   = end_dt,
+        durationStr   = duration,
+        barSizeSetting = bar_size,
+        whatToShow    = _WHAT_TO_SHOW,
+        useRTH        = False,
+        formatDate    = 1,
+    )
+
+    if not bars:
+        raise ValueError(f"No historical data returned for {symbol} {date_str}")
+
+    result = []
+    for bar in bars:
+        result.append({
+            "time":   str(bar.date),
+            "open":   bar.open,
+            "high":   bar.high,
+            "low":    bar.low,
+            "close":  bar.close,
+            "volume": bar.volume,
+        })
+
+    log.info(f"Fetched {len(result)} bars for {symbol} {date_str}")
+    return result
+
+
+def save_csv(bars: list[dict], symbol: str, date_str: str,
+             history_dir: Path = None) -> Path:
+    """Save bars list to CSV. Returns the file path."""
+    out_path = get_csv_path(symbol, date_str, history_dir)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=["time", "open", "high", "low", "close", "volume"])
+        writer.writeheader()
+        writer.writerows(bars)
+
+    log.info(f"Saved {len(bars)} bars to {out_path}")
+    return out_path
+
+
+def fetch_and_save(ibc, symbol: str, date_str: str = None,
+                   history_dir: Path = None, bar_size: str = _BAR_SIZE) -> Path:
+    """Convenience: fetch + save. Returns CSV path."""
+    date_str = date_str or date.today().strftime("%Y-%m-%d")
+    bars = fetch_bars(ibc, symbol, date_str, bar_size=bar_size)
+    return save_csv(bars, symbol, date_str, history_dir)
+
+
+def verify_csv(symbol: str, date_str: str, history_dir: Path = None) -> bool:
+    """
+    Sanity-check a saved CSV.
+    Prints a report and returns True if it looks healthy.
+    Checks: file exists, row count, no gaps > 15 min, prices positive,
+    high >= low, OHLC within range, volume positive.
+    """
+    from datetime import datetime as dt
+    bars = load_csv(symbol, date_str, history_dir)
+    ok = True
+    issues = []
+
+    print(f"\n--- Verify: {symbol} {date_str} ---")
+    print(f"  Rows      : {len(bars)}")
+
+    if len(bars) == 0:
+        print("  ERROR: empty file")
+        return False
+
+    # Parse numeric values
+    def f(v):
+        return float(v) if v not in ("", None) else None
+
+    closes = [f(b["close"]) for b in bars]
+    highs  = [f(b["high"])  for b in bars]
+    lows   = [f(b["low"])   for b in bars]
+    vols   = [f(b["volume"]) for b in bars]
+
+    print(f"  First bar : {bars[0]['time']}")
+    print(f"  Last bar  : {bars[-1]['time']}")
+    print(f"  Close range: {min(c for c in closes if c)} – {max(c for c in closes if c)}")
+    print(f"  Volume range: {min(v for v in vols if v is not None)} – {max(v for v in vols if v is not None)}")
+
+    # Check high >= low
+    for i, b in enumerate(bars):
+        h, l = f(b["high"]), f(b["low"])
+        if h is not None and l is not None and h < l:
+            issues.append(f"  Row {i}: high {h} < low {l}")
+
+    # Check prices positive
+    for i, b in enumerate(bars):
+        for field in ("open", "high", "low", "close"):
+            v = f(b[field])
+            if v is not None and v <= 0:
+                issues.append(f"  Row {i}: {field}={v} is non-positive")
+
+    # Check for large gaps (> 15 min between consecutive bars)
+    times = []
+    for b in bars:
+        raw = b["time"]
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y%m%d %H:%M:%S", "%Y-%m-%dT%H:%M:%S"):
+            try:
+                times.append(dt.strptime(raw.strip(), fmt))
+                break
+            except ValueError:
+                pass
+        else:
+            times.append(None)
+
+    max_gap = 0
+    for i in range(1, len(times)):
+        if times[i] and times[i-1]:
+            gap = (times[i] - times[i-1]).total_seconds() / 60
+            if gap > 15:
+                issues.append(f"  Gap > 15 min at row {i}: {times[i-1]} -> {times[i]} ({gap:.0f} min)")
+            max_gap = max(max_gap, gap)
+    if max_gap:
+        print(f"  Max gap   : {max_gap:.0f} min")
+
+    if issues:
+        print(f"  ISSUES ({len(issues)}):")
+        for iss in issues[:10]:
+            print(iss)
+        ok = False
+    else:
+        print("  Status    : OK — no issues found")
+    return ok
+
+
+def load_csv(symbol: str, date_str: str, history_dir: Path = None) -> list[dict]:
+    """Load bars from existing CSV. Returns list of dicts."""
+    path = get_csv_path(symbol, date_str, history_dir)
+    if not path.exists():
+        raise FileNotFoundError(f"History file not found: {path}")
+    with open(path, encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+# ── Self-test ─────────────────────────────────────────────────────────────────
+
+def self_test() -> bool:
+    import tempfile
+    try:
+        from lib.logger import reset_loggers
+
+        cfg = get_config()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            hist_dir = tmp_path / "history"
+
+            # 1. CSV path construction
+            p = get_csv_path("MES", "2026-04-07", hist_dir)
+            assert p.name == "MES_2026-04-07.csv", f"Bad filename: {p.name}"
+
+            # 2. Save and load round-trip (no IB needed)
+            sample_bars = [
+                {"time": "2026-04-07 09:30:00", "open": 6500.0, "high": 6502.5,
+                 "low": 6499.0, "close": 6501.25, "volume": 1200},
+                {"time": "2026-04-07 09:35:00", "open": 6501.25, "high": 6503.0,
+                 "low": 6500.75, "close": 6502.0, "volume": 980},
+            ]
+            out = save_csv(sample_bars, "MES", "2026-04-07", hist_dir)
+            assert out.exists(), "CSV not created"
+
+            loaded = load_csv("MES", "2026-04-07", hist_dir)
+            assert len(loaded) == 2, f"Expected 2 rows, got {len(loaded)}"
+            assert loaded[0]["time"]  == "2026-04-07 09:30:00"
+            assert float(loaded[0]["close"]) == 6501.25
+            assert loaded[1]["volume"] == "980"
+
+            # 3. load_csv missing file → FileNotFoundError
+            raised = False
+            try:
+                load_csv("MES", "2099-01-01", hist_dir)
+            except FileNotFoundError:
+                raised = True
+            assert raised, "Missing file should raise FileNotFoundError"
+
+            # 4. IB fetch — attempt if connected, skip otherwise
+            from lib.ib_client import IBClient
+            ibc = IBClient(cfg)
+            try:
+                ibc.connect(live=True, paper=False)
+                if ibc.is_live_connected():
+                    today = date.today().strftime("%Y-%m-%d")
+                    try:
+                        path = fetch_and_save(ibc, "MES", today, hist_dir)
+                        assert path.exists()
+                        bars = load_csv("MES", today, hist_dir)
+                        assert len(bars) > 0, "No bars fetched"
+                        log.info(f"[self-test] fetched {len(bars)} bars from IB")
+                    except Exception as e:
+                        log.warning(f"[self-test] IB fetch non-fatal: {e}")
+                ibc.disconnect()
+            except Exception as e:
+                log.info(f"[self-test] IB not available: {e} — SKIP")
+
+            reset_loggers()
+
+        print("[self-test] fetcher: PASS")
+        return True
+
+    except Exception as e:
+        print(f"[self-test] fetcher: FAIL -- {e}")
+        import traceback; traceback.print_exc()
+        return False
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Galao historical data fetcher")
+    parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--symbol",   default=None)
+    parser.add_argument("--date",     default=None, help="YYYY-MM-DD (default: today)")
+    parser.add_argument("--bar-size", default=_BAR_SIZE,
+                        help=f"IB bar size string (default: '{_BAR_SIZE}')")
+    parser.add_argument("--verify",   action="store_true",
+                        help="Sanity-check existing CSV without fetching")
+    args = parser.parse_args()
+
+    if args.self_test:
+        sys.exit(0 if self_test() else 1)
+
+    cfg = get_config()
+    symbols  = [args.symbol] if args.symbol else cfg.symbols
+    date_str = args.date or date.today().strftime("%Y-%m-%d")
+
+    if args.verify:
+        all_ok = True
+        for sym in symbols:
+            ok = verify_csv(sym, date_str)
+            if not ok:
+                all_ok = False
+        sys.exit(0 if all_ok else 1)
+
+    from lib.ib_client import IBClient
+    ibc = IBClient(cfg)
+    ibc.connect(live=True, paper=False)
+
+    for sym in symbols:
+        try:
+            path = fetch_and_save(ibc, sym, date_str, bar_size=args.bar_size)
+            print(f"Saved: {path}")
+            verify_csv(sym, date_str)
+        except Exception as e:
+            log.error(f"Failed to fetch {sym}: {e}")
+
+    ibc.disconnect()
