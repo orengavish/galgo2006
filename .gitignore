@@ -7,4 +7,5 @@ data/*.db-wal
 data/*.db-shm
 logs/
 *.pptx
+*.csv
 .claude/
