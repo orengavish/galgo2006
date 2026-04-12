@@ -219,7 +219,50 @@ git push
 
 ---
 
-## 13. Troubleshooting
+## 13. Back-Trading Engine
+
+Located in `back-trading/`. Run from the `back-trading/` directory.
+
+### Self-test (no IB required)
+```bash
+cd back-trading
+python engine.py --self-test
+```
+
+### Fetch tick data for a date
+```bash
+python engine.py --fetch --date 2026-04-09
+```
+Downloads TRADES + BID_ASK ticks for the day into `data/bars/`.
+Files are cached — re-running skips already-fetched dates.
+
+### Historical simulation (offline)
+```bash
+python engine.py --date 2026-04-09
+python engine.py --from 2026-04-01 --to 2026-04-09
+```
+Generates synthetic orders, simulates fills tick-by-tick, prints P&L timeline.
+
+### Reality model (run on market day, requires IB paper)
+```bash
+python engine.py --reality-model
+```
+Submits generated orders to IB paper in real time throughout the day.
+At 15:00 CT, compares paper fills to simulated fills → prints grade.
+
+### Back-trading config (back-trading/config.yaml)
+| Key | Default | What it controls |
+|-----|---------|-----------------|
+| `generator.n_timestamps` | `20` | Random order placements per session |
+| `generator.entry_offset_min` | `0.25` | Min distance from market price (pts) |
+| `generator.entry_offset_max` | `1.50` | Max distance from market price (pts) |
+| `generator.bracket_sizes` | `[2, 16]` | TP/SL distances tested (pts) |
+| `grader.fill_match_ticks` | `1` | Ticks within which sim=paper counts as match |
+| `grader.target_grade_pct` | `80` | Target accuracy % for the simulation model |
+
+---
+
+## 14. Troubleshooting
 
 | Symptom | Check |
 |---------|-------|

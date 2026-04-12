@@ -51,6 +51,18 @@ backtest:
   what_to_show: TRADES
   use_rth: false                # include extended hours
 
+generator:
+  n_timestamps: 20              # random order placements per RTH session
+  entry_offset_min: 0.25        # min distance from market price (points)
+  entry_offset_max: 1.50        # max distance from market price (points)
+  bracket_sizes: [2, 16]        # bracket TP/SL distances to test (points)
+  rth_start: "08:30"            # earliest order placement (CT)
+  rth_end:   "14:30"            # latest order placement (CT, leaves time to fill)
+
+grader:
+  fill_match_ticks: 1           # sim vs paper: fills within N ticks = match
+  target_grade_pct: 80          # target accuracy %
+
 paths:
   db: data/backtest.db
   test_db: data/test_backtest.db
