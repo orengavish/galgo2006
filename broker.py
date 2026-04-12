@@ -35,6 +35,139 @@ log = get_logger("broker")
 
 _MAX_RECONNECT_ATTEMPTS = 5
 
+# IB error codes that are purely informational (data-farm connection status etc.)
+_IB_INFO_CODES = {
+    1102, 2103, 2104, 2105, 2106, 2107, 2108, 2109, 2110, 2119, 2158,
+}
+
+
+# ── IB Event wiring ───────────────────────────────────────────────────────────
+
+def _write_ib_event(db_path, event_type: str, component: str,
+                    message: str, code: int = None):
+    """Thread-safe insert into ib_events (called from ib_insync background thread)."""
+    try:
+        with get_db(db_path) as con:
+            con.execute(
+                "INSERT INTO ib_events (event_type, component, code, message)"
+                " VALUES (?,?,?,?)",
+                (event_type, component, code, message)
+            )
+    except Exception as e:
+        log.warning(f"ib_event write failed: {e}")
+
+
+def _handle_exec_fill(order_id: int, fill_price: float, db_path):
+    """Event-driven fill: mark SUBMITTED command FILLED immediately on execDetails."""
+    now = _now_utc()
+    try:
+        with get_db(db_path) as con:
+            row = con.execute(
+                "SELECT id FROM commands WHERE ib_order_id=? AND status='SUBMITTED'",
+                (order_id,)
+            ).fetchone()
+            if row:
+                update_command_status(
+                    con, row["id"], "FILLED",
+                    fill_price=fill_price,
+                    fill_time=now,
+                )
+                log.info(
+                    f"[event] Command {row['id']} FILLED "
+                    f"(execDetails orderId={order_id} price={fill_price})"
+                )
+    except Exception as e:
+        log.warning(f"Event fill handler error: {e}")
+
+
+def register_ib_events(ibc: IBClient, db_path):
+    """
+    Wire ib_insync events on both PAPER and LIVE connections to ib_events table.
+    Also registers event-driven fill detection via execDetailsEvent.
+    Call once after ibc.connect().
+    """
+
+    # ── Helpers ───────────────────────────────────────────────────────────────
+    def _classify_error(code: int) -> str:
+        if code in _IB_INFO_CODES:
+            return "INFO"
+        if code >= 2000:
+            return "WARNING"
+        if code >= 1000:
+            return "WARNING"
+        return "ERROR"
+
+    def _contract_sym(contract) -> str:
+        if contract is None:
+            return ""
+        return getattr(contract, "localSymbol", "") or getattr(contract, "symbol", "")
+
+    # ── PAPER handlers ────────────────────────────────────────────────────────
+    def on_paper_error(reqId, errorCode, errorString, contract):
+        evt = _classify_error(errorCode)
+        sym = _contract_sym(contract)
+        msg = f"[req={reqId}] {sym} {errorString}".strip()
+        log.log(
+            __import__("logging").WARNING if evt != "INFO" else __import__("logging").DEBUG,
+            f"IB PAPER {evt} {errorCode}: {msg}"
+        )
+        _write_ib_event(db_path, evt, "paper", msg, errorCode)
+
+    def on_paper_order_status(trade):
+        o = trade.order
+        s = trade.orderStatus
+        msg = (f"orderId={o.orderId} {o.action} {o.orderType} "
+               f"status={s.status} filled={s.filled} "
+               f"remaining={s.remaining} avgFill={s.avgFillPrice}")
+        _write_ib_event(db_path, "INFO", "paper", msg)
+
+    def on_paper_exec(trade, fill):
+        ex = fill.execution
+        msg = (f"FILL orderId={ex.orderId} {ex.side} "
+               f"qty={ex.shares} price={ex.avgPrice} time={ex.time}")
+        log.info(f"IB execDetails: {msg}")
+        _write_ib_event(db_path, "INFO", "paper", msg)
+        _handle_exec_fill(ex.orderId, ex.avgPrice, db_path)
+
+    def on_paper_connected():
+        msg = f"PAPER connected (clientId={ibc._paper_client_id})"
+        log.info(f"IB event: {msg}")
+        _write_ib_event(db_path, "RECONNECT", "paper", msg)
+
+    def on_paper_disconnected():
+        msg = "PAPER disconnected"
+        log.warning(f"IB event: {msg}")
+        _write_ib_event(db_path, "DISCONNECT", "paper", msg)
+
+    # ── LIVE handlers ─────────────────────────────────────────────────────────
+    def on_live_error(reqId, errorCode, errorString, contract):
+        evt = _classify_error(errorCode)
+        sym = _contract_sym(contract)
+        msg = f"[req={reqId}] {sym} {errorString}".strip()
+        _write_ib_event(db_path, evt, "live", msg, errorCode)
+
+    def on_live_connected():
+        _write_ib_event(db_path, "RECONNECT", "live",
+                        f"LIVE connected (clientId={ibc._live_client_id})")
+
+    def on_live_disconnected():
+        _write_ib_event(db_path, "DISCONNECT", "live", "LIVE disconnected")
+
+    # ── Wire up ───────────────────────────────────────────────────────────────
+    if ibc.paper:
+        ibc.paper.errorEvent        += on_paper_error
+        ibc.paper.orderStatusEvent  += on_paper_order_status
+        ibc.paper.execDetailsEvent  += on_paper_exec
+        ibc.paper.connectedEvent    += on_paper_connected
+        ibc.paper.disconnectedEvent += on_paper_disconnected
+
+    if ibc.live:
+        ibc.live.errorEvent         += on_live_error
+        ibc.live.connectedEvent     += on_live_connected
+        ibc.live.disconnectedEvent  += on_live_disconnected
+
+    log.info("IB event handlers registered")
+
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -176,11 +309,16 @@ def poll_fills(ibc: IBClient, db_path) -> int:
     return fills
 
 
-def run_broker(db_path=None):
+def run_broker(db_path=None, dry_run: bool = False):
     """Main broker loop."""
     cfg = get_config()
     db_path = db_path or Path(cfg.paths.db)
     init_db(db_path)
+
+    if dry_run:
+        log.warning("*** DRY-RUN MODE — no IB orders will be sent ***")
+        _run_broker_dry(db_path, cfg)
+        return
 
     log.info(f"Broker starting — DB={db_path}")
 
@@ -190,6 +328,8 @@ def run_broker(db_path=None):
     except ConnectionError as e:
         log.error(f"Broker startup: IB connection failed: {e}")
         sys.exit(1)
+
+    register_ib_events(ibc, db_path)
 
     poll_seconds     = cfg.broker.command_poll_seconds
     ib_poll_seconds  = cfg.broker.ib_poll_seconds
@@ -207,6 +347,8 @@ def run_broker(db_path=None):
         if not ibc.is_paper_connected() or not ibc.is_live_connected():
             log.warning("IB connection lost — attempting reconnect")
             ok = ibc.reconnect(max_attempts=_MAX_RECONNECT_ATTEMPTS)
+            if ok:
+                register_ib_events(ibc, db_path)
             if not ok:
                 log.error("Reconnect failed after max attempts — aborting broker")
                 # R-ERR-05: abort means trigger shutdown then exit
@@ -238,6 +380,50 @@ def run_broker(db_path=None):
 
     ibc.disconnect()
     log.info("Broker stopped")
+
+
+def _run_broker_dry(db_path, cfg):
+    """
+    Dry-run broker loop: consumes PENDING commands and logs what would be sent
+    to IB, but never opens a connection or places an order.
+    Commands are advanced to SUBMITTED with fake order IDs so the rest of the
+    system (decider, position_manager) behaves normally.
+    """
+    poll_seconds = cfg.broker.command_poll_seconds
+    fake_order_id = 90000
+
+    log.info("Dry-run broker loop started")
+
+    while True:
+        if _is_shutdown(db_path):
+            log.info("SESSION=SHUTDOWN detected — dry-run broker exiting")
+            break
+
+        with get_db(db_path) as con:
+            pending = get_pending_commands(con)
+
+        for cmd in pending:
+            cid = cmd["id"]
+            if not _claim_command(db_path, cid):
+                continue
+
+            fake_order_id += 1
+            log.info(
+                f"[DRY-RUN] Would submit command {cid}: "
+                f"{cmd['direction']} {cmd['entry_type']} "
+                f"{cmd['symbol']} @ {cmd['entry_price']} "
+                f"(fake IB id={fake_order_id})"
+            )
+            with get_db(db_path) as con:
+                update_command_status(
+                    con, cid, "SUBMITTED",
+                    ib_order_id    = fake_order_id,
+                    ib_tp_order_id = fake_order_id + 1,
+                    ib_sl_order_id = fake_order_id + 2,
+                )
+            fake_order_id += 2
+
+        time.sleep(poll_seconds)
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
@@ -320,9 +506,11 @@ def self_test() -> bool:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galao broker")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--dry-run",   action="store_true",
+                        help="Log commands instead of sending to IB")
     args = parser.parse_args()
 
     if args.self_test:
         sys.exit(0 if self_test() else 1)
 
-    run_broker()
+    run_broker(dry_run=args.dry_run)

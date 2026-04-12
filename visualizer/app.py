@@ -43,6 +43,7 @@ _ROOT = _HERE.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import re
 from flask import Flask, jsonify, request, render_template
 from lib.config_loader import get_config
 from lib.logger import get_logger
@@ -367,6 +368,49 @@ def api_test_trades():
     return jsonify({"count": len(inserted), "price": price, "commands": inserted})
 
 
+# ── IB Gateway Log API ────────────────────────────────────────────────────────
+
+@app.route("/api/ib-gateway-log")
+def api_ib_gateway_log():
+    """
+    GET /api/ib-gateway-log?limit=500
+    Reads the most recent IB Gateway system log file from ib.gateway_log_dir.
+    Returns {lines, file, error}.
+    """
+    limit = int(request.args.get("limit", 500))
+    cfg   = _get_cfg()
+    log_dir = getattr(cfg.ib, "gateway_log_dir", "") if hasattr(cfg, "ib") else ""
+
+    if not log_dir:
+        return jsonify({"lines": [], "file": None,
+                        "error": "ib.gateway_log_dir not set in config.yaml"})
+
+    log_dir_path = Path(log_dir)
+    if not log_dir_path.exists():
+        return jsonify({"lines": [], "file": None,
+                        "error": f"Directory not found: {log_dir}"})
+
+    # Find the most recent *.log or any log file in the dir (or subdirs by date)
+    candidates = sorted(log_dir_path.glob("**/*.log"), key=lambda p: p.stat().st_mtime,
+                        reverse=True)
+    if not candidates:
+        # Also try .txt files (IB Gateway sometimes uses different extensions)
+        candidates = sorted(log_dir_path.glob("**/*.txt"), key=lambda p: p.stat().st_mtime,
+                            reverse=True)
+    if not candidates:
+        return jsonify({"lines": [], "file": None,
+                        "error": f"No log files found in {log_dir}"})
+
+    latest = candidates[0]
+    try:
+        with open(latest, encoding="utf-8", errors="replace") as f:
+            all_lines = f.readlines()
+        lines = all_lines[-limit:]
+        return jsonify({"lines": lines, "file": str(latest), "error": None})
+    except Exception as e:
+        return jsonify({"lines": [], "file": str(latest), "error": str(e)})
+
+
 # ── System State API ──────────────────────────────────────────────────────────
 
 @app.route("/api/state")
@@ -374,6 +418,186 @@ def api_state():
     with get_db(_get_db_path()) as con:
         rows = con.execute("SELECT * FROM system_state ORDER BY key").fetchall()
     return jsonify(_rows_to_list(rows))
+
+
+# ── Lines input API ───────────────────────────────────────────────────────────
+
+_STRENGTH_LABELS = {1: "strong (!)", 2: "medium (?)", 3: "weak (no suffix)"}
+
+def _parse_lines_text(text: str) -> list[dict]:
+    """
+    Parse Hebrew/free-form critical lines input.
+
+    Recognised section headers (case-insensitive, Hebrew or English):
+      קווי תמיכה / support
+      קווי התנגדות / resistance
+
+    Per-price suffixes:
+      !  → strength 1 (strong)
+      ?  → strength 2 (medium)
+      (none) → strength 3 (weak)
+
+    Ranges  A - B  inside a comma-separated list add both endpoints separately.
+    """
+    results = []
+
+    support_text    = ""
+    resistance_text = ""
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        low = line.lower()
+        if "תמיכה" in line or "support" in low:
+            idx = line.find(":")
+            if idx >= 0:
+                support_text = line[idx + 1:].strip()
+        elif "התנגדות" in line or "resistance" in low:
+            idx = line.find(":")
+            if idx >= 0:
+                resistance_text = line[idx + 1:].strip()
+
+    def _parse_section(raw: str, line_type: str):
+        items = []
+        for token in raw.split(","):
+            for sub in token.split(" - "):
+                sub = sub.strip()
+                if not sub:
+                    continue
+                if sub.endswith("!"):
+                    strength, price_str = 3, sub[:-1].strip()
+                elif sub.endswith("?"):
+                    strength, price_str = 2, sub[:-1].strip()
+                else:
+                    strength, price_str = 1, sub.strip()
+                try:
+                    price = float(price_str)
+                    items.append({"line_type": line_type, "price": price, "strength": strength})
+                except ValueError:
+                    pass
+        return items
+
+    if support_text:
+        results.extend(_parse_section(support_text, "SUPPORT"))
+    if resistance_text:
+        results.extend(_parse_section(resistance_text, "RESISTANCE"))
+
+    return results
+
+
+@app.route("/api/lines", methods=["GET", "POST"])
+def api_lines():
+    """
+    GET  /api/lines?date=YYYY-MM-DD&symbol=MES
+         Returns current critical_lines rows for that date+symbol.
+
+    POST /api/lines
+         Body JSON: {text, date, symbol}
+         Parses the text and upserts into critical_lines.
+         Returns {count, lines} on success or {error} on failure.
+    """
+    if request.method == "GET":
+        date_str = request.args.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+        symbol   = request.args.get("symbol", (_get_cfg().symbols or ["MES"])[0])
+        with get_db(_get_db_path()) as con:
+            rows = _rows_to_list(con.execute(
+                "SELECT * FROM critical_lines WHERE symbol=? AND date=? ORDER BY price",
+                (symbol, date_str)
+            ).fetchall())
+        return jsonify(rows)
+
+    # POST
+    body   = request.get_json(force=True) or {}
+    text   = body.get("text", "").strip()
+    date_str = body.get("date", datetime.now(timezone.utc).strftime("%Y-%m-%d"))
+    symbol   = body.get("symbol", (_get_cfg().symbols or ["MES"])[0])
+
+    if not text:
+        return jsonify({"error": "No text provided"}), 400
+
+    lines = _parse_lines_text(text)
+    if not lines:
+        return jsonify({"error": "No valid lines found in input"}), 400
+    if len(lines) > 20:
+        return jsonify({"error": f"Too many lines ({len(lines)}), max is 20"}), 400
+
+    with get_db(_get_db_path()) as con:
+        con.execute(
+            "DELETE FROM critical_lines WHERE symbol=? AND date=?",
+            (symbol, date_str)
+        )
+        for ln in lines:
+            con.execute(
+                "INSERT INTO critical_lines (symbol, date, line_type, price, strength, armed)"
+                " VALUES (?, ?, ?, ?, ?, 1)",
+                (symbol, date_str, ln["line_type"], ln["price"], ln["strength"])
+            )
+
+    log.info(f"Lines input: saved {len(lines)} lines for {symbol} {date_str}")
+    return jsonify({"count": len(lines), "lines": lines})
+
+
+# ── Reset API ─────────────────────────────────────────────────────────────────
+
+_WIPE_TABLES = ("commands", "positions", "ib_events", "system_state")
+
+
+@app.route("/api/reset", methods=["POST"])
+def api_reset():
+    """
+    POST /api/reset
+    Body JSON: {cancel_ib: bool, wipe_db: bool}
+    Defaults: both true.
+
+    1. Optionally call reqGlobalCancel on LIVE and PAPER.
+    2. Optionally wipe operational DB tables (keeps critical_lines, release_notes).
+    Returns {ib_cancel: "ok"|"failed"|"skipped", wipe: {table: count}, errors: [...]}
+    """
+    body      = request.get_json(force=True) or {}
+    do_ib     = body.get("cancel_ib", True)
+    do_wipe   = body.get("wipe_db",   True)
+
+    result = {"ib_cancel": "skipped", "wipe": {}, "errors": []}
+
+    # ── 1. IB cancel ──────────────────────────────────────────────────────────
+    if do_ib:
+        try:
+            from lib.ib_client import IBClient
+            cfg = _get_cfg()
+            ibc = IBClient(cfg)
+            ibc.connect(live=True, paper=True)
+            try:
+                ibc.live.reqGlobalCancel()
+                log.info("[reset] reqGlobalCancel sent to LIVE")
+            except Exception as e:
+                result["errors"].append(f"LIVE cancel: {e}")
+            try:
+                ibc.paper.reqGlobalCancel()
+                log.info("[reset] reqGlobalCancel sent to PAPER")
+            except Exception as e:
+                result["errors"].append(f"PAPER cancel: {e}")
+            ibc.disconnect()
+            result["ib_cancel"] = "ok"
+        except Exception as e:
+            result["ib_cancel"] = "failed"
+            result["errors"].append(f"IB connect: {e}")
+            log.warning(f"[reset] IB cancel failed: {e}")
+
+    # ── 2. DB wipe ────────────────────────────────────────────────────────────
+    if do_wipe:
+        try:
+            with get_db(_get_db_path()) as con:
+                for tbl in _WIPE_TABLES:
+                    cnt = con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    con.execute(f"DELETE FROM {tbl}")
+                    result["wipe"][tbl] = cnt
+            log.info(f"[reset] DB wiped: {result['wipe']}")
+        except Exception as e:
+            result["errors"].append(f"DB wipe: {e}")
+            log.error(f"[reset] DB wipe failed: {e}")
+
+    return jsonify(result)
 
 
 # ── HTML routes ───────────────────────────────────────────────────────────────
@@ -419,6 +643,13 @@ def preflight_page():
 @app.route("/release-notes")
 def release_notes_page():
     return render_template("release_notes.html", active="release_notes")
+
+
+@app.route("/lines")
+def lines_page():
+    cfg = _get_cfg()
+    return render_template("lines.html", active="lines",
+                           symbols=cfg.symbols or ["MES"])
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────

@@ -31,7 +31,7 @@ from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_filled_commands, get_system_state, set_system_state
 from lib.order_builder import determine_entry_type, calc_bracket_prices, round_tick
-from lib.critical_lines import load_critical_lines, get_armed_lines
+from lib.critical_lines import get_armed_lines
 
 log = get_logger("decider")
 
@@ -62,7 +62,7 @@ def get_current_price(symbol: str, ibc=None) -> float | None:
 
 
 def generate_commands(symbol: str, date_str: str, current_price: float,
-                      cfg, db_path, cl_dir: Path = None) -> int:
+                      cfg, db_path) -> int:
     """
     Generate PENDING commands for all armed critical lines for symbol+date.
     Creates commands in BOTH directions (BUY + SELL) for each line,
@@ -198,17 +198,22 @@ def replenish(symbol: str, date_str: str, current_price: float,
     return count
 
 
-def run_session_start(ibc, cfg, db_path, date_str: str = None, cl_dir: Path = None):
+def run_session_start(ibc, cfg, db_path, date_str: str = None):
     """
-    Session start: load critical lines into DB, fetch price, generate all commands.
+    Session start: read critical lines already in DB (entered via GUI),
+    fetch price, generate all commands.
     Called once at the beginning of a trading session.
     """
     date_str = date_str or date.today().strftime("%Y-%m-%d")
 
     for symbol in cfg.symbols:
-        # Load critical lines (raises FileNotFoundError if missing — R-CL-05)
-        n = load_critical_lines(symbol, date_str, db_path, cl_dir)
-        log.info(f"Loaded {n} critical lines for {symbol}")
+        # Lines come from DB (entered via /lines GUI) — just count them
+        with get_db(db_path) as con:
+            n = con.execute(
+                "SELECT COUNT(*) FROM critical_lines WHERE symbol=? AND date=? AND armed=1",
+                (symbol, date_str)
+            ).fetchone()[0]
+        log.info(f"Found {n} armed critical lines in DB for {symbol} {date_str}")
 
         # Get current price
         price = get_current_price(symbol, ibc)
@@ -216,7 +221,7 @@ def run_session_start(ibc, cfg, db_path, date_str: str = None, cl_dir: Path = No
             raise ValueError(f"Cannot get current price for {symbol} — abort session start")
 
         # Generate commands
-        count = generate_commands(symbol, date_str, price, cfg, db_path, cl_dir)
+        count = generate_commands(symbol, date_str, price, cfg, db_path)
         log.info(f"Session start: {count} commands generated for {symbol}")
 
     with get_db(db_path) as con:
@@ -262,29 +267,28 @@ def self_test() -> bool:
         tick = cfg.orders.tick_size
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            db_path  = tmp_path / "test.db"
-            cl_dir   = tmp_path / "cl"
-            cl_dir.mkdir()
+            db_path = Path(tmp) / "test.db"
             init_db(db_path)
 
-            # Write a critical lines file
+            # Insert critical lines directly into DB (simulates GUI entry)
             today = "2026-04-07"
-            from lib.critical_lines import get_file_path
-            fp = get_file_path("MES", today, cl_dir)
-            # Two lines: one support (6490), one resistance (6510)
-            fp.write_text(
-                "SUPPORT,    6490.00, 2\n"
-                "RESISTANCE, 6510.00, 1\n"
-            )
-            load_critical_lines("MES", today, db_path, cl_dir)
+            with get_db(db_path) as con:
+                for line_type, price, strength in [
+                    ("SUPPORT",    6490.00, 2),
+                    ("RESISTANCE", 6510.00, 1),
+                ]:
+                    con.execute(
+                        "INSERT INTO critical_lines (symbol, date, line_type, price, strength, armed)"
+                        " VALUES ('MES', ?, ?, ?, ?, 1)",
+                        (today, line_type, price, strength)
+                    )
 
             # Simulate current price at 6500 (between lines)
             current_price = 6500.0
             brackets = cfg.orders.active_brackets  # [2, 4]
 
             # 1. Generate commands
-            n = generate_commands("MES", today, current_price, cfg, db_path, cl_dir)
+            n = generate_commands("MES", today, current_price, cfg, db_path)
             expected = 2 * len(brackets) * 2  # 2 lines * N brackets * 2 directions
             assert n == expected, f"Expected {expected} commands, got {n}"
 

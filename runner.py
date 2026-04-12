@@ -71,11 +71,13 @@ def _start(name: str, cmd: list[str]) -> subprocess.Popen:
     return p
 
 
-def run(skip_preflight: bool = False):
+def run(skip_preflight: bool = False, dry_run: bool = False):
     cfg = get_config()
 
     print(f"\n{'='*55}")
     print(f"  GALAO ENGINE  —  {_now_utc()}")
+    if dry_run:
+        print(f"  *** DRY-RUN MODE — no IB orders will be sent ***")
     print(f"  DB    : {cfg.paths.db}")
     print(f"  Logs  : {cfg.paths.logs}/")
     print(f"  Web   : http://{cfg.visualizer.host}:{cfg.visualizer.port}")
@@ -96,9 +98,13 @@ def run(skip_preflight: bool = False):
         log.warning("Pre-flight skipped (--no-preflight)")
 
     # 2. Launch components
+    broker_cmd = [sys.executable, "broker.py"]
+    if dry_run:
+        broker_cmd.append("--dry-run")
+
     components = [
         ("decider",          [sys.executable, "decider.py"]),
-        ("broker",           [sys.executable, "broker.py"]),
+        ("broker",           broker_cmd),
         ("position_manager", [sys.executable, "position_manager.py"]),
         ("visualizer",       [sys.executable, "visualizer/app.py"]),
     ]
@@ -256,6 +262,8 @@ if __name__ == "__main__":
                         help="Skip pre-flight checks (dev/testing only)")
     parser.add_argument("--reset",         action="store_true",
                         help="Cancel all IB orders and wipe DB, then exit")
+    parser.add_argument("--dry-run",       action="store_true",
+                        help="Run without sending any IB orders (broker logs instead)")
     args = parser.parse_args()
 
     if args.self_test:
@@ -265,4 +273,4 @@ if __name__ == "__main__":
         reset_session()
         sys.exit(0)
 
-    run(skip_preflight=args.no_preflight)
+    run(skip_preflight=args.no_preflight, dry_run=args.dry_run)

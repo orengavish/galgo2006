@@ -111,26 +111,8 @@ def check_db(db_path, con) -> dict:
         return {"db": ("FAIL", str(e))}
 
 
-def check_critical_lines(symbols: list, date_str: str, con,
-                          cl_dir: Path = None) -> dict:
-    """Check that critical lines files exist for all symbols."""
-    from lib.critical_lines import get_file_path
-    results = {}
-    for sym in symbols:
-        fp = get_file_path(sym, date_str, cl_dir)
-        if fp.exists():
-            log.info(f"Pre-flight critical lines {sym}: PASS ({fp.name})")
-            _record(con, f"cl_{sym}", "PASS", str(fp))
-            results[f"cl_{sym}"] = ("PASS", str(fp))
-        else:
-            log.error(f"Pre-flight critical lines {sym}: FAIL — file not found: {fp}")
-            _record(con, f"cl_{sym}", "FAIL", f"not found: {fp}")
-            results[f"cl_{sym}"] = ("FAIL", f"not found: {fp}")
-    return results
 
-
-def run_preflight(db_path=None, cl_dir: Path = None,
-                  date_str: str = None) -> dict:
+def run_preflight(db_path=None, date_str: str = None) -> dict:
     """
     Run all pre-flight checks.
     Returns dict of {check: (status, detail)}.
@@ -151,9 +133,6 @@ def run_preflight(db_path=None, cl_dir: Path = None,
         ibc = IBClient(cfg)
         all_results.update(check_ib_connections(ibc, con))
         all_results.update(check_price_fetch(ibc, cfg.symbols[0], con))
-
-        # Critical lines
-        all_results.update(check_critical_lines(cfg.symbols, date_str, con, cl_dir))
 
         ibc.disconnect()
 
@@ -203,33 +182,13 @@ def self_test() -> bool:
         from lib.config_loader import reset_cache
 
         with tempfile.TemporaryDirectory() as tmp:
-            tmp_path = Path(tmp)
-            db_path  = tmp_path / "test.db"
-            cl_dir   = tmp_path / "cl"
-            cl_dir.mkdir()
-
-            # Write critical lines file for today
-            today = date.today().strftime("%Y-%m-%d")
-            from lib.critical_lines import get_file_path
-            fp = get_file_path("MES", today, cl_dir)
-            fp.write_text("SUPPORT, 6500.00, 1\nRESISTANCE, 6510.25, 2\n")
-
+            db_path = Path(tmp) / "test.db"
             init_db(db_path)
 
             # DB check
             with get_db(db_path) as con:
                 db_result = check_db(db_path, con)
             assert db_result["db"][0] == "PASS", f"DB check: {db_result}"
-
-            # Critical lines check
-            with get_db(db_path) as con:
-                cl_result = check_critical_lines(["MES"], today, con, cl_dir)
-            assert cl_result["cl_MES"][0] == "PASS", f"CL check: {cl_result}"
-
-            # Missing critical lines
-            with get_db(db_path) as con:
-                cl_bad = check_critical_lines(["MES"], "2099-12-31", con, cl_dir)
-            assert cl_bad["cl_MES"][0] == "FAIL"
 
             # IB checks — attempt real connection, skip if unavailable
             from lib.ib_client import IBClient

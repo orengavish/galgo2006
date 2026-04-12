@@ -2,6 +2,7 @@
 # All tunables live here. Never hardcode values in Python files.
 
 ib:
+  gateway_log_dir: ""   # optional: IB Gateway log dir, e.g. C:\Jts\username
   live_host: 127.0.0.1
   live_port: 4001
   live_client_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
