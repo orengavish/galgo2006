@@ -15,6 +15,9 @@ import sys
 import argparse
 from pathlib import Path
 
+_ROOT = Path(__file__).parent.parent
+import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else None
+
 
 def add_note(program: str, version: str, summary: str, details: str = None, db_path=None):
     """Insert a release note into the DB."""

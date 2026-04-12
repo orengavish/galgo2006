@@ -22,6 +22,9 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 
+_ROOT = Path(__file__).parent.parent
+import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else None
+
 from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db

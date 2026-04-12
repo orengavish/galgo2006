@@ -1,0 +1,60 @@
+# Galao Back-Trading Configuration
+# All tunables live here. Never hardcode values in Python files.
+
+ib:
+  gateway_log_dir: ""   # optional: IB Gateway log dir, e.g. C:\Jts\username
+  live_host: 127.0.0.1
+  live_port: 4001
+  live_client_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
+  paper_host: 127.0.0.1
+  paper_port: 4002
+  paper_client_ids: [201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+  reconnect_interval_seconds: 30
+  connection_timeout: 5
+  fetcher_client_ids: [801, 802, 803]
+
+symbols:
+  - MES
+
+session:
+  open_offset_minutes: 30
+  shutdown_offset_minutes: 60
+  timezone: America/Chicago
+
+orders:
+  active_brackets: [2, 4]
+  quantity: 1
+  tick_size: 0.25
+
+position:
+  stagnation_seconds: 60
+  stagnation_min_move_points: 0.5
+  sl_cooldown_seconds: 30
+
+shutdown:
+  exit_patience_seconds: 30
+  panic_threshold_minutes: 10
+
+decider:
+  replenishment_poll_seconds: 10
+
+broker:
+  command_poll_seconds: 5
+  ib_poll_seconds: 30
+
+visualizer:
+  host: 127.0.0.1
+  port: 5001                    # different port from trader (5000)
+
+backtest:
+  bar_size: "1 min"             # IB bar size string
+  what_to_show: TRADES
+  use_rth: false                # include extended hours
+
+paths:
+  db: data/backtest.db
+  test_db: data/test_backtest.db
+  bars: data/bars               # cached historical OHLC bars
+  results: data/results
+  logs: logs
+  versions: ../versions         # shared with trader

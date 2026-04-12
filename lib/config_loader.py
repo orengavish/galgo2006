@@ -17,8 +17,30 @@ import argparse
 from pathlib import Path
 from types import SimpleNamespace
 
-_CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 _cached = None
+
+
+def _find_config() -> Path:
+    """
+    Locate config.yaml by walking up from the calling script's directory.
+    Search order:
+      1. $GALGO_CONFIG env var (explicit override)
+      2. Directory of sys.argv[0] (the script being run)
+      3. Parent of sys.argv[0] directory
+      4. Hard fallback: lib/../trader/config.yaml
+    This lets every sub-project find its own config.yaml without any
+    per-script setup — just run `python trader/runner.py` and it works.
+    """
+    import os
+    if "GALGO_CONFIG" in os.environ:
+        return Path(os.environ["GALGO_CONFIG"])
+    if sys.argv:
+        script_dir = Path(sys.argv[0]).resolve().parent
+        for candidate_dir in (script_dir, script_dir.parent):
+            cfg = candidate_dir / "config.yaml"
+            if cfg.exists():
+                return cfg
+    return Path(__file__).parent.parent / "trader" / "config.yaml"
 
 REQUIRED_KEYS = [
     "ib", "symbols", "session", "orders",
@@ -63,7 +85,7 @@ def get_config(path: Path = None) -> SimpleNamespace:
         return _cached
 
     import yaml
-    cfg_path = path or _CONFIG_PATH
+    cfg_path = path or _find_config()
     if not cfg_path.exists():
         raise FileNotFoundError(f"Config file not found: {cfg_path}")
 

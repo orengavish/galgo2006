@@ -39,7 +39,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 _HERE = Path(__file__).parent
-_ROOT = _HERE.parent
+_ROOT = _HERE.parent.parent   # trader/visualizer -> trader -> galgo2026
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 

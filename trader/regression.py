@@ -30,6 +30,9 @@ import traceback
 from datetime import date, datetime, timezone
 from pathlib import Path
 
+_ROOT = Path(__file__).parent.parent
+import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else None
+
 
 # ── Result types ──────────────────────────────────────────────────────────────
 

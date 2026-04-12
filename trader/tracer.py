@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 
-_ROOT = Path(__file__).parent
+_ROOT = Path(__file__).parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 

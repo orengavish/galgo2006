@@ -27,7 +27,7 @@ def _poll_loop(cfg, symbol: str, interval: int):
     global _price, _price_time, _ibc
     import sys
     import asyncio
-    _HERE = Path(__file__).parent.parent
+    _HERE = Path(__file__).parent.parent.parent   # trader/visualizer -> trader -> galgo2026
     if str(_HERE) not in sys.path:
         sys.path.insert(0, str(_HERE))
 
