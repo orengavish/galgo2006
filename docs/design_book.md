@@ -1,5 +1,5 @@
 # Galao System — Design Book
-Version: 0.5.0 | Date: 2026-04-07
+Version: 0.6.0 | Date: 2026-04-12
 
 ---
 
@@ -9,46 +9,60 @@ Galao is an **intraday futures trading learning platform**. Primary goal: collec
 
 ---
 
-## 2. System Overview
+## 2. Monorepo Structure
+
+Galao is a **monorepo** with three independent sub-projects sharing a common `lib/`:
+
+```
+galgo2026/
+├── lib/           ← shared code (config_loader, db, ib_client, order_builder, logger)
+├── docs/          ← all documentation
+├── versions/      ← timestamped file snapshots before edits
+│
+├── trader/        ← SUB-PROJECT 1: live intraday trading
+├── back-trading/  ← SUB-PROJECT 2: simulation + calibration
+└── algo-analyzer/ ← SUB-PROJECT 3: critical line extraction (planned)
+```
+
+Each sub-project has its own `config.yaml`, `data/`, and `logs/`. They are fully independent — different Python processes, different DBs, different IB client IDs.
+
+---
+
+## 3. System Overview — trader/
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
-│                          GALAO SYSTEM                               │
+│                        GALAO — trader/                              │
 │                                                                     │
 │  ┌──────────────┐    DB (SQLite)    ┌──────────────────────────┐   │
 │  │   DECIDER    │ ◄──────────────► │        BROKER            │   │
 │  │ (bg process) │                  │      (bg process)        │   │
-│  └──────┬───────┘                  └────────────┬─────────────┘   │
-│         │                                        │                  │
-│  Reads critical                          ib_insync/ibapi            │
-│  line files                                      │                  │
-│         │                          ┌─────────────┴──────────┐      │
-│  ┌──────┴───────┐                  │     IB GATEWAY         │      │
-│  │   FETCHER    │                  │  PAPER port 4002       │      │
-│  │ (bg process) │                  │  LIVE  port 4001       │      │
-│  └──────┬───────┘                  └────────────────────────┘      │
-│         │ LIVE port only                                            │
-│         │ CSV history files                                         │
+│  └──────────────┘                  └────────────┬─────────────┘   │
+│         ↑                                        │                  │
+│  Reads critical_lines                     ib_insync/ibapi           │
+│  from DB (entered via GUI)                       │                  │
+│                                   ┌──────────────┴─────────┐       │
+│  ┌────────────────────────────┐   │     IB GATEWAY         │       │
+│  │   FETCHER  (bg, optional)  │   │  PAPER port 4002       │       │
+│  │   LIVE port, CSV history   │   │  LIVE  port 4001       │       │
+│  └────────────────────────────┘   └────────────────────────┘       │
 │                                                                     │
 │  ┌──────────────────────────────────────────────────────────────┐  │
-│  │        VISUALIZER  (browser GUI)                             │  │
-│  │        DB viewer + live orders/prices/P&L/status             │  │
-│  └──────────────────────────────────────────────────────────────┘  │
-│  ┌──────────────────────────────────────────────────────────────┐  │
-│  │        ANALYZER    (bg process)  [LATER]                     │  │
+│  │   VISUALIZER  (browser GUI, port 5000)                       │  │
+│  │   Dashboard · Lines entry · IB Trace · Logs · Reset          │  │
 │  └──────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 3. Components
+## 4. Components — trader/
 
 ### 3.1 Decider (`decider.py`)
 **Role:** Brain. Generates all trading commands at day open and handles replenishment all day.
 
 **Inputs:**
-- `data/critical_lines/levels_daily_YYYYMMDD.txt`
+- DB `critical_lines` table (lines entered via GUI → `/lines` page)
 - DB `commands` table (polls for fills to trigger replenishment)
 - `config.yaml`
 
@@ -203,23 +217,21 @@ timestamp,open,high,low,close,volume
 
 ---
 
-## 4. Critical Lines File Format
+## 5. Critical Lines — Input Format
 
-**File:** `data/critical_lines/levels_daily_YYYYMMDD.txt`
+Lines are entered via the `/lines` GUI page (not files). The GUI accepts Hebrew paste format:
 
-**Format:** `SYMBOL, PRICE, STRENGTH`
 ```
-MES, 6250, 3
-MES, 6300, 2
-MES, 6180, 1
-MES, 6400, 3
+קווי תמיכה: 6765.25?, 6672.50? - 6652.75!, 6598.75!
+קווי התנגדות: 6845.75?, 6903.75! - 6912.50, 6953.25?
 ```
 
-**Rules:**
-- Strength: 1 (weak) to 3 (strong)
-- One file per trading day
-- Same file can be copied/reused for multiple days
-- Up to 10 lines per symbol
+Strength mapping:
+- No suffix → `1` (strong)
+- `?` suffix → `2` (medium)
+- `!` suffix → `3` (weak)
+
+Lines are parsed by `app.py → _parse_lines_text()` and stored in the `critical_lines` DB table.
 
 ---
 
@@ -372,44 +384,58 @@ paths:
 ## 7. File / Directory Structure
 
 ```
-galao/
-├── .cursorrules
-├── config.yaml
-├── decider.py
-├── broker.py
-├── fetcher.py
-├── release_notes.py          ← CLI reader: --program <name> filter
-├── preflight.py              ← startup checklist (also used by --self-test)
-├── analyzer.py               (later)
-├── visualizer/
-│   ├── app.py
-│   ├── templates/
-│   └── static/
-├── lib/
+galgo2026/                        ← monorepo root
+│
+├── lib/                          ← shared across all sub-projects
+│   ├── config_loader.py          ← auto-discovers config.yaml by walking up from sys.argv[0]
 │   ├── db.py
 │   ├── ib_client.py
 │   ├── order_builder.py
-│   ├── config_loader.py
-│   └── logger.py             ← shared logging setup
-├── data/
-│   ├── galao.db
-│   ├── critical_lines/
-│   │   └── levels_daily_20260407.txt
-│   └── history/
-│       └── MES_2026-04-07.csv
-├── logs/
-│   ├── decider.log
-│   ├── broker.log
-│   ├── fetcher.log
-│   └── visualizer.log
-├── regression.py             ← on-demand regression test runner
-├── versions/                 ← timestamped file snapshots before each edit
-│   └── broker.py.20260407_1151
-└── docs/
-    ├── rules_book.md
-    ├── design_book.md
-    ├── tech_solutions_book.md
-    └── release_notes.md
+│   └── logger.py
+│
+├── docs/                         ← shared documentation
+│   ├── rules_book.md
+│   ├── design_book.md
+│   ├── running_book.md
+│   ├── tech_solutions_book.md
+│   ├── release_notes.md
+│   ├── trader_book.md
+│   └── walkthrough_book.md
+│
+├── versions/                     ← timestamped snapshots before edits
+│
+├── trader/                       ← SUB-PROJECT 1
+│   ├── config.yaml
+│   ├── runner.py
+│   ├── decider.py
+│   ├── broker.py
+│   ├── fetcher.py
+│   ├── preflight.py
+│   ├── tracer.py
+│   ├── visualizer/
+│   │   ├── app.py
+│   │   ├── price_feed.py
+│   │   └── templates/
+│   ├── data/
+│   │   ├── galao.db
+│   │   └── history/             ← TRADES + BID_ASK CSVs from fetcher
+│   └── logs/
+│
+├── back-trading/                 ← SUB-PROJECT 2
+│   ├── config.yaml
+│   ├── engine.py                 ← orchestrator
+│   ├── generator.py              ← synthetic order generator
+│   ├── simulator.py              ← tick-by-tick OCO fill engine
+│   ├── reality_model.py          ← IB paper submission + fill collection
+│   ├── grader.py                 ← sim vs paper accuracy scoring
+│   ├── db.py                     ← backtest DB schema
+│   ├── data/
+│   │   ├── backtest.db
+│   │   └── bars/                ← TRADES + BID_ASK CSVs (shared with fetcher format)
+│   └── logs/
+│
+└── algo-analyzer/                ← SUB-PROJECT 3 (planned)
+    └── .gitkeep
 ```
 
 ---
@@ -561,7 +587,111 @@ Regression must fully pass before any version bump.
 
 ---
 
-## 10. V1 Reuse Map
+## 10. Back-Trading Sub-Project
+
+### 10.1 Purpose
+
+Calibrate the simulation model so it reliably predicts real IB paper fills.
+The grading loop runs over days until the simulator reaches ≥80% accuracy within 1 tick.
+Once trusted, back-trading becomes the primary tool for bracket size optimization.
+
+### 10.2 System Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                    GALAO — back-trading/                            │
+│                                                                     │
+│  GENERATOR                                                          │
+│  ──────────                                                         │
+│  At N random RTH timestamps:                                        │
+│    market_price from tick data                                      │
+│    LMT BUY  at price - offset   (market ABOVE "line")              │
+│    LMT SELL at price + offset   (market BELOW "line")              │
+│    For each bracket size in [2, 16] pt                              │
+│                    │                                                │
+│                    ▼                                                │
+│  SIMULATOR                     REALITY MODEL (--reality-model)     │
+│  ─────────                     ──────────────────────────────────  │
+│  For each order:               Same orders submitted to IB paper   │
+│    Find entry fill             at their scheduled timestamps.      │
+│    (ASK ≤ entry for BUY)       Fills collected via execDetailsEvent│
+│    Find TP or SL exit          at day-end.                         │
+│    (trade tick, conservative)                                      │
+│                    │                         │                      │
+│                    └──────────┬──────────────┘                     │
+│                               ▼                                     │
+│                           GRADER                                    │
+│                           ──────                                    │
+│                  |sim_exit - paper_exit| in ticks                  │
+│                  grade_pct = % within 1 tick                       │
+│                  Written to grades table in backtest.db            │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+### 10.3 Fill Model (Realistic)
+
+| Leg | Tick source | Trigger condition | Fill price |
+|-----|-------------|-------------------|------------|
+| Entry LMT BUY | BID_ASK | `ask_p ≤ entry_price` | `entry_price` (our limit) |
+| Entry LMT SELL | BID_ASK | `bid_p ≥ entry_price` | `entry_price` |
+| Long TP (LMT SELL) | TRADES | `price ≥ tp_price` (conservative) | `tp_price` |
+| Long SL (STP SELL) | TRADES | `price ≤ sl_price` | `sl_price − 1 tick` (slippage) |
+| Short TP (LMT BUY) | TRADES | `price ≤ tp_price` (conservative) | `tp_price` |
+| Short SL (STP BUY) | TRADES | `price ≥ sl_price` | `sl_price + 1 tick` (slippage) |
+
+OCO priority: SL is checked before TP on the same tick (conservative / matches live IB behaviour).
+
+If BID_ASK data is unavailable, entry falls back to TRADES touch (less accurate).
+
+### 10.4 Grading Loop
+
+```
+Each trading day:
+  morning → engine.py --reality-model  (submit to paper + simulate)
+  15:00 CT → grade printed + written to grades table
+
+After N days:
+  SELECT date, bracket_size, grade_pct FROM grades ORDER BY date
+  → see if accuracy is improving
+  Target: >80% of fills within 1 tick
+
+Interpretation:
+  grade_pct ≥ 80%  → simulator is trusted for bracket optimization
+  grade_pct < 60%  → fill model needs tuning (check slippage constant, BID_ASK coverage)
+  pnl_diff large   → slippage model needs recalibration
+```
+
+### 10.5 Back-Trading Database Schema
+
+**File:** `back-trading/data/backtest.db`
+
+| Table | Purpose |
+|-------|---------|
+| `runs` | One row per engine invocation (date, symbol, mode: sim/reality) |
+| `sim_orders` | Generated synthetic brackets (ts_placed, direction, entry/tp/sl prices, bracket_size) |
+| `sim_fills` | Simulated fill results (entry_fill_price/time, exit_type, exit_fill_price, pnl) |
+| `paper_fills` | Actual IB paper fill results from reality model |
+| `grades` | Accuracy scores per bracket_size per run (grade_pct, sim_pnl, paper_pnl, pnl_diff) |
+
+### 10.6 Config (`back-trading/config.yaml`)
+
+Key sections beyond the standard IB/session/orders blocks:
+
+```yaml
+generator:
+  n_timestamps: 20           # random placements per RTH session
+  entry_offset_min: 0.25     # min distance from market (points)
+  entry_offset_max: 1.50     # max distance from market (points)
+  bracket_sizes: [2, 16]     # TP/SL distances tested (points)
+
+grader:
+  fill_match_ticks: 1        # threshold for "match"
+  target_grade_pct: 80       # target accuracy %
+```
+
+---
+
+## 11. V1 Reuse Map
 
 | Galao Component | Reuse from V1 |
 |----------------|---------------|

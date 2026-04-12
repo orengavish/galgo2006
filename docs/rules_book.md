@@ -1,5 +1,5 @@
 # Galao System — Rules Book
-Version: 0.5.1 | Date: 2026-04-07
+Version: 0.6.0 | Date: 2026-04-12
 
 ---
 
@@ -203,3 +203,50 @@ Version: 0.5.1 | Date: 2026-04-07
 | R-ABT-02 | Bracket sizes and position management params are primary A/B test variables |
 | R-ABT-03 | No runtime decisions based on strength or bracket — record only |
 | R-ABT-04 | Analyzer (future) will process DB data for A/B results |
+
+---
+
+## 16. Back-Trading Rules
+
+### Fill Model
+
+| # | Rule |
+|---|------|
+| R-BT-01 | Entry LMT BUY fills when `ask_p ≤ entry_price` (BID_ASK tick source). Fill price = entry_price (our limit, not the ask). |
+| R-BT-02 | Entry LMT SELL fills when `bid_p ≥ entry_price` (BID_ASK tick source). Fill price = entry_price. |
+| R-BT-03 | If BID_ASK data is unavailable, entry fill falls back to TRADES touch (less accurate — log a warning). |
+| R-BT-04 | TP (long: LMT SELL, short: LMT BUY) fills when a TRADE tick reaches the TP price (conservative / trade-at model). Fill price = tp_price. |
+| R-BT-05 | SL (long: STP SELL, short: STP BUY) fills when a TRADE tick reaches the SL price. Fill price = sl_price ± 1 tick (slippage in the adverse direction). |
+| R-BT-06 | OCO priority: if both TP and SL are triggered by the same tick, SL wins (conservative, matches IB behaviour). |
+| R-BT-07 | Orders not filled by session end are marked EXPIRED with pnl = NULL. EXPIRED orders are excluded from grading. |
+
+### Generator
+
+| # | Rule |
+|---|------|
+| R-BT-08 | Generated orders use LMT entry only. Entry placed at `market_price ± random_offset` where offset ∈ [entry_offset_min, entry_offset_max], tick-rounded. |
+| R-BT-09 | LMT BUY entry placed BELOW market price (market is above "line" → toggle rule → LMT BUY). |
+| R-BT-10 | LMT SELL entry placed ABOVE market price (market is below "line" → toggle rule → LMT SELL). |
+| R-BT-11 | No two generated orders may share a placement timestamp within 120 seconds of each other (prevents clustering). |
+| R-BT-12 | All generated bracket sizes are symmetric (TP distance = SL distance from entry), per R-ORD-08. |
+
+### Reality Model
+
+| # | Rule |
+|---|------|
+| R-BT-13 | Reality model submits to IB PAPER port only — never LIVE. |
+| R-BT-14 | Orders are submitted at their scheduled ts_placed time (real-time clock comparison). |
+| R-BT-15 | Fills are collected event-driven via `execDetailsEvent` — not by polling. |
+| R-BT-16 | At session end (15:00 CT), all unfilled entry orders are cancelled and recorded as EXPIRED. |
+| R-BT-17 | Reality model and simulator run on the same generated order list for the same day. The generator seed is NOT fixed — each day uses a fresh random set. |
+
+### Grader
+
+| # | Rule |
+|---|------|
+| R-BT-18 | A trade is "graded" only when BOTH simulator and paper show TP or SL exit. EXPIRED on either side = excluded. |
+| R-BT-19 | Grade metric: `grade_pct = (fills within fill_match_ticks) / total_graded_trades × 100`. |
+| R-BT-20 | Default `fill_match_ticks = 1` (configurable in `grader.fill_match_ticks`). |
+| R-BT-21 | Target grade: ≥80% of fills within 1 tick (configurable in `grader.target_grade_pct`). |
+| R-BT-22 | Grades are stored per bracket_size per run. Results accumulate over days for trend analysis. |
+| R-BT-23 | `pnl_diff = paper_pnl − sim_pnl`. Large pnl_diff (positive or negative) indicates slippage model miscalibration. |

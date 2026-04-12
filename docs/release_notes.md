@@ -211,4 +211,37 @@ Following ChatGPT review. All decisions confirmed by user.
 
 ---
 
+## v0.6.0 — 2026-04-12
+
+### Monorepo Restructure + Back-Trading Engine
+
+**Monorepo restructure:**
+- All live trading code moved from repo root → `trader/` (git mv, history preserved)
+- `lib/config_loader.py`: replaced hardcoded path with `_find_config()` — auto-discovers `config.yaml` by walking up from `sys.argv[0]`'s directory. Each sub-project finds its own config automatically.
+- sys.path fixed in all 11 Python files to resolve `_ROOT = Path(__file__).parent.parent`
+- Created `algo-analyzer/` placeholder (sub-project 3, TBD)
+
+**back-trading/ sub-project — full implementation:**
+- `generator.py`: synthetic order generator — N random RTH timestamps, LMT BUY at `price - offset`, LMT SELL at `price + offset`, for each bracket size in `[2, 16]`
+- `simulator.py`: tick-by-tick OCO fill engine with realistic fill model (BID_ASK for entries, TRADES for TP/SL, 1-tick SL slippage). OCO priority: SL beats TP on same tick.
+- `reality_model.py`: submits generated orders to IB paper at scheduled times, collects fills via `execDetailsEvent`, writes to `paper_fills` table
+- `grader.py`: compares sim exit prices to paper exit prices → `grade_pct` (% within 1 tick) per bracket size per day
+- `db.py`: SQLite schema — `runs`, `sim_orders`, `sim_fills`, `paper_fills`, `grades`
+- `engine.py`: orchestrator — `--date`, `--from/--to`, `--reality-model`, `--fetch`, `--self-test`
+- `config.yaml`: added `generator` and `grader` sections
+- All self-tests pass: db, generator, simulator, grader, engine
+
+**Trader additions (prior sessions):**
+- `--dry-run` mode: broker logs commands without connecting to IB
+- `/lines` GUI page: Hebrew paste format → parse → save to DB (critical_lines table)
+- `preflight.py`: removed critical lines file check (lines now entered via GUI)
+- `decider.py`: reads critical lines from DB instead of file
+- `broker.py`: `register_ib_events()` wires errorEvent, orderStatusEvent, execDetailsEvent, connectedEvent, disconnectedEvent → `ib_events` table
+- `visualizer/`: added Lines page, Reset functionality, IB Gateway raw log panel
+
+**Documents updated:**
+- `design_book.md` → v0.6.0 (monorepo structure, back-trading section 10, fill model table)
+- `rules_book.md` → v0.6.0 (section 16: Back-Trading Rules R-BT-01 to R-BT-23)
+- `running_book.md` → v0.6.0 (section 13: back-trading commands)
+
 <!-- New releases go above this line, most recent first -->
