@@ -181,6 +181,8 @@ def api_ib_events():
 
 def _run_sim(target_date: date, symbol: str):
     """Background thread: load tick data, generate orders, simulate fills."""
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         cfg = get_config()
         gcfg = cfg.generator
@@ -249,6 +251,8 @@ def _run_sim(target_date: date, symbol: str):
 
 def _run_live_generate(target_date: date, symbol: str):
     """Generate timestamps for a live session (no tick data needed)."""
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         cfg  = get_config()
         gcfg = cfg.generator
@@ -298,9 +302,12 @@ def _run_live_generate(target_date: date, symbol: str):
 def _run_live_session(target_date: date, symbol: str):
     """
     Background thread for live reality model.
+    asyncio event loop is created here because ib_insync requires one per thread.
     Submits orders to IB paper at their scheduled timestamps.
     Collects fills via execDetailsEvent.
     """
+    import asyncio
+    asyncio.set_event_loop(asyncio.new_event_loop())
     try:
         cfg  = get_config()
         gcfg = cfg.generator
