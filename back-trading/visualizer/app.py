@@ -34,6 +34,10 @@ from flask import Flask, jsonify, request, render_template
 from lib.config_loader import get_config
 from lib.logger import get_logger
 
+# Import fetcher in the main thread — fetcher.py registers a SIGINT handler at
+# module level which Python only allows from the main thread.
+import fetcher as _fetcher_preload  # noqa: F401
+
 log = get_logger("bt_visualizer")
 
 app = Flask(__name__, template_folder="templates")

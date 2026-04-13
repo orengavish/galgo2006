@@ -68,7 +68,9 @@ def _signal_handler(sig, frame):
     _running = False
 
 
-signal.signal(signal.SIGINT, _signal_handler)
+import threading as _threading
+if _threading.current_thread() is _threading.main_thread():
+    signal.signal(signal.SIGINT, _signal_handler)
 
 
 # ── Session window ────────────────────────────────────────────────────────────
