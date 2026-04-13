@@ -155,6 +155,82 @@ def generate(trades_df: pd.DataFrame,
     return orders
 
 
+# ── Live-mode helpers (no tick data needed) ───────────────────────────────────
+
+def generate_live_timestamps(target_date: date, n_timestamps: int,
+                              seed: int = None) -> list:
+    """
+    Pre-generate N random placement timestamps in the RTH window for a live
+    session, without needing historical tick data.
+
+    Timestamps are at minute resolution with MIN_GAP_SEC spacing.
+    Returns sorted list of UTC datetimes.
+    """
+    from datetime import timedelta
+    if seed is not None:
+        random.seed(seed)
+
+    rth_start = datetime(target_date.year, target_date.month, target_date.day,
+                         8, 30, 0, tzinfo=CT).astimezone(UTC)
+    rth_end   = datetime(target_date.year, target_date.month, target_date.day,
+                         14, 30, 0, tzinfo=UTC)
+
+    # Minute-resolution candidate pool
+    total_min = int((rth_end - rth_start).total_seconds()) // 60
+    candidates = [rth_start + timedelta(minutes=i) for i in range(total_min)]
+    return _pick_spaced(candidates, n_timestamps, _MIN_GAP_SEC)
+
+
+def make_orders_for_price(ts: "datetime", market_price: float,
+                           bracket_sizes: list,
+                           entry_offset_min: float, entry_offset_max: float,
+                           symbol: str = "MES") -> list[dict]:
+    """
+    Generate orders for a single timestamp given a known market price.
+    Used by the live reality model when a scheduled timestamp arrives and
+    the current price is fetched from IB LIVE.
+
+    Returns a list of order dicts (same structure as generate()).
+    """
+    raw = random.uniform(entry_offset_min, entry_offset_max)
+    offset = _round_tick(raw)
+    if offset < _TICK:
+        offset = _TICK
+
+    orders = []
+    for bracket_size in bracket_sizes:
+        bs = float(bracket_size)
+
+        buy_line = _round_tick(market_price - offset)
+        orders.append({
+            "ts_placed":    ts,
+            "direction":    "BUY",
+            "entry_type":   "LMT",
+            "entry_price":  buy_line,
+            "tp_price":     _round_tick(buy_line + bs),
+            "sl_price":     _round_tick(buy_line - bs),
+            "bracket_size": bs,
+            "market_price": market_price,
+            "entry_offset": offset,
+            "symbol":       symbol,
+        })
+
+        sell_line = _round_tick(market_price + offset)
+        orders.append({
+            "ts_placed":    ts,
+            "direction":    "SELL",
+            "entry_type":   "LMT",
+            "entry_price":  sell_line,
+            "tp_price":     _round_tick(sell_line - bs),
+            "sl_price":     _round_tick(sell_line + bs),
+            "bracket_size": bs,
+            "market_price": market_price,
+            "entry_offset": offset,
+            "symbol":       symbol,
+        })
+    return orders
+
+
 # ── Self-test ──────────────────────────────────────────────────────────────────
 
 def self_test() -> bool:

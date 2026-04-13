@@ -1,0 +1,325 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>back-trading</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: monospace; font-size: 13px; background: #0d1117; color: #c9d1d9; }
+  a { color: #58a6ff; text-decoration: none; }
+
+  header { background: #161b22; border-bottom: 1px solid #30363d; padding: 10px 16px;
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 15px; color: #e6edf3; }
+  .badge { padding: 2px 8px; border-radius: 4px; font-size: 11px; font-weight: bold; }
+  .badge-sim  { background: #1f4068; color: #79c0ff; }
+  .badge-live { background: #3d2b00; color: #f0883e; }
+
+  .controls { display: flex; flex-wrap: wrap; gap: 10px; padding: 12px 16px;
+              background: #161b22; border-bottom: 1px solid #30363d; align-items: center; }
+  .controls label { color: #8b949e; font-size: 12px; }
+  input[type="date"], select { background: #0d1117; border: 1px solid #30363d; color: #c9d1d9;
+                               padding: 4px 8px; border-radius: 4px; font-family: monospace; }
+  .mode-toggle { display: flex; border: 1px solid #30363d; border-radius: 4px; overflow: hidden; }
+  .mode-toggle button { padding: 4px 12px; border: none; cursor: pointer;
+                        font-family: monospace; font-size: 12px; }
+  .mode-toggle button.active-sim  { background: #1f4068; color: #79c0ff; }
+  .mode-toggle button.active-live { background: #3d2b00; color: #f0883e; }
+  .mode-toggle button:not(.active-sim):not(.active-live)
+                                  { background: #21262d; color: #8b949e; }
+
+  button.action { padding: 5px 14px; border: none; border-radius: 4px; cursor: pointer;
+                  font-family: monospace; font-size: 12px; font-weight: bold; }
+  button.btn-generate { background: #238636; color: #fff; }
+  button.btn-send     { background: #f0883e; color: #000; }
+  button.btn-stop     { background: #da3633; color: #fff; }
+  button:disabled     { opacity: 0.4; cursor: not-allowed; }
+
+  .status-bar { padding: 6px 16px; background: #0d1117; border-bottom: 1px solid #30363d;
+                display: flex; gap: 20px; font-size: 12px; color: #8b949e; }
+  .status-bar .pill { padding: 2px 8px; border-radius: 10px; }
+  .pill-idle      { background: #21262d; color: #8b949e; }
+  .pill-generating{ background: #1f4068; color: #79c0ff; }
+  .pill-simulating{ background: #1f4068; color: #79c0ff; }
+  .pill-fetching  { background: #1f4068; color: #79c0ff; }
+  .pill-scheduled { background: #3d2b00; color: #f0883e; }
+  .pill-running   { background: #1a4f1a; color: #3fb950; }
+  .pill-done      { background: #1a3b1a; color: #3fb950; }
+  .pill-error     { background: #4a1212; color: #f85149; }
+
+  .layout { display: grid; grid-template-columns: 1fr 320px; height: calc(100vh - 110px); }
+
+  .main-panel { overflow-y: auto; padding: 12px; }
+  .side-panel { border-left: 1px solid #30363d; overflow-y: auto; padding: 12px; }
+
+  .panel-title { font-size: 11px; color: #8b949e; text-transform: uppercase;
+                 letter-spacing: 1px; margin-bottom: 8px; }
+  .pnl-summary { font-size: 18px; font-weight: bold; margin-bottom: 12px; }
+  .pnl-pos { color: #3fb950; }
+  .pnl-neg { color: #f85149; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { color: #8b949e; text-align: left; padding: 4px 8px; border-bottom: 1px solid #21262d;
+       position: sticky; top: 0; background: #0d1117; }
+  td { padding: 4px 8px; border-bottom: 1px solid #161b22; }
+  tr:hover td { background: #161b22; }
+
+  .dir-buy  { color: #3fb950; }
+  .dir-sell { color: #f85149; }
+  .st-scheduled { color: #8b949e; }
+  .st-submitted { color: #79c0ff; }
+  .st-open      { color: #e3b341; }
+  .st-tp        { color: #3fb950; font-weight: bold; }
+  .st-sl        { color: #f85149; font-weight: bold; }
+  .st-expired   { color: #484f58; }
+  .st-error     { color: #f85149; }
+  .st-submitting{ color: #79c0ff; }
+  .st-simulating{ color: #8b949e; }
+
+  .pnl-p { color: #3fb950; }
+  .pnl-n { color: #f85149; }
+  .tbd   { color: #484f58; font-style: italic; }
+
+  .events-list { list-style: none; font-size: 11px; }
+  .events-list li { padding: 3px 0; border-bottom: 1px solid #161b22; display: flex; gap: 8px; }
+  .ev-time  { color: #484f58; flex-shrink: 0; }
+  .ev-CONN  { color: #79c0ff; }
+  .ev-FILL  { color: #3fb950; font-weight: bold; }
+  .ev-ORDER { color: #e3b341; }
+  .ev-RESULT{ color: #3fb950; font-weight: bold; }
+  .ev-ERROR { color: #f85149; }
+  .ev-WARN  { color: #e3b341; }
+  .ev-INFO  { color: #8b949e; }
+  .ev-FETCH { color: #79c0ff; }
+  .ev-PRICE { color: #c9d1d9; }
+  .ev-STOP  { color: #f85149; }
+
+  .empty { color: #484f58; font-style: italic; padding: 20px 0; text-align: center; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>back-trading</h1>
+  <span id="hdr-badge" class="badge badge-sim">SIM</span>
+  <span id="hdr-date" style="color:#8b949e"></span>
+  <span id="hdr-pnl" style="margin-left:auto;font-size:15px;font-weight:bold"></span>
+</header>
+
+<div class="controls">
+  <label>Date</label>
+  <input type="date" id="ctrl-date" value="">
+
+  <label>Mode</label>
+  <div class="mode-toggle">
+    <button id="btn-mode-sim"  onclick="setMode('sim')"  class="active-sim">SIM</button>
+    <button id="btn-mode-live" onclick="setMode('live')">LIVE PAPER</button>
+  </div>
+
+  <label>Symbol</label>
+  <select id="ctrl-symbol"><option>MES</option></select>
+
+  <button class="action btn-generate" id="btn-generate" onclick="doGenerate()">Generate</button>
+  <button class="action btn-send"     id="btn-send"     onclick="doSend()"     disabled>Send to Paper</button>
+  <button class="action btn-stop"     id="btn-stop"     onclick="doStop()"     disabled>Stop</button>
+</div>
+
+<div class="status-bar">
+  <span>Status: <span id="sb-status" class="pill pill-idle">idle</span></span>
+  <span id="sb-counts" style="color:#8b949e"></span>
+  <span id="sb-error"  style="color:#f85149"></span>
+</div>
+
+<div class="layout">
+  <div class="main-panel">
+    <div class="panel-title">Orders</div>
+    <table id="orders-table">
+      <thead>
+        <tr>
+          <th>#</th><th>Placed</th><th>Dir</th><th>BkSz</th>
+          <th>Entry</th><th>TP</th><th>SL</th>
+          <th>Filled@</th><th>Exit</th><th>Exit@</th><th>P&amp;L</th><th>Status</th>
+        </tr>
+      </thead>
+      <tbody id="orders-body">
+        <tr><td colspan="12" class="empty">Click Generate to start</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="side-panel">
+    <div class="panel-title">IB Events</div>
+    <ul class="events-list" id="events-list">
+      <li><span class="ev-time">—</span><span class="ev-INFO">Waiting...</span></li>
+    </ul>
+  </div>
+</div>
+
+<script>
+let _mode = "sim";
+let _status = "idle";
+let _pollInterval = null;
+
+// Set default date to today
+document.getElementById("ctrl-date").value = new Date().toISOString().slice(0,10);
+
+function setMode(m) {
+  _mode = m;
+  document.getElementById("btn-mode-sim").className  = m === "sim"  ? "active-sim"  : "";
+  document.getElementById("btn-mode-live").className = m === "live" ? "active-live" : "";
+  document.getElementById("hdr-badge").className = "badge badge-" + m;
+  document.getElementById("hdr-badge").textContent  = m === "sim" ? "SIM" : "LIVE PAPER";
+  document.getElementById("btn-send").disabled = true;
+}
+
+function doGenerate() {
+  const d = document.getElementById("ctrl-date").value;
+  const sym = document.getElementById("ctrl-symbol").value;
+  fetch("/api/generate", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({date: d, mode: _mode, symbol: sym})
+  }).then(r => r.json()).then(data => {
+    if (data.error) { alert(data.error); return; }
+    startPolling();
+  });
+}
+
+function doSend() {
+  fetch("/api/send", { method: "POST" })
+    .then(r => r.json()).then(data => {
+      if (data.error) { alert(data.error); return; }
+      document.getElementById("btn-send").disabled = true;
+      document.getElementById("btn-stop").disabled = false;
+    });
+}
+
+function doStop() {
+  fetch("/api/stop", { method: "POST" });
+}
+
+function startPolling() {
+  if (_pollInterval) clearInterval(_pollInterval);
+  _pollInterval = setInterval(poll, 1500);
+  poll();
+}
+
+function poll() {
+  fetch("/api/status").then(r => r.json()).then(update);
+}
+
+function update(s) {
+  _status = s.status;
+  document.getElementById("hdr-date").textContent = s.date || "";
+  updateStatusBar(s);
+  updateOrders(s);
+  updateEvents(s);
+  updatePnl(s);
+  updateButtons(s);
+}
+
+function updateStatusBar(s) {
+  const el = document.getElementById("sb-status");
+  el.className = "pill pill-" + s.status;
+  el.textContent = s.status;
+
+  const orders = s.orders || [];
+  const fills  = s.fills  || [];
+  const tp  = fills.filter(f => f && f.exit_type === "TP").length;
+  const sl  = fills.filter(f => f && f.exit_type === "SL").length;
+  const exp = fills.filter(f => f && f.exit_type === "EXPIRED").length;
+  const submitted = orders.filter(o => o.status === "SUBMITTED" || o.status === "OPEN").length;
+  document.getElementById("sb-counts").textContent =
+    orders.length ? `${orders.length} orders | TP:${tp} SL:${sl} EXP:${exp} OPEN:${submitted}` : "";
+  document.getElementById("sb-error").textContent = s.error || "";
+}
+
+function fmtTime(iso) {
+  if (!iso) return "—";
+  // Show CT time from UTC ISO string
+  const d = new Date(iso);
+  return d.toLocaleTimeString("en-US", {timeZone: "America/Chicago",
+                                        hour: "2-digit", minute: "2-digit", second: "2-digit"});
+}
+
+function fmtPrice(p) {
+  return p != null ? Number(p).toFixed(2) : '<span class="tbd">TBD</span>';
+}
+
+function updateOrders(s) {
+  const tbody = document.getElementById("orders-body");
+  const orders = s.orders || [];
+  const fills  = s.fills  || [];
+
+  if (!orders.length) {
+    tbody.innerHTML = '<tr><td colspan="12" class="empty">Click Generate to start</td></tr>';
+    return;
+  }
+
+  let rows = "";
+  orders.forEach((o, i) => {
+    const f = fills[i] || {};
+    const dir = o.direction || "";
+    const dirClass = dir === "BUY" ? "dir-buy" : "dir-sell";
+    const st = (f.exit_type || o.status || "").toUpperCase();
+    const stClass = "st-" + st.toLowerCase();
+    const pnl = f.pnl != null
+      ? `<span class="${f.pnl >= 0 ? 'pnl-p' : 'pnl-n'}">${f.pnl >= 0 ? "+" : ""}$${Number(f.pnl).toFixed(2)}</span>`
+      : (st === "EXPIRED" ? '<span class="tbd">—</span>' : "");
+    const ep  = f.entry_fill_price != null ? Number(f.entry_fill_price).toFixed(2) : (o.entry_price != null ? '<span class="tbd">—</span>' : '<span class="tbd">TBD</span>');
+    const xp  = f.exit_fill_price  != null ? Number(f.exit_fill_price).toFixed(2)  : "";
+    rows += `<tr>
+      <td>${i+1}</td>
+      <td>${fmtTime(typeof o.ts_placed === "string" ? o.ts_placed : null)}</td>
+      <td class="${dirClass}">${dir[0]}</td>
+      <td>${o.bracket_size || ""}</td>
+      <td>${fmtPrice(o.entry_price)}</td>
+      <td>${fmtPrice(o.tp_price)}</td>
+      <td>${fmtPrice(o.sl_price)}</td>
+      <td>${ep}</td>
+      <td class="${stClass}">${st || ""}</td>
+      <td>${xp || ""}</td>
+      <td>${pnl}</td>
+      <td class="${stClass}">${o.status || ""}</td>
+    </tr>`;
+  });
+  tbody.innerHTML = rows;
+}
+
+function updateEvents(s) {
+  const ul = document.getElementById("events-list");
+  const evs = (s.ib_events || []).slice().reverse();
+  if (!evs.length) return;
+  ul.innerHTML = evs.map(e =>
+    `<li><span class="ev-time">${e.time}</span><span class="ev-${e.type}">[${e.type}] ${e.msg}</span></li>`
+  ).join("");
+}
+
+function updatePnl(s) {
+  const el = document.getElementById("hdr-pnl");
+  if (s.pnl != null) {
+    el.className = s.pnl >= 0 ? "pnl-pos" : "pnl-neg";
+    el.textContent = `${s.pnl >= 0 ? "+" : ""}$${Number(s.pnl).toFixed(2)}`;
+  } else {
+    el.textContent = "";
+  }
+}
+
+function updateButtons(s) {
+  const isActive = ["generating","simulating","fetching","running"].includes(s.status);
+  document.getElementById("btn-generate").disabled = isActive;
+  document.getElementById("btn-send").disabled =
+    !(s.status === "scheduled" && _mode === "live");
+  document.getElementById("btn-stop").disabled = s.status !== "running";
+  if (["done","error","idle"].includes(s.status) && _pollInterval) {
+    clearInterval(_pollInterval);
+    _pollInterval = null;
+  }
+}
+
+// Start polling immediately
+startPolling();
+</script>
+</body>
+</html>
