@@ -1,14 +1,16 @@
 {
   "permissions": {
     "allow": [
-      "Bash(python:*)",
-      "Bash(gh auth:*)",
-      "Bash(git init:*)",
-      "Bash(git remote:*)",
-      "Bash(git add:*)",
-      "Bash(rm -rf c:/Projects/galgo2026_temp)",
-      "Bash(mkdir -p c:/Projects/galgo2026/logs c:/Projects/galgo2026/data/critical_lines c:/Projects/galgo2026/data/history)",
-      "Bash(cd:*)"
+      "Bash(git -C c:/Projects/galgo2026 remote -v)",
+      "Bash(git -C c:/Projects/galgo2026 status)",
+      "Bash(cat c:/Projects/galgo2026/docs/*)",
+      "Bash(netstat -ano)",
+      "Bash(findstr \":5000\")",
+      "Bash(tasklist *)",
+      "Bash(cmd *)",
+      "Bash(powershell *)",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

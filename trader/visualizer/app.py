@@ -39,9 +39,11 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 _HERE = Path(__file__).parent
-_ROOT = _HERE.parent.parent   # trader/visualizer -> trader -> galgo2026
-if str(_ROOT) not in sys.path:
-    sys.path.insert(0, str(_ROOT))
+_TRADER = _HERE.parent        # trader/visualizer -> trader
+_ROOT = _TRADER.parent        # trader -> galgo2026
+for _p in (str(_ROOT), str(_TRADER)):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 import re
 from flask import Flask, jsonify, request, render_template
