@@ -892,6 +892,11 @@ def release_notes_page():
     return render_template("release_notes.html", active="release_notes")
 
 
+@app.route("/db")
+def db_view_page():
+    return render_template("db_view.html", active="db_view")
+
+
 @app.route("/report")
 def report_page():
     return render_template("report.html", active="report")
