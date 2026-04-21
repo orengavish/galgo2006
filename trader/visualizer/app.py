@@ -691,8 +691,8 @@ def api_reset():
 def api_report():
     """
     GET /api/report?source=X&symbol=Y&limit=N
-    Returns P&L summary for CLOSED trades:
-      trades       — list of closed commands (newest first)
+    Reads from completed_trades — guaranteed no duplicates, no missing data.
+      trades       — list of completed trades (newest first)
       by_source    — per-source stats
       by_exit      — per-exit-reason stats
       summary      — overall totals
@@ -702,7 +702,7 @@ def api_report():
     symbol  = request.args.get("symbol")
     limit   = int(request.args.get("limit", 5000))
 
-    query  = "SELECT * FROM commands WHERE status='CLOSED'"
+    query  = "SELECT * FROM completed_trades WHERE 1=1"
     params = []
     if source:
         query += " AND source=?"
@@ -710,18 +710,18 @@ def api_report():
     if symbol:
         query += " AND symbol=?"
         params.append(symbol)
-    query += " ORDER BY exit_time ASC NULLS LAST LIMIT ?"
+    query += " ORDER BY exit_time ASC LIMIT ?"
     params.append(limit)
 
     with get_db(_get_db_path()) as con:
         rows = _rows_to_list(con.execute(query, params).fetchall())
 
-    trades_with_pnl = [r for r in rows if r.get("pnl_points") is not None]
+    trades_with_pnl = rows  # completed_trades always has pnl_points (NOT NULL)
 
     # ── by_source ──
     src_map: dict = {}
     for r in rows:
-        src = r.get("source") or "unknown"
+        src = r["source"] or "unknown"
         if src not in src_map:
             src_map[src] = {"source": src, "count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
         src_map[src]["count"] += 1
@@ -742,7 +742,7 @@ def api_report():
     # ── by_exit ──
     exit_map: dict = {}
     for r in rows:
-        reason = r.get("exit_reason") or "unknown"
+        reason = r["exit_reason"] or "unknown"
         exit_map[reason] = exit_map.get(reason, 0) + 1
     by_exit = [{"reason": k, "count": v} for k, v in sorted(exit_map.items())]
 
@@ -766,10 +766,10 @@ def api_report():
     for r in trades_with_pnl:
         cumulative += r["pnl_points"]
         equity_curve.append({
-            "time":       r.get("exit_time", ""),
+            "time":       r["exit_time"],
             "pnl":        round(r["pnl_points"], 4),
             "cumulative": round(cumulative, 4),
-            "source":     r.get("source") or "unknown",
+            "source":     r["source"] or "unknown",
         })
 
     return jsonify({

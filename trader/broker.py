@@ -30,7 +30,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state
+from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket
 
@@ -312,6 +312,76 @@ def poll_fills(ibc: IBClient, db_path) -> int:
     return fills
 
 
+def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
+    """
+    For each FILLED command, check whether IB has filled the TP or SL child order.
+    When detected: write CLOSED + pnl_points + record to completed_trades.
+    Returns number of exits recorded.
+    """
+    if not ibc.is_paper_connected():
+        return 0
+
+    try:
+        trades = ibc.paper.trades()
+    except Exception as e:
+        log.error(f"poll_tp_sl_fills: error fetching trades: {e}")
+        return 0
+
+    # Build map of filled order IDs → avg fill price
+    ib_filled: dict[int, float] = {}
+    for trade in trades:
+        if trade.orderStatus.status == "Filled":
+            ib_filled[trade.order.orderId] = trade.orderStatus.avgFillPrice
+
+    if not ib_filled:
+        return 0
+
+    with get_db(db_path) as con:
+        filled_cmds = con.execute("SELECT * FROM commands WHERE status='FILLED'").fetchall()
+
+    if not filled_cmds:
+        return 0
+
+    closed = 0
+    now = _now_utc()
+    for cmd in filled_cmds:
+        tp_oid = cmd["ib_tp_order_id"]
+        sl_oid = cmd["ib_sl_order_id"]
+        fill_p = cmd["fill_price"]
+        if fill_p is None:
+            continue
+
+        exit_price = None
+        exit_reason = None
+
+        if tp_oid and tp_oid in ib_filled:
+            exit_price  = ib_filled[tp_oid]
+            exit_reason = "TP"
+        elif sl_oid and sl_oid in ib_filled:
+            exit_price  = ib_filled[sl_oid]
+            exit_reason = "SL"
+
+        if exit_price is None:
+            continue
+
+        pnl = (exit_price - fill_p) if cmd["direction"] == "BUY" else (fill_p - exit_price)
+
+        log.info(
+            f"Command {cmd['id']} CLOSED via {exit_reason} "
+            f"fill={fill_p} exit={exit_price} pnl={pnl:+.2f}pts"
+        )
+        with get_db(db_path) as con:
+            update_command_status(con, cmd["id"], "CLOSED",
+                                  exit_price=exit_price,
+                                  exit_time=now,
+                                  exit_reason=exit_reason,
+                                  pnl_points=round(pnl, 4))
+            record_completed_trade(con, cmd["id"])
+        closed += 1
+
+    return closed
+
+
 def run_broker(db_path=None, dry_run: bool = False):
     """Main broker loop."""
     cfg = get_config()
@@ -368,15 +438,21 @@ def run_broker(db_path=None, dry_run: bool = False):
         except Exception as e:
             log.error(f"Error in process_pending_commands: {e}")
 
-        # Periodic fill poll
+        # Periodic fill poll (entry fills + TP/SL child order exits)
         now = time.time()
         if now - last_ib_poll >= ib_poll_seconds:
             try:
                 f = poll_fills(ibc, db_path)
                 if f:
-                    log.info(f"Detected {f} fill(s)")
+                    log.info(f"Detected {f} entry fill(s)")
             except Exception as e:
                 log.error(f"Error in poll_fills: {e}")
+            try:
+                c = poll_tp_sl_fills(ibc, db_path)
+                if c:
+                    log.info(f"Detected {c} TP/SL exit(s)")
+            except Exception as e:
+                log.error(f"Error in poll_tp_sl_fills: {e}")
             last_ib_poll = now
 
         time.sleep(poll_seconds)

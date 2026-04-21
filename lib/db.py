@@ -144,10 +144,30 @@ CREATE TABLE IF NOT EXISTS release_notes (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
-CREATE INDEX IF NOT EXISTS idx_commands_status   ON commands(status);
-CREATE INDEX IF NOT EXISTS idx_commands_symbol   ON commands(symbol);
-CREATE INDEX IF NOT EXISTS idx_positions_status  ON positions(status);
-CREATE INDEX IF NOT EXISTS idx_critical_lines_sd ON critical_lines(symbol, date);
+CREATE TABLE IF NOT EXISTS completed_trades (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    command_id   INTEGER NOT NULL UNIQUE REFERENCES commands(id),
+    symbol       TEXT    NOT NULL,
+    source       TEXT,                   -- critical_line | random_mkt | random_lmt | random_stp | test
+    direction    TEXT    NOT NULL,       -- BUY | SELL
+    entry_type   TEXT    NOT NULL,       -- MKT | LMT | STP
+    bracket_size REAL    NOT NULL,
+    ib_order_id  INTEGER,
+    fill_price   REAL    NOT NULL,
+    fill_time    TEXT    NOT NULL,
+    exit_price   REAL    NOT NULL,
+    exit_time    TEXT    NOT NULL,
+    exit_reason  TEXT    NOT NULL,       -- TP | SL | STAGNATION | SHUTDOWN | MANUAL
+    pnl_points   REAL    NOT NULL,
+    recorded_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_commands_status      ON commands(status);
+CREATE INDEX IF NOT EXISTS idx_commands_symbol      ON commands(symbol);
+CREATE INDEX IF NOT EXISTS idx_positions_status     ON positions(status);
+CREATE INDEX IF NOT EXISTS idx_critical_lines_sd    ON critical_lines(symbol, date);
+CREATE INDEX IF NOT EXISTS idx_completed_source     ON completed_trades(source);
+CREATE INDEX IF NOT EXISTS idx_completed_exit_time  ON completed_trades(exit_time);
 """
 
 
@@ -194,6 +214,35 @@ def update_command_status(con, command_id: int, status: str, **kwargs):
     sets += ", updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
     values = list(fields.values()) + [command_id]
     con.execute(f"UPDATE commands SET {sets} WHERE id=?", values)
+
+
+def record_completed_trade(con, command_id: int) -> bool:
+    """
+    Write one row to completed_trades for a CLOSED command.
+    INSERT OR IGNORE on UNIQUE(command_id) guarantees exactly-once semantics —
+    safe to call multiple times for the same command_id.
+    Returns True if a new row was inserted, False if already recorded.
+    """
+    row = con.execute("SELECT * FROM commands WHERE id=?", (command_id,)).fetchone()
+    if not row:
+        return False
+    if row["fill_price"] is None or row["exit_price"] is None or row["pnl_points"] is None:
+        return False
+    cur = con.execute("""
+        INSERT OR IGNORE INTO completed_trades
+            (command_id, symbol, source, direction, entry_type, bracket_size,
+             ib_order_id, fill_price, fill_time, exit_price, exit_time,
+             exit_reason, pnl_points)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        command_id, row["symbol"], row["source"],
+        row["direction"], row["entry_type"], row["bracket_size"],
+        row["ib_order_id"],
+        row["fill_price"], row["fill_time"],
+        row["exit_price"], row["exit_time"],
+        row["exit_reason"], row["pnl_points"],
+    ))
+    return cur.rowcount == 1
 
 
 def get_pending_commands(con, symbol: str = None) -> list:

@@ -30,7 +30,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_system_state, update_command_status
+from lib.db import get_db, init_db, get_system_state, update_command_status, record_completed_trade
 from lib.critical_lines import disarm_line, rearm_line
 
 log = get_logger("position_manager")
@@ -108,17 +108,18 @@ def check_stagnation(ibc, db_path, cfg) -> int:
         try:
             _place_market_exit(ibc, cmd)
             exit_price = current_price  # approximate
+            pnl = (exit_price - fill_price) if cmd["direction"] == "BUY" \
+                  else (fill_price - exit_price)
             with get_db(db_path) as con:
                 update_command_status(
                     con, cmd["id"], "CLOSED",
                     exit_price  = exit_price,
                     exit_time   = _now_utc(),
                     exit_reason = "STAGNATION",
-                    pnl_points  = (exit_price - fill_price)
-                                  if cmd["direction"] == "BUY"
-                                  else (fill_price - exit_price),
+                    pnl_points  = round(pnl, 4),
                 )
-            log.info(f"Command {cmd['id']} CLOSED via STAGNATION exit")
+                record_completed_trade(con, cmd["id"])
+            log.info(f"Command {cmd['id']} CLOSED via STAGNATION pnl={pnl:+.2f}pts")
             exited += 1
         except Exception as e:
             log.error(f"Failed to exit stagnant position cmd {cmd['id']}: {e}")
