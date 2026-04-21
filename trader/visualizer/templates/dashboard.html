@@ -2,13 +2,40 @@
 {% block title %}Dashboard — Galao{% endblock %}
 {% block content %}
 
-<div style="display:flex;align-items:center;gap:12px;margin-bottom:12px">
-  <button id="btn-test" onclick="sendTestTrades()"
-    style="background:#1a3a1a;color:#3fb950;border:1px solid #3fb950;padding:5px 14px;
-           border-radius:4px;cursor:pointer;font-family:monospace;font-size:12px;font-weight:bold">
-    Send Test
-  </button>
-  <span id="test-status" style="font-size:12px;color:#8b949e"></span>
+<div class="card" style="margin-bottom:12px;padding:10px 14px">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <span style="color:#79c0ff;font-size:12px;font-weight:bold;min-width:60px">GENERATE</span>
+
+    <label style="font-size:11px;color:#8b949e">Bracket&nbsp;pts
+      <input id="g-bracket" type="number" value="8" min="0.25" step="0.25"
+        style="width:60px;margin-left:4px;background:#0d1117;color:#c9d1d9;
+               border:1px solid #30363d;padding:2px 5px;border-radius:3px;font-family:monospace">
+    </label>
+
+    <label style="font-size:11px;color:#8b949e">Max offset&nbsp;ticks
+      <input id="g-offset" type="number" value="2" min="1" max="20"
+        style="width:46px;margin-left:4px;background:#0d1117;color:#c9d1d9;
+               border:1px solid #30363d;padding:2px 5px;border-radius:3px;font-family:monospace">
+    </label>
+
+    <label style="font-size:11px;color:#8b949e">Count
+      <input id="g-count" type="number" value="10" min="1" max="200"
+        style="width:50px;margin-left:4px;background:#0d1117;color:#c9d1d9;
+               border:1px solid #30363d;padding:2px 5px;border-radius:3px;font-family:monospace">
+    </label>
+
+    <span style="font-size:11px;color:#8b949e">Types</span>
+    <label style="font-size:11px;color:#3fb950"><input type="checkbox" id="g-mkt" checked> MKT</label>
+    <label style="font-size:11px;color:#79c0ff"><input type="checkbox" id="g-lmt" checked> LMT</label>
+    <label style="font-size:11px;color:#e3b341"><input type="checkbox" id="g-stp" checked> STP</label>
+
+    <button id="btn-gen" onclick="doGenerate()"
+      style="background:#1a2d1a;color:#3fb950;border:1px solid #3fb950;padding:4px 16px;
+             border-radius:4px;cursor:pointer;font-family:monospace;font-size:12px;font-weight:bold">
+      Generate
+    </button>
+    <span id="gen-status" style="font-size:11px;color:#8b949e"></span>
+  </div>
 </div>
 
 <div class="card-row" style="margin-bottom:12px">
@@ -135,15 +162,30 @@ function refreshLadder(){
 refreshLadder();
 setInterval(refreshLadder, 5000);
 
-function sendTestTrades(){
-  const btn = document.getElementById('btn-test');
-  const st  = document.getElementById('test-status');
+function doGenerate(){
+  const btn = document.getElementById('btn-gen');
+  const st  = document.getElementById('gen-status');
+
+  const bracket  = parseFloat(document.getElementById('g-bracket').value) || 8;
+  const offset   = parseInt(document.getElementById('g-offset').value)    || 2;
+  const count    = parseInt(document.getElementById('g-count').value)     || 10;
+  const types    = [];
+  if(document.getElementById('g-mkt').checked) types.push('MKT');
+  if(document.getElementById('g-lmt').checked) types.push('LMT');
+  if(document.getElementById('g-stp').checked) types.push('STP');
+
+  if(!types.length){ st.style.color='#f85149'; st.textContent='✗ Select at least one type'; return; }
+
   btn.disabled = true;
-  btn.textContent = 'Sending...';
+  btn.textContent = 'Generating...';
   st.style.color = '#8b949e';
   st.textContent = '';
 
-  fetch('/api/test-trades', {method:'POST'})
+  fetch('/api/generate', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({bracket, types, count, max_offset: offset})
+  })
     .then(r => r.json())
     .then(d => {
       if(d.error){
@@ -151,20 +193,11 @@ function sendTestTrades(){
         st.textContent = '✗ ' + d.error;
       } else {
         st.style.color = '#3fb950';
-        const summary = d.commands.map(c =>
-          `#${c.id} ${c.direction} ${c.entry_type} @${c.entry_price}`
-        ).join('  |  ');
-        st.textContent = `✓ ${d.count} orders inserted near ${d.price.toFixed(2)} — ${summary}`;
+        st.textContent = `✓ ${d.count} orders near ${d.price.toFixed(2)}`;
       }
     })
-    .catch(e => {
-      st.style.color = '#f85149';
-      st.textContent = '✗ ' + e;
-    })
-    .finally(() => {
-      btn.disabled = false;
-      btn.textContent = 'Send Test';
-    });
+    .catch(e => { st.style.color='#f85149'; st.textContent='✗ '+e; })
+    .finally(() => { btn.disabled=false; btn.textContent='Generate'; });
 }
 </script>
 {% endblock %}

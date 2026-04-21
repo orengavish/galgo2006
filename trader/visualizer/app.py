@@ -307,6 +307,89 @@ def api_release_notes():
     return jsonify(_rows_to_list(rows))
 
 
+# ── Generate API ─────────────────────────────────────────────────────────────
+
+@app.route("/api/generate", methods=["POST"])
+def api_generate():
+    """
+    POST /api/generate
+    Body JSON:
+      bracket      float  — bracket size in points (default 4.0)
+      types        list   — entry types to use, e.g. ["MKT","LMT","STP"]
+      count        int    — number of trades to insert (default 10, max 200)
+      max_offset   int    — max entry offset from live price in ticks (default 2)
+
+    Returns {count, price, commands: [...]}
+    """
+    body       = request.get_json(force=True) or {}
+    bracket    = float(body.get("bracket", 4.0))
+    types      = [t.upper() for t in body.get("types", ["MKT", "LMT", "STP"])]
+    count      = min(int(body.get("count", 10)), 200)
+    max_offset = int(body.get("max_offset", 2))
+
+    if not types:
+        return jsonify({"error": "At least one entry type required"}), 400
+
+    try:
+        from visualizer.price_feed import get_latest
+        price, _ = get_latest()
+    except Exception:
+        price = None
+
+    if price is None:
+        return jsonify({"error": "No price available — price feed not running"}), 400
+
+    import random as _rnd
+    from random_gen import _build_trade, _insert_pending, _pick_entry_type
+
+    cfg    = _get_cfg()
+    tick   = cfg.orders.tick_size
+
+    def rt(p):
+        return round(round(p / tick) * tick, 10)
+
+    inserted = []
+    with get_db(_get_db_path()) as _con:
+        pass  # just ensure DB open; inserts happen inside _insert_pending
+
+    for _ in range(count):
+        # Force entry_type from allowed types only
+        entry_type = _rnd.choice(types)
+        direction  = _rnd.choice(["BUY", "SELL"])
+        offset     = _rnd.randint(1, max(1, max_offset)) * tick
+
+        if entry_type == "MKT":
+            entry_price = rt(price)
+        elif entry_type == "LMT":
+            entry_price = rt(price - offset) if direction == "BUY" else rt(price + offset)
+        else:  # STP
+            entry_price = rt(price + offset) if direction == "BUY" else rt(price - offset)
+
+        tp_price = rt(entry_price + bracket) if direction == "BUY" else rt(entry_price - bracket)
+        sl_price = rt(entry_price - bracket) if direction == "BUY" else rt(entry_price + bracket)
+
+        trade = {
+            "symbol":        (cfg.symbols or ["MES"])[0],
+            "line_price":    entry_price,
+            "line_type":     "SUPPORT" if direction == "BUY" else "RESISTANCE",
+            "line_strength": _rnd.randint(1, 3),
+            "direction":     direction,
+            "entry_type":    entry_type,
+            "entry_price":   entry_price,
+            "tp_price":      tp_price,
+            "sl_price":      sl_price,
+            "bracket_size":  bracket,
+            "source":        f"random_{entry_type.lower()}",
+            "quantity":      cfg.orders.quantity,
+        }
+        cmd_id = _insert_pending(_get_db_path(), trade)
+        inserted.append({"id": cmd_id, "direction": direction, "entry_type": entry_type,
+                          "entry_price": entry_price, "tp_price": tp_price, "sl_price": sl_price})
+
+    log.info(f"[generate] Inserted {len(inserted)} commands near price={price} bracket={bracket}")
+    return jsonify({"count": len(inserted), "price": price, "commands": inserted})
+
+
 # ── Test Trades API ───────────────────────────────────────────────────────────
 
 @app.route("/api/test-trades", methods=["POST"])
