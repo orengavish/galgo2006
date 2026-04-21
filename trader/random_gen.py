@@ -37,11 +37,11 @@ from lib.db import get_db, init_db, get_system_state, update_command_status
 
 log = get_logger("random_gen")
 
-_DEFAULT_RATE   = 6    # trades per minute
-_MKT_WEIGHT     = 0.50
-_LMT_WEIGHT     = 0.25
-_STP_WEIGHT     = 0.25
-_MAX_OFFSET_TICKS = 8
+_DEFAULT_RATE      = 6    # trades per minute
+_MKT_WEIGHT        = 0.50
+_LMT_WEIGHT        = 0.25
+_STP_WEIGHT        = 0.25
+_DEFAULT_MAX_OFFSET_TICKS = 8
 
 
 def _now_utc() -> str:
@@ -65,13 +65,15 @@ def _pick_entry_type() -> str:
     )[0]
 
 
-def _build_trade(symbol: str, price: float, cfg) -> dict:
+def _build_trade(symbol: str, price: float, cfg,
+                 bracket_override: float = None,
+                 max_offset_ticks: int = _DEFAULT_MAX_OFFSET_TICKS) -> dict:
     """Return a dict of command fields for one random bracket trade."""
     tick         = cfg.orders.tick_size
-    bracket_size = random.choice(cfg.orders.active_brackets)
+    bracket_size = bracket_override if bracket_override else random.choice(cfg.orders.active_brackets)
     direction    = random.choice(["BUY", "SELL"])
     entry_type   = _pick_entry_type()
-    offset       = random.randint(1, _MAX_OFFSET_TICKS) * tick
+    offset       = random.randint(1, max(1, max_offset_ticks)) * tick
 
     if entry_type == "MKT":
         entry_price = _rt(price, tick)
@@ -172,7 +174,9 @@ def _simulate_lifecycle(db_path, cmd_id: int, trade: dict, tick: float):
 
 
 def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
-            dry_run: bool = False, symbol: str = None):
+            dry_run: bool = False, symbol: str = None,
+            bracket_override: float = None,
+            max_offset_ticks: int = _DEFAULT_MAX_OFFSET_TICKS):
     """
     Main generator loop.
     dry_run: simulate fill+close in-process (no IB needed).
@@ -183,7 +187,8 @@ def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
 
     log.info(
         f"random_gen starting — symbol={symbol} rate={rate_per_min}/min "
-        f"sleep={sleep_secs:.1f}s dry_run={dry_run}"
+        f"sleep={sleep_secs:.1f}s bracket={bracket_override or 'random'} "
+        f"max_offset={max_offset_ticks}ticks dry_run={dry_run}"
     )
 
     if not dry_run:
@@ -219,7 +224,9 @@ def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
             sim_price += random.gauss(0, 0.5)
             price = round(sim_price, 2)
 
-        trade = _build_trade(symbol, price, cfg)
+        trade = _build_trade(symbol, price, cfg,
+                             bracket_override=bracket_override,
+                             max_offset_ticks=max_offset_ticks)
         cmd_id = _insert_pending(db_path, trade)
 
         log.info(
@@ -310,6 +317,10 @@ if __name__ == "__main__":
                         help="Simulate full lifecycle without IB")
     parser.add_argument("--rate", type=float, default=_DEFAULT_RATE,
                         metavar="N", help="Trades per minute (default 6)")
+    parser.add_argument("--bracket", type=float, default=None,
+                        metavar="PTS", help="Fixed bracket size in points (default: random from config)")
+    parser.add_argument("--max-offset", type=int, default=_DEFAULT_MAX_OFFSET_TICKS,
+                        metavar="T", help="Max entry offset from live price in ticks (default 8; use 1-2 for near-market fills)")
     parser.add_argument("--symbol", default=None, help="Override symbol from config")
     args = parser.parse_args()
 
@@ -323,4 +334,6 @@ if __name__ == "__main__":
     run_gen(db_path, cfg,
             rate_per_min=args.rate,
             dry_run=args.dry_run,
-            symbol=args.symbol)
+            symbol=args.symbol,
+            bracket_override=args.bracket,
+            max_offset_ticks=args.max_offset)

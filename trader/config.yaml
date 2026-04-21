@@ -27,7 +27,7 @@ orders:
   tick_size: 0.25
 
 position:
-  stagnation_seconds: 60
+  stagnation_seconds: 300
   stagnation_min_move_points: 0.5
   sl_cooldown_seconds: 30
 
