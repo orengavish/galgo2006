@@ -2,14 +2,25 @@
 {% block title %}Dashboard — Galao{% endblock %}
 {% block content %}
 
-<div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
-  <button id="btn-replenish" onclick="toggleReplenish()"
-    style="font-family:monospace;font-size:14px;font-weight:bold;padding:7px 28px;
-           border-radius:5px;cursor:pointer;border:2px solid #30363d;
-           background:#161b22;color:#6e7681;min-width:200px">
-    REPLENISH: OFF
-  </button>
-  <span id="replenish-info" style="font-size:11px;color:#8b949e"></span>
+<div class="card" style="margin-bottom:10px;padding:10px 14px">
+  <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+    <button id="btn-replenish" onclick="toggleReplenish()"
+      style="font-family:monospace;font-size:13px;font-weight:bold;padding:6px 22px;
+             border-radius:5px;cursor:pointer;border:2px solid #30363d;
+             background:#161b22;color:#6e7681;min-width:180px;white-space:nowrap">
+      REPLENISH: OFF
+    </button>
+
+    <div id="rp-stats" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
+      <span class="rp-pill" id="rp-total"  style="font-size:11px;color:#8b949e">total: —</span>
+      <span class="rp-pill" id="rp-pending"  style="font-size:11px;color:#d29922"></span>
+      <span class="rp-pill" id="rp-submitted" style="font-size:11px;color:#58a6ff"></span>
+      <span class="rp-pill" id="rp-filled"   style="font-size:11px;color:#3fb950"></span>
+      <span class="rp-pill" id="rp-closed"   style="font-size:11px;color:#6e7681"></span>
+      <span class="rp-pill" id="rp-error"    style="font-size:11px;color:#f85149"></span>
+      <span class="rp-pill" id="rp-pnl"      style="font-size:12px;font-weight:bold"></span>
+    </div>
+  </div>
 </div>
 
 <div class="card" style="margin-bottom:12px;padding:10px 14px">
@@ -124,6 +135,23 @@ function refreshStats(){
     const el = document.getElementById('s-pnl');
     el.textContent = pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) : '--';
     el.className = 'val ' + (pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : '');
+
+    // ── Replenish stats ────────────────────────────────────────────────
+    const rp = d.replenish || {};
+    document.getElementById('rp-total').textContent   = rp.total ? `↻ total: ${rp.total}` : '↻ none yet';
+    document.getElementById('rp-pending').textContent  = rp.pending   ? `${rp.pending} pending`   : '';
+    document.getElementById('rp-submitted').textContent= rp.submitted ? `${rp.submitted} submitted`: '';
+    document.getElementById('rp-filled').textContent   = rp.filled    ? `${rp.filled} filled`     : '';
+    document.getElementById('rp-closed').textContent   = rp.closed    ? `${rp.closed} closed`     : '';
+    document.getElementById('rp-error').textContent    = rp.error     ? `${rp.error} err`         : '';
+    const rpPnl = rp.pnl;
+    const rpEl  = document.getElementById('rp-pnl');
+    if(rpPnl != null && rp.closed > 0){
+      rpEl.textContent  = (rpPnl >= 0 ? '+' : '') + rpPnl.toFixed(2) + ' pts';
+      rpEl.style.color  = rpPnl >= 0 ? '#3fb950' : '#f85149';
+    } else {
+      rpEl.textContent = '';
+    }
   });
 }
 refreshStats();

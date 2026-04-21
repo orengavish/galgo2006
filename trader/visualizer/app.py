@@ -147,6 +147,32 @@ def api_stats():
             for p in positions
         )
     counts["unrealized_pnl"] = round(pnl, 2) if pnl is not None else None
+
+    # ── Replenish stats (commands with parent_command_id set) ──────────────
+    with get_db(_get_db_path()) as con:
+        rp_rows = con.execute(
+            "SELECT status, COUNT(*) as cnt FROM commands"
+            " WHERE parent_command_id IS NOT NULL GROUP BY status"
+        ).fetchall()
+        rp_total = con.execute(
+            "SELECT COUNT(*) FROM commands WHERE parent_command_id IS NOT NULL"
+        ).fetchone()[0]
+        rp_closed_pnl = con.execute(
+            "SELECT SUM(pnl_points) FROM commands"
+            " WHERE parent_command_id IS NOT NULL AND status='CLOSED'"
+        ).fetchone()[0]
+
+    rp_by_status = {r["status"]: r["cnt"] for r in rp_rows}
+    counts["replenish"] = {
+        "total":    rp_total,
+        "pending":  rp_by_status.get("PENDING", 0),
+        "submitted": rp_by_status.get("SUBMITTED", 0) + rp_by_status.get("SUBMITTING", 0),
+        "filled":   rp_by_status.get("FILLED", 0),
+        "closed":   rp_by_status.get("CLOSED", 0),
+        "error":    rp_by_status.get("ERROR", 0),
+        "pnl":      round(rp_closed_pnl, 2) if rp_closed_pnl is not None else None,
+    }
+
     return jsonify(counts)
 
 
