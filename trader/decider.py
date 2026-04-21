@@ -100,8 +100,8 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
                         INSERT INTO commands
                             (symbol, line_price, line_type, line_strength,
                              direction, entry_type, entry_price, tp_price, sl_price,
-                             bracket_size, quantity, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                             bracket_size, source, quantity, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, 'PENDING')
                     """, (
                         symbol, line_price, line_type, strength,
                         direction, entry_type,
@@ -182,8 +182,8 @@ def replenish(symbol: str, date_str: str, current_price: float,
                 INSERT INTO commands
                     (symbol, line_price, line_type, line_strength,
                      direction, entry_type, entry_price, tp_price, sl_price,
-                     bracket_size, quantity, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+                     bracket_size, source, quantity, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, 'PENDING')
             """, (
                 cmd["symbol"], cmd["line_price"], cmd["line_type"], cmd["line_strength"],
                 cmd["direction"], entry_type,

@@ -354,8 +354,8 @@ def api_test_trades():
             con.execute(
                 "INSERT INTO commands"
                 " (symbol, line_price, line_type, line_strength,"
-                "  direction, entry_type, entry_price, tp_price, sl_price, bracket_size)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "  direction, entry_type, entry_price, tp_price, sl_price, bracket_size, source)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'test')",
                 (symbol, rt(price), line_type, 1,
                  direction, entry_type, entry_price, tp_price, sl_price, bracket)
             )
@@ -602,6 +602,102 @@ def api_reset():
     return jsonify(result)
 
 
+# ── Report API ────────────────────────────────────────────────────────────────
+
+@app.route("/api/report")
+def api_report():
+    """
+    GET /api/report?source=X&symbol=Y&limit=N
+    Returns P&L summary for CLOSED trades:
+      trades       — list of closed commands (newest first)
+      by_source    — per-source stats
+      by_exit      — per-exit-reason stats
+      summary      — overall totals
+      equity_curve — [{time, pnl, cumulative}] sorted by exit_time
+    """
+    source  = request.args.get("source")
+    symbol  = request.args.get("symbol")
+    limit   = int(request.args.get("limit", 5000))
+
+    query  = "SELECT * FROM commands WHERE status='CLOSED'"
+    params = []
+    if source:
+        query += " AND source=?"
+        params.append(source)
+    if symbol:
+        query += " AND symbol=?"
+        params.append(symbol)
+    query += " ORDER BY exit_time ASC NULLS LAST LIMIT ?"
+    params.append(limit)
+
+    with get_db(_get_db_path()) as con:
+        rows = _rows_to_list(con.execute(query, params).fetchall())
+
+    trades_with_pnl = [r for r in rows if r.get("pnl_points") is not None]
+
+    # ── by_source ──
+    src_map: dict = {}
+    for r in rows:
+        src = r.get("source") or "unknown"
+        if src not in src_map:
+            src_map[src] = {"source": src, "count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
+        src_map[src]["count"] += 1
+        pnl = r.get("pnl_points")
+        if pnl is not None:
+            src_map[src]["total_pnl"] += pnl
+            if pnl > 0:
+                src_map[src]["wins"] += 1
+            else:
+                src_map[src]["losses"] += 1
+    for s in src_map.values():
+        n = s["wins"] + s["losses"]
+        s["win_rate"]  = round(100.0 * s["wins"] / n, 1) if n else None
+        s["avg_pnl"]   = round(s["total_pnl"] / n, 4)    if n else None
+        s["total_pnl"] = round(s["total_pnl"], 4)
+    by_source = sorted(src_map.values(), key=lambda x: x["total_pnl"], reverse=True)
+
+    # ── by_exit ──
+    exit_map: dict = {}
+    for r in rows:
+        reason = r.get("exit_reason") or "unknown"
+        exit_map[reason] = exit_map.get(reason, 0) + 1
+    by_exit = [{"reason": k, "count": v} for k, v in sorted(exit_map.items())]
+
+    # ── summary ──
+    pnl_vals = [r["pnl_points"] for r in trades_with_pnl]
+    total_pnl = sum(pnl_vals) if pnl_vals else 0.0
+    wins = sum(1 for p in pnl_vals if p > 0)
+    summary = {
+        "total_trades": len(rows),
+        "trades_with_pnl": len(pnl_vals),
+        "total_pnl":    round(total_pnl, 4),
+        "win_rate":     round(100.0 * wins / len(pnl_vals), 1) if pnl_vals else None,
+        "avg_pnl":      round(total_pnl / len(pnl_vals), 4)    if pnl_vals else None,
+        "best_trade":   round(max(pnl_vals), 4)                 if pnl_vals else None,
+        "worst_trade":  round(min(pnl_vals), 4)                 if pnl_vals else None,
+    }
+
+    # ── equity_curve ──
+    equity_curve = []
+    cumulative = 0.0
+    for r in trades_with_pnl:
+        cumulative += r["pnl_points"]
+        equity_curve.append({
+            "time":       r.get("exit_time", ""),
+            "pnl":        round(r["pnl_points"], 4),
+            "cumulative": round(cumulative, 4),
+            "source":     r.get("source") or "unknown",
+        })
+
+    return jsonify({
+        "trades":       list(reversed(rows)),   # newest first for table display
+        "by_source":    by_source,
+        "by_exit":      by_exit,
+        "summary":      summary,
+        "equity_curve": equity_curve,
+    })
+
+
 # ── HTML routes ───────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -645,6 +741,11 @@ def preflight_page():
 @app.route("/release-notes")
 def release_notes_page():
     return render_template("release_notes.html", active="release_notes")
+
+
+@app.route("/report")
+def report_page():
+    return render_template("report.html", active="report")
 
 
 @app.route("/lines")

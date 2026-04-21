@@ -67,11 +67,12 @@ CREATE TABLE IF NOT EXISTS commands (
     line_type           TEXT    NOT NULL,    -- SUPPORT | RESISTANCE
     line_strength       INTEGER NOT NULL,    -- 1=strong 2=medium 3=low
     direction           TEXT    NOT NULL,    -- BUY | SELL
-    entry_type          TEXT    NOT NULL,    -- LMT | STP
+    entry_type          TEXT    NOT NULL,    -- LMT | STP | MKT
     entry_price         REAL    NOT NULL,
     tp_price            REAL    NOT NULL,
     sl_price            REAL    NOT NULL,
     bracket_size        REAL    NOT NULL,
+    source              TEXT,               -- critical_line | random_mkt | random_lmt | random_stp | test
     quantity            INTEGER NOT NULL DEFAULT 1,
     status              TEXT    NOT NULL DEFAULT 'PENDING',
     -- PENDING | SUBMITTING | SUBMITTED | FILLED | EXITING | CLOSED
@@ -154,6 +155,20 @@ def init_db(path: Path = None):
     """Create all tables and indexes if they don't exist."""
     with get_db(path) as con:
         con.executescript(_SCHEMA)
+    # Migrations for existing DBs — safe to re-run
+    _migrate(path)
+
+
+def _migrate(path: Path = None):
+    stmts = [
+        "ALTER TABLE commands ADD COLUMN source TEXT",
+    ]
+    with get_db(path) as con:
+        for stmt in stmts:
+            try:
+                con.execute(stmt)
+            except Exception:
+                pass
 
 
 # ── CRUD helpers ──────────────────────────────────────────────────────────────
