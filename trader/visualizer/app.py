@@ -111,11 +111,12 @@ def api_session_state():
 
 @app.route("/api/stats")
 def api_stats():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
     with get_db(_get_db_path()) as con:
-        rows = con.execute(
+        status_rows = con.execute(
             "SELECT status, COUNT(*) as cnt FROM commands GROUP BY status"
         ).fetchall()
-        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         closed_today = con.execute(
             "SELECT COUNT(*) FROM commands WHERE status='CLOSED'"
             " AND date(updated_at)=?", (today,)
@@ -124,32 +125,17 @@ def api_stats():
             "SELECT COUNT(*) FROM commands WHERE status IN ('ERROR','RECONCILE_REQUIRED')"
         ).fetchone()[0]
 
-        # Unrealized P&L from open positions
-        positions = _rows_to_list(con.execute(
-            "SELECT * FROM positions WHERE status='OPEN'"
+        # Unrealized P&L — read from FILLED commands (positions table not populated)
+        filled_cmds = _rows_to_list(con.execute(
+            "SELECT direction, fill_price, quantity FROM commands WHERE status='FILLED'"
         ).fetchall())
 
-    counts = {r["status"]: r["cnt"] for r in rows}
-    counts["CLOSED"] = closed_today
-    counts["ERROR"]  = errors
+        # Realized P&L today from completed_trades
+        pnl_today_rows = _rows_to_list(con.execute(
+            "SELECT pnl_points FROM completed_trades WHERE date(exit_time)=?", (today,)
+        ).fetchall())
 
-    try:
-        from visualizer.price_feed import get_latest
-        price, _ = get_latest()
-    except Exception:
-        price = None
-
-    pnl = None
-    if price and positions:
-        pnl = sum(
-            (price - p["entry_price"]) * p["quantity"] if p["direction"] == "BUY"
-            else (p["entry_price"] - price) * p["quantity"]
-            for p in positions
-        )
-    counts["unrealized_pnl"] = round(pnl, 2) if pnl is not None else None
-
-    # ── Replenish stats (commands with parent_command_id set) ──────────────
-    with get_db(_get_db_path()) as con:
+        # Replenish stats
         rp_rows = con.execute(
             "SELECT status, COUNT(*) as cnt FROM commands"
             " WHERE parent_command_id IS NOT NULL GROUP BY status"
@@ -158,19 +144,52 @@ def api_stats():
             "SELECT COUNT(*) FROM commands WHERE parent_command_id IS NOT NULL"
         ).fetchone()[0]
         rp_closed_pnl = con.execute(
-            "SELECT SUM(pnl_points) FROM commands"
-            " WHERE parent_command_id IS NOT NULL AND status='CLOSED'"
+            "SELECT SUM(ct.pnl_points) FROM completed_trades ct"
+            " JOIN commands c ON c.id = ct.command_id"
+            " WHERE c.parent_command_id IS NOT NULL"
         ).fetchone()[0]
 
+    counts = {r["status"]: r["cnt"] for r in status_rows}
+    counts["CLOSED"] = closed_today
+    counts["ERROR"]  = errors
+
+    # ── Unrealized P&L ────────────────────────────────────────────────────
+    try:
+        from visualizer.price_feed import get_latest
+        price, _ = get_latest()
+    except Exception:
+        price = None
+
+    unrealized = None
+    if price and filled_cmds:
+        unrealized = sum(
+            (price - c["fill_price"]) * c["quantity"] if c["direction"] == "BUY"
+            else (c["fill_price"] - price) * c["quantity"]
+            for c in filled_cmds if c["fill_price"] is not None
+        )
+    counts["unrealized_pnl"] = round(unrealized, 2) if unrealized is not None else None
+
+    # ── Realized P&L today breakdown ──────────────────────────────────────
+    wins   = [r["pnl_points"] for r in pnl_today_rows if r["pnl_points"] > 0]
+    losses = [r["pnl_points"] for r in pnl_today_rows if r["pnl_points"] <= 0]
+    counts["pnl_today"] = {
+        "wins":       len(wins),
+        "gains":      round(sum(wins), 2)   if wins   else 0.0,
+        "losses":     len(losses),
+        "loss_total": round(sum(losses), 2) if losses else 0.0,
+        "net":        round(sum(r["pnl_points"] for r in pnl_today_rows), 2) if pnl_today_rows else 0.0,
+    }
+
+    # ── Replenish stats ───────────────────────────────────────────────────
     rp_by_status = {r["status"]: r["cnt"] for r in rp_rows}
     counts["replenish"] = {
-        "total":    rp_total,
-        "pending":  rp_by_status.get("PENDING", 0),
+        "total":     rp_total,
+        "pending":   rp_by_status.get("PENDING", 0),
         "submitted": rp_by_status.get("SUBMITTED", 0) + rp_by_status.get("SUBMITTING", 0),
-        "filled":   rp_by_status.get("FILLED", 0),
-        "closed":   rp_by_status.get("CLOSED", 0),
-        "error":    rp_by_status.get("ERROR", 0),
-        "pnl":      round(rp_closed_pnl, 2) if rp_closed_pnl is not None else None,
+        "filled":    rp_by_status.get("FILLED", 0),
+        "closed":    rp_by_status.get("CLOSED", 0),
+        "error":     rp_by_status.get("ERROR", 0),
+        "pnl":       round(rp_closed_pnl, 2) if rp_closed_pnl is not None else None,
     }
 
     return jsonify(counts)

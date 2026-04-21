@@ -59,15 +59,43 @@
   </div>
 </div>
 
+<!-- Status filter buttons -->
+<div class="card-row" style="margin-bottom:8px" id="filter-bar">
+  <div class="stat-card" id="fc-all"       onclick="setFilter(null)"       style="cursor:pointer;border-color:#58a6ff">
+    <div class="val" id="s-all">--</div><div class="lbl">ALL ACTIVE</div></div>
+  <div class="stat-card" id="fc-pending"   onclick="setFilter('PENDING')"   style="cursor:pointer">
+    <div class="val" id="s-pending" style="color:#d29922">--</div><div class="lbl">PENDING</div></div>
+  <div class="stat-card" id="fc-submitted" onclick="setFilter('SUBMITTED')" style="cursor:pointer">
+    <div class="val" id="s-submitted" style="color:#58a6ff">--</div><div class="lbl">SUBMITTED</div></div>
+  <div class="stat-card" id="fc-filled"    onclick="setFilter('FILLED')"    style="cursor:pointer">
+    <div class="val" id="s-filled" style="color:#3fb950">--</div><div class="lbl">FILLED</div></div>
+  <div class="stat-card" id="fc-closed"    onclick="setFilter('CLOSED')"    style="cursor:pointer">
+    <div class="val" id="s-closed">--</div><div class="lbl">CLOSED TODAY</div></div>
+  <div class="stat-card" id="fc-error"     onclick="setFilter('ERROR')"     style="cursor:pointer">
+    <div class="val" id="s-errors" style="color:#f85149">--</div><div class="lbl">ERRORS</div></div>
+</div>
+
+<!-- P&L row: realized today + unrealized open -->
 <div class="card-row" style="margin-bottom:12px">
-  <div class="stat-card"><div class="val" id="s-pending">--</div><div class="lbl">PENDING</div></div>
-  <div class="stat-card"><div class="val" id="s-submitted">--</div><div class="lbl">SUBMITTED</div></div>
-  <div class="stat-card"><div class="val" id="s-filled">--</div><div class="lbl">FILLED</div></div>
-  <div class="stat-card"><div class="val" id="s-closed">--</div><div class="lbl">CLOSED TODAY</div></div>
-  <div class="stat-card"><div class="val" id="s-errors">--</div><div class="lbl">ERRORS</div></div>
-  <div class="stat-card" style="min-width:180px">
-    <div class="val" id="s-pnl" style="font-size:16px">--</div>
-    <div class="lbl">UNREALIZED P&L (pts)</div>
+  <div class="stat-card">
+    <div style="display:flex;gap:12px;align-items:baseline">
+      <div><div class="val pnl-pos" id="s-wins" style="font-size:18px">--</div><div class="lbl">#Gains</div></div>
+      <div><div class="val pnl-pos" id="s-gains" style="font-size:15px">--</div><div class="lbl">pts</div></div>
+    </div>
+  </div>
+  <div class="stat-card">
+    <div style="display:flex;gap:12px;align-items:baseline">
+      <div><div class="val pnl-neg" id="s-losses" style="font-size:18px">--</div><div class="lbl">#Lost</div></div>
+      <div><div class="val pnl-neg" id="s-loss-total" style="font-size:15px">--</div><div class="lbl">pts</div></div>
+    </div>
+  </div>
+  <div class="stat-card" style="min-width:130px">
+    <div class="val" id="s-net" style="font-size:20px">--</div>
+    <div class="lbl">NET P&L today</div>
+  </div>
+  <div class="stat-card" style="min-width:130px">
+    <div class="val" id="s-pnl" style="font-size:18px">--</div>
+    <div class="lbl">OPEN (unrealized)</div>
   </div>
 </div>
 
@@ -83,7 +111,10 @@
 
   <!-- ── Active commands ───────────────────────────────────────── -->
   <div class="card" style="flex:1;overflow-x:auto">
-    <h2>Active Commands</h2>
+    <h2>Commands &nbsp;<span id="filter-label" style="font-size:11px;color:#58a6ff"></span>
+      <span id="filter-clear" onclick="setFilter(null)"
+        style="display:none;font-size:11px;color:#8b949e;cursor:pointer;margin-left:6px">✕ clear</span>
+    </h2>
     <table>
       <thead><tr>
         <th>ID</th><th>Sym</th><th>Dir</th><th>Type</th>
@@ -119,39 +150,93 @@ function activeRow(r){
   </tr>`;
 }
 
-autoRefreshTable(
-  '/api/commands?status_in=PENDING,SUBMITTING,SUBMITTED,FILLED&limit=30',
-  'active-tbody', activeRow, 5000
-);
+// ── Filter logic ────────────────────────────────────────────────────────────
+let _activeFilter = null;
+const _filterUrls = {
+  null:      '/api/commands?status_in=PENDING,SUBMITTING,SUBMITTED,FILLED&limit=100',
+  PENDING:   '/api/commands?status=PENDING&limit=100',
+  SUBMITTED: '/api/commands?status_in=SUBMITTED,SUBMITTING&limit=100',
+  FILLED:    '/api/commands?status=FILLED&limit=100',
+  CLOSED:    '/api/commands?status=CLOSED&limit=100',
+  ERROR:     '/api/commands?status_in=ERROR,RECONCILE_REQUIRED&limit=100',
+};
+const _filterCardIds = {
+  null: 'fc-all', PENDING:'fc-pending', SUBMITTED:'fc-submitted',
+  FILLED:'fc-filled', CLOSED:'fc-closed', ERROR:'fc-error'
+};
+
+function setFilter(f){
+  if(f === _activeFilter){ f = null; } // toggle off
+  _activeFilter = f;
+
+  // Update card highlights
+  Object.entries(_filterCardIds).forEach(([k, id]) => {
+    const el = document.getElementById(id);
+    if(!el) return;
+    el.style.borderColor = (String(k) === String(f) || (k==='null' && f===null))
+      ? '#58a6ff' : '#30363d';
+  });
+
+  // Filter label
+  const lbl   = document.getElementById('filter-label');
+  const clear  = document.getElementById('filter-clear');
+  lbl.textContent  = f ? `SHOWING: ${f}` : '';
+  clear.style.display = f ? 'inline' : 'none';
+
+  refreshCommands();
+}
+
+function refreshCommands(){
+  const url = _filterUrls[_activeFilter] || _filterUrls[null];
+  fetch(url).then(r=>r.json()).then(rows=>{
+    document.getElementById('active-tbody').innerHTML = rows.map(activeRow).join('');
+  });
+}
+refreshCommands();
+setInterval(refreshCommands, 5000);
+
+// ── Stats ────────────────────────────────────────────────────────────────────
+function pts(v){ return v != null ? (v>=0?'+':'')+v.toFixed(2) : '--'; }
 
 function refreshStats(){
   fetch('/api/stats').then(r=>r.json()).then(d=>{
+    const active = (d.PENDING||0)+(d.SUBMITTED||0)+(d.SUBMITTING||0)+(d.FILLED||0);
+    document.getElementById('s-all').textContent       = active;
     document.getElementById('s-pending').textContent   = d.PENDING   || 0;
     document.getElementById('s-submitted').textContent = (d.SUBMITTED||0)+(d.SUBMITTING||0);
     document.getElementById('s-filled').textContent    = d.FILLED    || 0;
     document.getElementById('s-closed').textContent    = d.CLOSED    || 0;
     document.getElementById('s-errors').textContent    = d.ERROR     || 0;
-    const pnl = d.unrealized_pnl;
-    const el = document.getElementById('s-pnl');
-    el.textContent = pnl != null ? (pnl >= 0 ? '+' : '') + pnl.toFixed(2) : '--';
-    el.className = 'val ' + (pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : '');
 
-    // ── Replenish stats ────────────────────────────────────────────────
+    // P&L today
+    const p = d.pnl_today || {};
+    document.getElementById('s-wins').textContent       = p.wins   ?? '--';
+    document.getElementById('s-gains').textContent      = p.gains  != null ? '+'+p.gains.toFixed(2) : '--';
+    document.getElementById('s-losses').textContent     = p.losses  ?? '--';
+    document.getElementById('s-loss-total').textContent = p.loss_total != null ? p.loss_total.toFixed(2) : '--';
+    const netEl = document.getElementById('s-net');
+    netEl.textContent = pts(p.net ?? null);
+    netEl.className   = 'val ' + ((p.net??0) > 0 ? 'pnl-pos' : (p.net??0) < 0 ? 'pnl-neg' : '');
+
+    // Unrealized
+    const pnl = d.unrealized_pnl;
+    const pnlEl = document.getElementById('s-pnl');
+    pnlEl.textContent = pts(pnl);
+    pnlEl.className   = 'val ' + (pnl > 0 ? 'pnl-pos' : pnl < 0 ? 'pnl-neg' : '');
+
+    // Replenish
     const rp = d.replenish || {};
-    document.getElementById('rp-total').textContent   = rp.total ? `↻ total: ${rp.total}` : '↻ none yet';
-    document.getElementById('rp-pending').textContent  = rp.pending   ? `${rp.pending} pending`   : '';
-    document.getElementById('rp-submitted').textContent= rp.submitted ? `${rp.submitted} submitted`: '';
-    document.getElementById('rp-filled').textContent   = rp.filled    ? `${rp.filled} filled`     : '';
-    document.getElementById('rp-closed').textContent   = rp.closed    ? `${rp.closed} closed`     : '';
-    document.getElementById('rp-error').textContent    = rp.error     ? `${rp.error} err`         : '';
-    const rpPnl = rp.pnl;
-    const rpEl  = document.getElementById('rp-pnl');
-    if(rpPnl != null && rp.closed > 0){
-      rpEl.textContent  = (rpPnl >= 0 ? '+' : '') + rpPnl.toFixed(2) + ' pts';
-      rpEl.style.color  = rpPnl >= 0 ? '#3fb950' : '#f85149';
-    } else {
-      rpEl.textContent = '';
-    }
+    document.getElementById('rp-total').textContent    = rp.total ? `↻ total: ${rp.total}` : '↻ none yet';
+    document.getElementById('rp-pending').textContent   = rp.pending   ? `${rp.pending} pending`    : '';
+    document.getElementById('rp-submitted').textContent = rp.submitted ? `${rp.submitted} submitted` : '';
+    document.getElementById('rp-filled').textContent    = rp.filled    ? `${rp.filled} filled`      : '';
+    document.getElementById('rp-closed').textContent    = rp.closed    ? `${rp.closed} closed`      : '';
+    document.getElementById('rp-error').textContent     = rp.error     ? `${rp.error} err`          : '';
+    const rpEl = document.getElementById('rp-pnl');
+    if(rp.pnl != null && rp.closed > 0){
+      rpEl.textContent = pts(rp.pnl) + ' pts';
+      rpEl.style.color = rp.pnl >= 0 ? '#3fb950' : '#f85149';
+    } else { rpEl.textContent = ''; }
   });
 }
 refreshStats();
