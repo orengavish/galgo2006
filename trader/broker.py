@@ -30,7 +30,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade
+from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment
 from lib.ib_client import IBClient
 from lib.order_builder import build_bracket, place_bracket
 
@@ -382,6 +382,58 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
     return closed
 
 
+def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
+    """
+    If REPLENISH_ENABLED=1 in system_state, find CLOSED commands that have
+    no child replenishment yet and spawn one PENDING replacement each.
+    Returns number of replenishments spawned.
+    """
+    with get_db(db_path) as con:
+        if get_system_state(con, "REPLENISH_ENABLED") != "1":
+            return 0
+
+    # Find completed commands with no child yet
+    with get_db(db_path) as con:
+        candidates = con.execute("""
+            SELECT c.* FROM commands c
+            WHERE c.status = 'CLOSED'
+              AND c.source IS NOT NULL
+              AND c.source != 'critical_line'
+              AND NOT EXISTS (
+                  SELECT 1 FROM commands child
+                  WHERE child.parent_command_id = c.id
+              )
+            ORDER BY c.updated_at DESC
+            LIMIT 50
+        """).fetchall()
+
+    if not candidates:
+        return 0
+
+    try:
+        price = ibc.get_price(cfg.symbols[0]) if ibc else None
+    except Exception:
+        price = None
+    if not price:
+        return 0
+
+    tick = cfg.orders.tick_size
+    spawned = 0
+    for cmd in candidates:
+        try:
+            with get_db(db_path) as con:
+                child_id = spawn_replenishment(con, cmd, price, tick)
+            log.info(
+                f"[replenish] Spawned #{child_id} from parent #{cmd['id']} "
+                f"({cmd['source']} bracket={cmd['bracket_size']})"
+            )
+            spawned += 1
+        except Exception as e:
+            log.error(f"[replenish] Failed for cmd {cmd['id']}: {e}")
+
+    return spawned
+
+
 def run_broker(db_path=None, dry_run: bool = False):
     """Main broker loop."""
     cfg = get_config()
@@ -453,6 +505,12 @@ def run_broker(db_path=None, dry_run: bool = False):
                     log.info(f"Detected {c} TP/SL exit(s)")
             except Exception as e:
                 log.error(f"Error in poll_tp_sl_fills: {e}")
+            try:
+                r = replenish_if_enabled(ibc, db_path, cfg)
+                if r:
+                    log.info(f"Replenished {r} trade(s)")
+            except Exception as e:
+                log.error(f"Error in replenish_if_enabled: {e}")
             last_ib_poll = now
 
         time.sleep(poll_seconds)

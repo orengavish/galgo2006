@@ -2,6 +2,16 @@
 {% block title %}Dashboard — Galao{% endblock %}
 {% block content %}
 
+<div style="display:flex;gap:10px;align-items:center;margin-bottom:10px">
+  <button id="btn-replenish" onclick="toggleReplenish()"
+    style="font-family:monospace;font-size:14px;font-weight:bold;padding:7px 28px;
+           border-radius:5px;cursor:pointer;border:2px solid #30363d;
+           background:#161b22;color:#6e7681;min-width:200px">
+    REPLENISH: OFF
+  </button>
+  <span id="replenish-info" style="font-size:11px;color:#8b949e"></span>
+</div>
+
 <div class="card" style="margin-bottom:12px;padding:10px 14px">
   <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
     <span style="color:#79c0ff;font-size:12px;font-weight:bold;min-width:60px">GENERATE</span>
@@ -80,8 +90,11 @@
 <script>
 function activeRow(r){
   const upd = r.updated_at ? r.updated_at.slice(11,19) : '';
+  const src = r.parent_command_id
+    ? `<span style="color:#8b949e;font-size:10px">↻#${r.parent_command_id}</span>`
+    : (r.source ? `<span style="color:#6e7681;font-size:10px">${r.source}</span>` : '');
   return `<tr>
-    <td>${r.id}</td>
+    <td>${r.id} ${src}</td>
     <td>${r.symbol}</td>
     <td>${dir(r.direction)}</td>
     <td>${et(r.entry_type)}</td>
@@ -161,6 +174,38 @@ function refreshLadder(){
 }
 refreshLadder();
 setInterval(refreshLadder, 5000);
+
+// ── Replenish toggle ────────────────────────────────────────────────────────
+let _replenishEnabled = false;
+
+function updateReplenishBtn(enabled){
+  _replenishEnabled = enabled;
+  const btn = document.getElementById('btn-replenish');
+  const info = document.getElementById('replenish-info');
+  if(enabled){
+    btn.textContent = 'REPLENISH: ON';
+    btn.style.background = '#1a3a1a';
+    btn.style.color = '#3fb950';
+    btn.style.borderColor = '#3fb950';
+    info.textContent = 'Broker will auto-spawn a replacement for each closed trade';
+  } else {
+    btn.textContent = 'REPLENISH: OFF';
+    btn.style.background = '#161b22';
+    btn.style.color = '#6e7681';
+    btn.style.borderColor = '#30363d';
+    info.textContent = '';
+  }
+}
+
+function toggleReplenish(){
+  fetch('/api/replenish', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({enabled: !_replenishEnabled})
+  }).then(r=>r.json()).then(d => updateReplenishBtn(d.enabled));
+}
+
+fetch('/api/replenish').then(r=>r.json()).then(d => updateReplenishBtn(d.enabled));
 
 function doGenerate(){
   const btn = document.getElementById('btn-gen');

@@ -496,6 +496,27 @@ def api_ib_gateway_log():
         return jsonify({"lines": [], "file": str(latest), "error": str(e)})
 
 
+# ── Replenish toggle API ──────────────────────────────────────────────────────
+
+@app.route("/api/replenish", methods=["GET"])
+def api_replenish_get():
+    with get_db(_get_db_path()) as con:
+        from lib.db import get_system_state
+        val = get_system_state(con, "REPLENISH_ENABLED")
+    return jsonify({"enabled": val == "1"})
+
+
+@app.route("/api/replenish", methods=["POST"])
+def api_replenish_set():
+    body    = request.get_json(force=True) or {}
+    enabled = bool(body.get("enabled", False))
+    with get_db(_get_db_path()) as con:
+        from lib.db import set_system_state
+        set_system_state(con, "REPLENISH_ENABLED", "1" if enabled else "0")
+    log.info(f"[replenish] {'ENABLED' if enabled else 'DISABLED'} via API")
+    return jsonify({"enabled": enabled})
+
+
 # ── System State API ──────────────────────────────────────────────────────────
 
 @app.route("/api/state")

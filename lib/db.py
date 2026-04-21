@@ -73,6 +73,7 @@ CREATE TABLE IF NOT EXISTS commands (
     sl_price            REAL    NOT NULL,
     bracket_size        REAL    NOT NULL,
     source              TEXT,               -- critical_line | random_mkt | random_lmt | random_stp | test
+    parent_command_id   INTEGER,            -- set when this command was auto-replenished from another
     quantity            INTEGER NOT NULL DEFAULT 1,
     status              TEXT    NOT NULL DEFAULT 'PENDING',
     -- PENDING | SUBMITTING | SUBMITTED | FILLED | EXITING | CLOSED
@@ -182,6 +183,7 @@ def init_db(path: Path = None):
 def _migrate(path: Path = None):
     stmts = [
         "ALTER TABLE commands ADD COLUMN source TEXT",
+        "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
     ]
     with get_db(path) as con:
         for stmt in stmts:
@@ -243,6 +245,56 @@ def record_completed_trade(con, command_id: int) -> bool:
         row["exit_reason"], row["pnl_points"],
     ))
     return cur.rowcount == 1
+
+
+def spawn_replenishment(con, parent_cmd, price: float, tick: float) -> int:
+    """
+    Insert one PENDING command derived from parent_cmd at the current price.
+    Sets parent_command_id so the lineage is traceable.
+    Returns the new command id.
+    """
+    import random
+    source     = parent_cmd["source"] or "random_mkt"
+    bracket    = parent_cmd["bracket_size"]
+    direction  = random.choice(["BUY", "SELL"])
+    qty        = parent_cmd["quantity"]
+
+    entry_type_map = {
+        "random_lmt": "LMT",
+        "random_stp": "STP",
+        "critical_line": "LMT",
+    }
+    entry_type = entry_type_map.get(source, "MKT")
+
+    def rt(p):
+        return round(round(p / tick) * tick, 10)
+
+    # Entry offset: 1 tick for LMT/STP so fills quickly; 0 for MKT
+    offset = tick if entry_type in ("LMT", "STP") else 0.0
+
+    if entry_type == "MKT":
+        entry_price = rt(price)
+    elif entry_type == "LMT":
+        entry_price = rt(price - offset) if direction == "BUY" else rt(price + offset)
+    else:  # STP
+        entry_price = rt(price + offset) if direction == "BUY" else rt(price - offset)
+
+    tp_price = rt(entry_price + bracket) if direction == "BUY" else rt(entry_price - bracket)
+    sl_price = rt(entry_price - bracket) if direction == "BUY" else rt(entry_price + bracket)
+
+    con.execute("""
+        INSERT INTO commands
+            (symbol, line_price, line_type, line_strength,
+             direction, entry_type, entry_price, tp_price, sl_price,
+             bracket_size, source, parent_command_id, quantity, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+    """, (
+        parent_cmd["symbol"], entry_price,
+        "SUPPORT" if direction == "BUY" else "RESISTANCE", 1,
+        direction, entry_type, entry_price, tp_price, sl_price,
+        bracket, source, parent_cmd["id"], qty,
+    ))
+    return con.execute("SELECT last_insert_rowid()").fetchone()[0]
 
 
 def get_pending_commands(con, symbol: str = None) -> list:
