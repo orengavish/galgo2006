@@ -188,11 +188,13 @@ def paginate_ticks(ib: IB, contract, start_utc: datetime, end_utc: datetime,
     """
     total = 0
     cursor = start_utc
-    last_log  = time.time()
+    batch_count   = 0
+    last_log      = time.time()
     session_start = time.time()
     last_processed_ts = None
     last_batch_fps: set = set()
     reached_end = False
+    total_secs = max((end_utc - start_utc).total_seconds(), 1)
 
     async def _fetch():
         return await asyncio.wait_for(
@@ -214,6 +216,7 @@ def paginate_ticks(ib: IB, contract, start_utc: datetime, end_utc: datetime,
 
         try:
             loop = asyncio.get_event_loop()
+            batch_count += 1
             batch = loop.run_until_complete(_fetch())
 
             if not batch:
@@ -267,13 +270,23 @@ def paginate_ticks(ib: IB, contract, start_utc: datetime, end_utc: datetime,
             last_processed_ts = batch_end_ts
             last_batch_fps    = batch_end_fps
 
-            # Telemetry
-            now = time.time()
+            # Per-batch console output
+            pct     = min(100.0, (cursor - start_utc).total_seconds() / total_secs * 100)
+            ct_str  = cursor.astimezone(CT).strftime("%H:%M CT")
+            now     = time.time()
+            elapsed = max(now - session_start, 0.001)
+            if batch_count % 5 == 0:
+                speed = total / elapsed
+                print(f"    Batch {batch_count:3d} [{pct:5.1f}%]  {total:>8,} ticks"
+                      f"  {speed:5.0f}/s  cursor={ct_str}", flush=True)
+            else:
+                print(f"    Batch {batch_count:3d}  +{new_ticks:<5}  cursor={ct_str}",
+                      flush=True)
+
+            # Log + progress-DB update every 15 s
             if now - last_log > _PROGRESS_LOG_INTERVAL:
-                speed = total / max(now - session_start, 1)
-                ct_str = cursor.astimezone(CT).strftime("%H:%M:%S CT")
                 log.info(f"{symbol} {what} | {date_str} | cursor={ct_str} "
-                         f"total={total:,} speed={speed:.0f} t/s")
+                         f"total={total:,} speed={total/elapsed:.0f} t/s")
                 _update_progress(conn, symbol, date_str, what, total)
                 last_log = now
 
@@ -338,6 +351,10 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
                     time.sleep(1)
 
         _mark_started(progress_conn, symbol, date_str, dtype)
+        start_ct = start_utc.astimezone(CT).strftime("%H:%M CT")
+        end_ct   = end_utc.astimezone(CT).strftime("%H:%M CT")
+        print(f"\n  [{dtype}] {symbol} {date_str}  ({start_ct} → {end_ct})",
+              flush=True)
         log.info(f"[START] {symbol} {dtype} {date_str}")
 
         if dtype == "TRADES":
@@ -365,6 +382,8 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
 
         if _running:
             _mark_finished(progress_conn, symbol, date_str, dtype, count)
+            print(f"  [DONE] {symbol} {dtype} {date_str}: {count:,} ticks → {file_path.name}",
+                  flush=True)
             log.info(f"[DONE] {symbol} {dtype} {date_str}: {count:,} ticks -> {file_path.name}")
         results[dtype] = count
 
@@ -615,17 +634,21 @@ if __name__ == "__main__":
     ib = _connect(cfg)
     progress_conn = _init_progress_db(prog_db)
 
+    types_label = "TRADES + BID_ASK" if args.bid_ask else "TRADES"
+    print(f"\nFetching {types_label} for {len(days)} day(s) → {output_dir}")
+
     try:
-        for day in days:
+        for i, day in enumerate(days, 1):
             if not _running:
                 break
             for sym in symbols:
                 if not _running:
                     break
+                print(f"\n{'='*60}")
+                print(f"  {i}/{len(days)}  {sym}  {day}")
+                print(f"{'='*60}")
                 results = fetch_day(ib, sym, day, args.bid_ask, output_dir, progress_conn)
-                for dtype, count in results.items():
-                    if isinstance(count, int):
-                        print(f"  {sym} {dtype} {day}: {count:,} ticks")
+                # per-dtype summary already printed by fetch_day
     finally:
         progress_conn.close()
         ib.disconnect()
