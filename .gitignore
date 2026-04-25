@@ -5,6 +5,8 @@ data/galao.db
 data/fetch_progress.db
 data/*.db-wal
 data/*.db-shm
+trader/data/
+back-trading/data/
 logs/
 *.pptx
 *.csv

@@ -93,6 +93,13 @@ def get_config(path: Path = None) -> SimpleNamespace:
         raw = yaml.safe_load(f)
 
     _validate(raw)
+
+    # Resolve all paths relative to the config file so they're absolute
+    # regardless of which directory the calling script runs from.
+    cfg_dir = cfg_path.resolve().parent
+    if "paths" in raw:
+        raw["paths"] = {k: str(cfg_dir / v) for k, v in raw["paths"].items()}
+
     _cached = _dict_to_ns(raw)
     return _cached
 
