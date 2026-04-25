@@ -41,7 +41,7 @@ _DEFAULT_RATE      = 6    # trades per minute
 _MKT_WEIGHT        = 0.50
 _LMT_WEIGHT        = 0.25
 _STP_WEIGHT        = 0.25
-_DEFAULT_MAX_OFFSET_TICKS = 8
+_DEFAULT_MAX_OFFSET_TICKS = 2
 
 
 def _now_utc() -> str:
@@ -203,47 +203,51 @@ def run_gen(db_path, cfg, rate_per_min: float = _DEFAULT_RATE,
     # Random-walk price for dry-run
     sim_price = 5500.0
 
-    while True:
-        if _is_shutdown(db_path):
-            log.info("SESSION=SHUTDOWN — random_gen exiting")
-            break
+    try:
+        while True:
+            if _is_shutdown(db_path):
+                log.info("SESSION=SHUTDOWN — random_gen exiting")
+                break
 
-        # Get current price
+            # Get current price
+            if ibc:
+                try:
+                    price = ibc.get_price(symbol)
+                except Exception as e:
+                    log.warning(f"Price fetch failed: {e} — skipping this tick")
+                    time.sleep(5)
+                    continue
+                if price is None:
+                    log.warning("Price is None — skipping this tick")
+                    time.sleep(5)
+                    continue
+            else:
+                sim_price += random.gauss(0, 0.5)
+                price = round(sim_price, 2)
+
+            trade = _build_trade(symbol, price, cfg,
+                                 bracket_override=bracket_override,
+                                 max_offset_ticks=max_offset_ticks)
+            cmd_id = _insert_pending(db_path, trade)
+
+            log.info(
+                f"Inserted #{cmd_id} {trade['source']} {trade['direction']} "
+                f"{trade['entry_type']} entry={trade['entry_price']} "
+                f"TP={trade['tp_price']} SL={trade['sl_price']}"
+            )
+
+            if dry_run:
+                _simulate_lifecycle(db_path, cmd_id, trade, tick)
+                log.debug(f"  Simulated lifecycle for #{cmd_id}")
+
+            time.sleep(sleep_secs)
+
+    except KeyboardInterrupt:
+        log.info("random_gen interrupted")
+    finally:
         if ibc:
-            try:
-                price = ibc.get_price(symbol)
-            except Exception as e:
-                log.warning(f"Price fetch failed: {e} — skipping this tick")
-                time.sleep(5)
-                continue
-            if price is None:
-                log.warning("Price is None — skipping this tick")
-                time.sleep(5)
-                continue
-        else:
-            sim_price += random.gauss(0, 0.5)
-            price = round(sim_price, 2)
-
-        trade = _build_trade(symbol, price, cfg,
-                             bracket_override=bracket_override,
-                             max_offset_ticks=max_offset_ticks)
-        cmd_id = _insert_pending(db_path, trade)
-
-        log.info(
-            f"Inserted #{cmd_id} {trade['source']} {trade['direction']} "
-            f"{trade['entry_type']} entry={trade['entry_price']} "
-            f"TP={trade['tp_price']} SL={trade['sl_price']}"
-        )
-
-        if dry_run:
-            _simulate_lifecycle(db_path, cmd_id, trade, tick)
-            log.debug(f"  Simulated lifecycle for #{cmd_id}")
-
-        time.sleep(sleep_secs)
-
-    if ibc:
-        ibc.disconnect()
-    log.info("random_gen stopped")
+            ibc.disconnect()
+        log.info("random_gen stopped")
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────

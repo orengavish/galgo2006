@@ -359,15 +359,23 @@ def api_generate():
     """
     POST /api/generate
     Body JSON:
-      bracket      float  — bracket size in points (default 4.0)
-      types        list   — entry types to use, e.g. ["MKT","LMT","STP"]
-      count        int    — number of trades to insert (default 10, max 200)
-      max_offset   int    — max entry offset from live price in ticks (default 2)
+      mode         str    — "random" (default) or "critical_line"
+      bracket      float  — bracket size in points (default 8.0)
+      types        list   — entry types ["MKT","LMT","STP"]
+      count        int    — trades per line or total (default 10, max 200)
+      max_offset   int    — max entry offset from anchor price in ticks (default 2)
+
+      -- critical_line mode only --
+      line_ids     list   — IDs from critical_lines table (DB-sourced, fully traceable)
+      line_text    str    — free-form text to parse (e.g. "support: 7150!, 7140")
 
     Returns {count, price, commands: [...]}
     """
+    import random as _rnd
+
     body       = request.get_json(force=True) or {}
-    bracket    = float(body.get("bracket", 4.0))
+    mode       = body.get("mode", "random")
+    bracket    = float(body.get("bracket", 8.0))
     types      = [t.upper() for t in body.get("types", ["MKT", "LMT", "STP"])]
     count      = min(int(body.get("count", 10)), 200)
     max_offset = int(body.get("max_offset", 2))
@@ -384,54 +392,146 @@ def api_generate():
     if price is None:
         return jsonify({"error": "No price available — price feed not running"}), 400
 
-    import random as _rnd
-    from random_gen import _build_trade, _insert_pending, _pick_entry_type
-
-    cfg    = _get_cfg()
-    tick   = cfg.orders.tick_size
+    cfg  = _get_cfg()
+    tick = cfg.orders.tick_size
+    sym  = (cfg.symbols or ["MES"])[0]
 
     def rt(p):
         return round(round(p / tick) * tick, 10)
 
-    inserted = []
-    with get_db(_get_db_path()) as _con:
-        pass  # just ensure DB open; inserts happen inside _insert_pending
-
-    for _ in range(count):
-        # Force entry_type from allowed types only
-        entry_type = _rnd.choice(types)
-        direction  = _rnd.choice(["BUY", "SELL"])
-        offset     = _rnd.randint(1, max(1, max_offset)) * tick
-
+    def _make_cmd(anchor_price, direction, entry_type, source, critical_line_id=None,
+                  line_type=None, strength=1):
+        offset = _rnd.randint(1, max(1, max_offset)) * tick
         if entry_type == "MKT":
-            entry_price = rt(price)
+            ep = rt(anchor_price)
         elif entry_type == "LMT":
-            entry_price = rt(price - offset) if direction == "BUY" else rt(price + offset)
+            ep = rt(anchor_price - offset) if direction == "BUY" else rt(anchor_price + offset)
         else:  # STP
-            entry_price = rt(price + offset) if direction == "BUY" else rt(price - offset)
-
-        tp_price = rt(entry_price + bracket) if direction == "BUY" else rt(entry_price - bracket)
-        sl_price = rt(entry_price - bracket) if direction == "BUY" else rt(entry_price + bracket)
-
-        trade = {
-            "symbol":        (cfg.symbols or ["MES"])[0],
-            "line_price":    entry_price,
-            "line_type":     "SUPPORT" if direction == "BUY" else "RESISTANCE",
-            "line_strength": _rnd.randint(1, 3),
-            "direction":     direction,
-            "entry_type":    entry_type,
-            "entry_price":   entry_price,
-            "tp_price":      tp_price,
-            "sl_price":      sl_price,
-            "bracket_size":  bracket,
-            "source":        f"random_{entry_type.lower()}",
-            "quantity":      cfg.orders.quantity,
+            ep = rt(anchor_price + offset) if direction == "BUY" else rt(anchor_price - offset)
+        tp = rt(ep + bracket) if direction == "BUY" else rt(ep - bracket)
+        sl = rt(ep - bracket) if direction == "BUY" else rt(ep + bracket)
+        return {
+            "symbol":           sym,
+            "line_price":       anchor_price,
+            "line_type":        line_type or ("SUPPORT" if direction == "BUY" else "RESISTANCE"),
+            "line_strength":    strength,
+            "direction":        direction,
+            "entry_type":       entry_type,
+            "entry_price":      ep,
+            "tp_price":         tp,
+            "sl_price":         sl,
+            "bracket_size":     bracket,
+            "source":           source,
+            "critical_line_id": critical_line_id,
+            "quantity":         cfg.orders.quantity,
         }
-        cmd_id = _insert_pending(_get_db_path(), trade)
-        inserted.append({"id": cmd_id, "direction": direction, "entry_type": entry_type,
-                          "entry_price": entry_price, "tp_price": tp_price, "sl_price": sl_price})
 
-    log.info(f"[generate] Inserted {len(inserted)} commands near price={price} bracket={bracket}")
+    def _insert(trade):
+        with get_db(_get_db_path()) as con:
+            con.execute("""
+                INSERT INTO commands
+                    (symbol, line_price, line_type, line_strength,
+                     direction, entry_type, entry_price, tp_price, sl_price,
+                     bracket_size, source, critical_line_id, quantity, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+            """, (
+                trade["symbol"], trade["line_price"], trade["line_type"], trade["line_strength"],
+                trade["direction"], trade["entry_type"],
+                trade["entry_price"], trade["tp_price"], trade["sl_price"],
+                trade["bracket_size"], trade["source"], trade["critical_line_id"],
+                trade["quantity"],
+            ))
+            return con.execute("SELECT last_insert_rowid()").fetchone()[0]
+
+    inserted = []
+
+    if mode == "critical_line":
+        # ── Resolve lines from DB IDs and/or parsed text ──────────────────────
+        lines_to_use = []
+
+        line_ids = body.get("line_ids", [])
+        if line_ids:
+            with get_db(_get_db_path()) as con:
+                for lid in line_ids:
+                    row = con.execute(
+                        "SELECT * FROM critical_lines WHERE id=?", (lid,)
+                    ).fetchone()
+                    if row:
+                        lines_to_use.append({
+                            "id":        row["id"],
+                            "price":     row["price"],
+                            "line_type": row["line_type"],
+                            "strength":  row["strength"],
+                            "from_db":   True,
+                        })
+
+        line_text = body.get("line_text", "").strip()
+        if line_text:
+            parsed = _parse_lines_text(line_text)
+            today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+            # Save parsed lines to DB so they're traceable, then use their IDs
+            with get_db(_get_db_path()) as con:
+                for pl in parsed:
+                    con.execute(
+                        "INSERT INTO critical_lines (symbol, date, line_type, price, strength, armed)"
+                        " VALUES (?, ?, ?, ?, ?, 1)",
+                        (sym, today, pl["line_type"], pl["price"], pl["strength"])
+                    )
+                    new_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
+                    lines_to_use.append({
+                        "id":        new_id,
+                        "price":     pl["price"],
+                        "line_type": pl["line_type"],
+                        "strength":  pl["strength"],
+                        "from_db":   False,
+                    })
+
+        if not lines_to_use:
+            return jsonify({"error": "No critical lines found — select DB lines or paste line text"}), 400
+
+        # Generate `count` trades per line; direction fixed by line_type
+        for ln in lines_to_use:
+            direction = "BUY" if ln["line_type"] == "SUPPORT" else "SELL"
+            for _ in range(count):
+                entry_type = _rnd.choice(types)
+                trade = _make_cmd(
+                    anchor_price     = ln["price"],
+                    direction        = direction,
+                    entry_type       = entry_type,
+                    source           = "critical_line",
+                    critical_line_id = ln["id"],
+                    line_type        = ln["line_type"],
+                    strength         = ln["strength"],
+                )
+                cmd_id = _insert(trade)
+                inserted.append({
+                    "id": cmd_id, "direction": direction, "entry_type": entry_type,
+                    "entry_price": trade["entry_price"],
+                    "critical_line_id": ln["id"], "line_price": ln["price"],
+                })
+
+        log.info(f"[generate] critical_line: {len(inserted)} cmds across {len(lines_to_use)} lines "
+                 f"bracket={bracket}")
+
+    else:
+        # ── Random mode (existing behaviour) ─────────────────────────────────
+        for _ in range(count):
+            entry_type = _rnd.choice(types)
+            direction  = _rnd.choice(["BUY", "SELL"])
+            trade = _make_cmd(
+                anchor_price = price,
+                direction    = direction,
+                entry_type   = entry_type,
+                source       = f"random_{entry_type.lower()}",
+            )
+            cmd_id = _insert(trade)
+            inserted.append({
+                "id": cmd_id, "direction": direction, "entry_type": entry_type,
+                "entry_price": trade["entry_price"],
+            })
+
+        log.info(f"[generate] random: {len(inserted)} cmds near price={price} bracket={bracket}")
+
     return jsonify({"count": len(inserted), "price": price, "commands": inserted})
 
 
@@ -1048,9 +1148,11 @@ if __name__ == "__main__":
     init_db(Path(cfg.paths.db))
 
     if not args.no_price_feed:
-        from visualizer.price_feed import start as start_price_feed
+        import atexit
+        from visualizer.price_feed import start as start_price_feed, stop as stop_price_feed
         symbol = cfg.symbols[0] if cfg.symbols else "MES"
         start_price_feed(cfg, symbol=symbol, interval=5)
+        atexit.register(stop_price_feed)
         log.info(f"Price feed started for {symbol}")
 
     log.info(f"Visualizer starting on {cfg.visualizer.host}:{cfg.visualizer.port}")

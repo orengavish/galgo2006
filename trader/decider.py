@@ -100,13 +100,13 @@ def generate_commands(symbol: str, date_str: str, current_price: float,
                         INSERT INTO commands
                             (symbol, line_price, line_type, line_strength,
                              direction, entry_type, entry_price, tp_price, sl_price,
-                             bracket_size, source, quantity, status)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, 'PENDING')
+                             bracket_size, source, critical_line_id, quantity, status)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'critical_line', ?, ?, 'PENDING')
                     """, (
                         symbol, line_price, line_type, strength,
                         direction, entry_type,
                         prices["entry_price"], prices["tp_price"], prices["sl_price"],
-                        bracket_size, qty
+                        bracket_size, line["id"], qty
                     ))
                 count += 1
                 log.debug(

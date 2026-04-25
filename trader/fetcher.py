@@ -569,6 +569,8 @@ if __name__ == "__main__":
     parser.add_argument("--symbol",     default=None, help="e.g. MES")
     parser.add_argument("--date",       default=None, help="YYYY-MM-DD (single day)")
     parser.add_argument("--from-date",  default=None, help="YYYY-MM-DD (start of range)")
+    parser.add_argument("--days",       type=int, default=None, metavar="N",
+                        help="Fetch last N working days (from yesterday back)")
     parser.add_argument("--bid-ask",    action="store_true",
                         help="Also fetch BID_ASK ticks")
     args = parser.parse_args()
@@ -603,6 +605,10 @@ if __name__ == "__main__":
         days = [date.fromisoformat(args.date)]
     elif args.from_date:
         days = _get_working_days(date.fromisoformat(args.from_date), yesterday)
+    elif args.days:
+        # N working days back from yesterday — search far enough back to find them
+        search_from = yesterday - timedelta(days=args.days * 3)
+        days = _get_working_days(search_from, yesterday)[:args.days]
     else:
         days = [yesterday]
 

@@ -352,19 +352,29 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
             continue
 
         exit_price = None
-        exit_reason = None
 
         if tp_oid and tp_oid in ib_filled:
-            exit_price  = ib_filled[tp_oid]
-            exit_reason = "TP"
+            exit_price = ib_filled[tp_oid]
         elif sl_oid and sl_oid in ib_filled:
-            exit_price  = ib_filled[sl_oid]
-            exit_reason = "SL"
+            exit_price = ib_filled[sl_oid]
 
         if exit_price is None:
             continue
 
-        pnl = (exit_price - fill_p) if cmd["direction"] == "BUY" else (fill_p - exit_price)
+        # Derive exit_reason from price vs bracket levels — immune to order-ID swap bugs
+        d    = cmd["direction"]
+        tp_p = cmd["tp_price"]
+        sl_p = cmd["sl_price"]
+        if d == "BUY":
+            if exit_price >= tp_p:   exit_reason = "TP"
+            elif exit_price <= sl_p: exit_reason = "SL"
+            else:                    exit_reason = "STAGNATION"
+        else:  # SELL
+            if exit_price <= tp_p:   exit_reason = "TP"
+            elif exit_price >= sl_p: exit_reason = "SL"
+            else:                    exit_reason = "STAGNATION"
+
+        pnl = (exit_price - fill_p) if d == "BUY" else (fill_p - exit_price)
 
         log.info(
             f"Command {cmd['id']} CLOSED via {exit_reason} "
@@ -462,61 +472,65 @@ def run_broker(db_path=None, dry_run: bool = False):
 
     log.info("Broker loop started")
 
-    while True:
-        # Check for shutdown signal
-        if _is_shutdown(db_path):
-            log.info("SESSION=SHUTDOWN detected — broker exiting")
-            break
-
-        # Check connections; reconnect if needed
-        if not ibc.is_paper_connected() or not ibc.is_live_connected():
-            log.warning("IB connection lost — attempting reconnect")
-            ok = ibc.reconnect(max_attempts=_MAX_RECONNECT_ATTEMPTS)
-            if ok:
-                register_ib_events(ibc, db_path)
-            if not ok:
-                log.error("Reconnect failed after max attempts — aborting broker")
-                # R-ERR-05: abort means trigger shutdown then exit
-                with get_db(db_path) as con:
-                    from lib.db import set_system_state
-                    set_system_state(con, "SESSION", "SHUTDOWN")
+    try:
+        while True:
+            # Check for shutdown signal
+            if _is_shutdown(db_path):
+                log.info("SESSION=SHUTDOWN detected — broker exiting")
                 break
 
-        # Process pending commands
-        try:
-            n = process_pending_commands(ibc, db_path, cfg)
-            if n:
-                log.info(f"Submitted {n} order(s)")
-        except Exception as e:
-            log.error(f"Error in process_pending_commands: {e}")
+            # Check connections; reconnect if needed
+            if not ibc.is_paper_connected() or not ibc.is_live_connected():
+                log.warning("IB connection lost — attempting reconnect")
+                ok = ibc.reconnect(max_attempts=_MAX_RECONNECT_ATTEMPTS)
+                if ok:
+                    register_ib_events(ibc, db_path)
+                if not ok:
+                    log.error("Reconnect failed after max attempts — aborting broker")
+                    # R-ERR-05: abort means trigger shutdown then exit
+                    with get_db(db_path) as con:
+                        from lib.db import set_system_state
+                        set_system_state(con, "SESSION", "SHUTDOWN")
+                    break
 
-        # Periodic fill poll (entry fills + TP/SL child order exits)
-        now = time.time()
-        if now - last_ib_poll >= ib_poll_seconds:
+            # Process pending commands
             try:
-                f = poll_fills(ibc, db_path)
-                if f:
-                    log.info(f"Detected {f} entry fill(s)")
+                n = process_pending_commands(ibc, db_path, cfg)
+                if n:
+                    log.info(f"Submitted {n} order(s)")
             except Exception as e:
-                log.error(f"Error in poll_fills: {e}")
-            try:
-                c = poll_tp_sl_fills(ibc, db_path)
-                if c:
-                    log.info(f"Detected {c} TP/SL exit(s)")
-            except Exception as e:
-                log.error(f"Error in poll_tp_sl_fills: {e}")
-            try:
-                r = replenish_if_enabled(ibc, db_path, cfg)
-                if r:
-                    log.info(f"Replenished {r} trade(s)")
-            except Exception as e:
-                log.error(f"Error in replenish_if_enabled: {e}")
-            last_ib_poll = now
+                log.error(f"Error in process_pending_commands: {e}")
 
-        time.sleep(poll_seconds)
+            # Periodic fill poll (entry fills + TP/SL child order exits)
+            now = time.time()
+            if now - last_ib_poll >= ib_poll_seconds:
+                try:
+                    f = poll_fills(ibc, db_path)
+                    if f:
+                        log.info(f"Detected {f} entry fill(s)")
+                except Exception as e:
+                    log.error(f"Error in poll_fills: {e}")
+                try:
+                    c = poll_tp_sl_fills(ibc, db_path)
+                    if c:
+                        log.info(f"Detected {c} TP/SL exit(s)")
+                except Exception as e:
+                    log.error(f"Error in poll_tp_sl_fills: {e}")
+                try:
+                    r = replenish_if_enabled(ibc, db_path, cfg)
+                    if r:
+                        log.info(f"Replenished {r} trade(s)")
+                except Exception as e:
+                    log.error(f"Error in replenish_if_enabled: {e}")
+                last_ib_poll = now
 
-    ibc.disconnect()
-    log.info("Broker stopped")
+            time.sleep(poll_seconds)
+
+    except KeyboardInterrupt:
+        log.info("Broker interrupted")
+    finally:
+        ibc.disconnect()
+        log.info("Broker stopped")
 
 
 def _run_broker_dry(db_path, cfg):

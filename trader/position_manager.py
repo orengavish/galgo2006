@@ -233,34 +233,38 @@ def run_position_manager(db_path=None, date_str: str = None):
     poll_seconds = cfg.broker.command_poll_seconds  # reuse same poll cadence
 
     log.info("Position manager loop started")
-    while True:
-        if _is_shutdown(db_path):
-            log.info("SESSION=SHUTDOWN — position manager exiting")
-            break
-
-        if not ibc.is_live_connected() or not ibc.is_paper_connected():
-            log.warning("IB connection lost — attempting reconnect")
-            ok = ibc.reconnect(max_attempts=5)
-            if not ok:
-                log.error("Reconnect failed — aborting position manager")
+    try:
+        while True:
+            if _is_shutdown(db_path):
+                log.info("SESSION=SHUTDOWN — position manager exiting")
                 break
 
-        try:
-            n_stag = check_stagnation(ibc, db_path, cfg)
-            if n_stag:
-                log.info(f"Exited {n_stag} stagnant position(s)")
-        except Exception as e:
-            log.error(f"Error in check_stagnation: {e}")
+            if not ibc.is_live_connected() or not ibc.is_paper_connected():
+                log.warning("IB connection lost — attempting reconnect")
+                ok = ibc.reconnect(max_attempts=5)
+                if not ok:
+                    log.error("Reconnect failed — aborting position manager")
+                    break
 
-        try:
-            check_sl_cooldowns(db_path, cfg, date_str)
-        except Exception as e:
-            log.error(f"Error in check_sl_cooldowns: {e}")
+            try:
+                n_stag = check_stagnation(ibc, db_path, cfg)
+                if n_stag:
+                    log.info(f"Exited {n_stag} stagnant position(s)")
+            except Exception as e:
+                log.error(f"Error in check_stagnation: {e}")
 
-        time.sleep(poll_seconds)
+            try:
+                check_sl_cooldowns(db_path, cfg, date_str)
+            except Exception as e:
+                log.error(f"Error in check_sl_cooldowns: {e}")
 
-    ibc.disconnect()
-    log.info("Position manager stopped")
+            time.sleep(poll_seconds)
+
+    except KeyboardInterrupt:
+        log.info("Position manager interrupted")
+    finally:
+        ibc.disconnect()
+        log.info("Position manager stopped")
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────

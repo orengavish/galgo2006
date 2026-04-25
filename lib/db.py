@@ -74,6 +74,7 @@ CREATE TABLE IF NOT EXISTS commands (
     bracket_size        REAL    NOT NULL,
     source              TEXT,               -- critical_line | random_mkt | random_lmt | random_stp | test
     parent_command_id   INTEGER,            -- set when this command was auto-replenished from another
+    critical_line_id    INTEGER REFERENCES critical_lines(id),  -- origin line when source=critical_line
     quantity            INTEGER NOT NULL DEFAULT 1,
     status              TEXT    NOT NULL DEFAULT 'PENDING',
     -- PENDING | SUBMITTING | SUBMITTED | FILLED | EXITING | CLOSED
@@ -180,17 +181,97 @@ def init_db(path: Path = None):
     _migrate(path)
 
 
+_VERIFIED_TRADES_VIEW = """
+CREATE VIEW verified_trades AS
+WITH RECURSIVE ancestry(cmd_id, root_cmd_id, root_critical_line_id, chain_depth) AS (
+    -- Root commands: no parent
+    SELECT id, id, critical_line_id, 0
+    FROM commands WHERE parent_command_id IS NULL
+    UNION ALL
+    -- Walk down: children inherit root info; child's own critical_line_id wins if set
+    SELECT c.id,
+           ancestry.root_cmd_id,
+           COALESCE(c.critical_line_id, ancestry.root_critical_line_id),
+           ancestry.chain_depth + 1
+    FROM commands c
+    INNER JOIN ancestry ON ancestry.cmd_id = c.parent_command_id
+)
+SELECT
+    ct.id,
+    ct.command_id,
+    ct.symbol,
+    ct.source,
+    c.direction,
+    c.entry_type,
+    c.bracket_size,
+    c.entry_price,
+    c.tp_price,
+    c.sl_price,
+    ct.fill_price,
+    ct.fill_time,
+    ct.exit_price,
+    ct.exit_time,
+    -- exit_reason derived from actual prices — immune to order-ID label errors
+    CASE
+        WHEN c.direction='BUY'  AND ct.exit_price >= c.tp_price THEN 'TP'
+        WHEN c.direction='BUY'  AND ct.exit_price <= c.sl_price THEN 'SL'
+        WHEN c.direction='SELL' AND ct.exit_price <= c.tp_price THEN 'TP'
+        WHEN c.direction='SELL' AND ct.exit_price >= c.sl_price THEN 'SL'
+        ELSE 'STAGNATION'
+    END AS exit_reason,
+    ct.exit_reason AS raw_exit_reason,
+    ct.pnl_points,
+    -- Direct lineage
+    c.parent_command_id,
+    c.critical_line_id,
+    -- Full chain ancestry (walk to root)
+    anc.root_cmd_id,
+    anc.root_critical_line_id,
+    anc.chain_depth,
+    ct.recorded_at
+FROM completed_trades ct
+JOIN commands c   ON ct.command_id = c.id
+JOIN ancestry anc ON anc.cmd_id   = ct.command_id
+WHERE
+    -- real source only
+    ct.source IS NOT NULL
+    AND ct.source NOT IN ('test')
+    -- all required fields present
+    AND ct.fill_price  IS NOT NULL
+    AND ct.exit_price  IS NOT NULL
+    AND ct.pnl_points  IS NOT NULL
+    AND ct.fill_time   IS NOT NULL
+    AND ct.exit_time   IS NOT NULL
+    -- exclude instant fill+exit (mass-reconnect / stale-data artifacts)
+    AND ct.fill_time != ct.exit_time
+    -- pnl_points must match price arithmetic (catches any write-path bugs)
+    AND ABS(ct.pnl_points - CASE c.direction
+            WHEN 'BUY'  THEN ct.exit_price - ct.fill_price
+            ELSE             ct.fill_price  - ct.exit_price
+        END) < 0.01
+    -- fill must be inside the bracket (stale/gap fills already past TP or SL are invalid)
+    AND NOT (c.direction='BUY'  AND ct.fill_price >= c.tp_price)
+    AND NOT (c.direction='SELL' AND ct.fill_price <= c.tp_price)
+    AND NOT (c.direction='BUY'  AND ct.fill_price <= c.sl_price)
+    AND NOT (c.direction='SELL' AND ct.fill_price >= c.sl_price)
+"""
+
+
 def _migrate(path: Path = None):
-    stmts = [
+    alter_stmts = [
         "ALTER TABLE commands ADD COLUMN source TEXT",
         "ALTER TABLE commands ADD COLUMN parent_command_id INTEGER",
+        "ALTER TABLE commands ADD COLUMN critical_line_id INTEGER REFERENCES critical_lines(id)",
     ]
     with get_db(path) as con:
-        for stmt in stmts:
+        for stmt in alter_stmts:
             try:
                 con.execute(stmt)
             except Exception:
                 pass
+        # Always recreate the view so schema changes are picked up on restart
+        con.execute("DROP VIEW IF EXISTS verified_trades")
+        con.execute(_VERIFIED_TRADES_VIEW)
 
 
 # ── CRUD helpers ──────────────────────────────────────────────────────────────
@@ -247,10 +328,31 @@ def record_completed_trade(con, command_id: int) -> bool:
     return cur.rowcount == 1
 
 
+def _root_critical_line_id(con, cmd) -> int | None:
+    """Walk up parent_command_id chain to find the root's critical_line_id."""
+    cid = cmd["critical_line_id"]
+    if cid is not None:
+        return cid
+    cur_id = cmd["parent_command_id"]
+    for _ in range(50):  # max chain depth guard
+        if cur_id is None:
+            return None
+        row = con.execute(
+            "SELECT critical_line_id, parent_command_id FROM commands WHERE id=?",
+            (cur_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        if row["critical_line_id"] is not None:
+            return row["critical_line_id"]
+        cur_id = row["parent_command_id"]
+    return None
+
+
 def spawn_replenishment(con, parent_cmd, price: float, tick: float) -> int:
     """
     Insert one PENDING command derived from parent_cmd at the current price.
-    Sets parent_command_id so the lineage is traceable.
+    Sets parent_command_id and inherits root critical_line_id for full traceability.
     Returns the new command id.
     """
     import random
@@ -282,17 +384,20 @@ def spawn_replenishment(con, parent_cmd, price: float, tick: float) -> int:
     tp_price = rt(entry_price + bracket) if direction == "BUY" else rt(entry_price - bracket)
     sl_price = rt(entry_price - bracket) if direction == "BUY" else rt(entry_price + bracket)
 
+    # Inherit critical_line_id from chain root so origin is always traceable
+    inherited_line_id = _root_critical_line_id(con, parent_cmd)
+
     con.execute("""
         INSERT INTO commands
             (symbol, line_price, line_type, line_strength,
              direction, entry_type, entry_price, tp_price, sl_price,
-             bracket_size, source, parent_command_id, quantity, status)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+             bracket_size, source, parent_command_id, critical_line_id, quantity, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
     """, (
         parent_cmd["symbol"], entry_price,
         "SUPPORT" if direction == "BUY" else "RESISTANCE", 1,
         direction, entry_type, entry_price, tp_price, sl_price,
-        bracket, source, parent_cmd["id"], qty,
+        bracket, source, parent_cmd["id"], inherited_line_id, qty,
     ))
     return con.execute("SELECT last_insert_rowid()").fetchone()[0]
 

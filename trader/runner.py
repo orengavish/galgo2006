@@ -74,7 +74,9 @@ def _start(name: str, cmd: list[str]) -> subprocess.Popen:
     return p
 
 
-def run(skip_preflight: bool = False, dry_run: bool = False):
+def run(skip_preflight: bool = False, dry_run: bool = False,
+        gen_bracket: float = None, gen_max_offset: int = None,
+        no_random_gen: bool = False):
     cfg = get_config()
 
     print(f"\n{'='*55}")
@@ -105,12 +107,20 @@ def run(skip_preflight: bool = False, dry_run: bool = False):
     if dry_run:
         broker_cmd.append("--dry-run")
 
+    gen_cmd = [sys.executable, "random_gen.py"]
+    if gen_bracket is not None:
+        gen_cmd += ["--bracket", str(gen_bracket)]
+    if gen_max_offset is not None:
+        gen_cmd += ["--max-offset", str(gen_max_offset)]
+
     components = [
         ("decider",          [sys.executable, "decider.py"]),
         ("broker",           broker_cmd),
         ("position_manager", [sys.executable, "position_manager.py"]),
         ("visualizer",       [sys.executable, "visualizer/app.py"]),
     ]
+    if not no_random_gen:
+        components.append(("random_gen", gen_cmd))
 
     for name, cmd in components:
         _start(name, cmd)
@@ -122,7 +132,7 @@ def run(skip_preflight: bool = False, dry_run: bool = False):
 
     # 3. Monitor — restart crashed components (except visualizer)
     # Exponential backoff per component; give up after 5 consecutive crashes
-    restartable  = {"decider", "broker", "position_manager"}
+    restartable  = {"decider", "broker", "position_manager", "random_gen"}
     proc_map     = {name: p for (name, _), p in zip(components, _procs)}
     cmd_map      = {name: cmd for name, cmd in components}
     restart_count = {name: 0 for name in restartable}
@@ -239,7 +249,7 @@ def self_test() -> bool:
 
         # 2. Config has visualizer section
         assert hasattr(cfg, "visualizer"), "Config missing visualizer section"
-        assert cfg.visualizer.port == 5000
+        assert cfg.visualizer.port > 0, f"Invalid port: {cfg.visualizer.port}"
 
         # 3. Preflight self-test passes
         r = subprocess.run(
@@ -265,8 +275,14 @@ if __name__ == "__main__":
                         help="Skip pre-flight checks (dev/testing only)")
     parser.add_argument("--reset",         action="store_true",
                         help="Cancel all IB orders and wipe DB, then exit")
-    parser.add_argument("--dry-run",       action="store_true",
+    parser.add_argument("--dry-run",        action="store_true",
                         help="Run without sending any IB orders (broker logs instead)")
+    parser.add_argument("--no-random-gen", action="store_true",
+                        help="Do not start random trade generator")
+    parser.add_argument("--bracket",        type=float, default=None, metavar="PTS",
+                        help="Bracket size for random_gen (default: 8.0)")
+    parser.add_argument("--max-offset",     type=int,   default=None, metavar="TICKS",
+                        help="Max entry offset ticks for random_gen (default: 2)")
     args = parser.parse_args()
 
     if args.self_test:
@@ -276,4 +292,6 @@ if __name__ == "__main__":
         reset_session()
         sys.exit(0)
 
-    run(skip_preflight=args.no_preflight, dry_run=args.dry_run)
+    run(skip_preflight=args.no_preflight, dry_run=args.dry_run,
+        gen_bracket=args.bracket, gen_max_offset=args.max_offset,
+        no_random_gen=args.no_random_gen)

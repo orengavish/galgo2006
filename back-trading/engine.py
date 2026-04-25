@@ -52,14 +52,14 @@ log = get_logger("engine")
 # ── Tick data ─────────────────────────────────────────────────────────────────
 
 def _tick_paths(cfg, symbol: str, target_date: date) -> tuple:
-    bars = Path(cfg.paths.bars)
+    bars = Path(cfg.paths.history)
     d    = target_date.strftime("%Y%m%d")
     return (bars / f"{symbol}_trades_{d}.csv",
             bars / f"{symbol}_bidask_{d}.csv")
 
 
 def _fetch_ticks(cfg, symbol: str, target_date: date) -> None:
-    """Fetch TRADES + BID_ASK ticks from IB and save to data/bars/."""
+    """Fetch TRADES + BID_ASK ticks from IB and save to data/history/."""
     import random
     from ib_insync import IB
     from fetcher import (get_contract_for_date, get_session_bounds,
@@ -67,7 +67,7 @@ def _fetch_ticks(cfg, symbol: str, target_date: date) -> None:
     from zoneinfo import ZoneInfo
     CT = ZoneInfo("America/Chicago")
 
-    bars = Path(cfg.paths.bars)
+    bars = Path(cfg.paths.history)
     bars.mkdir(parents=True, exist_ok=True)
     prog_db = bars.parent / "fetch_progress.db"
     progress_conn = _init_progress_db(prog_db)

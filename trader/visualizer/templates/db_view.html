@@ -12,6 +12,7 @@
   <button class="qpill"        data-q="gains"       onclick="quickFilter(this)">Gains</button>
   <button class="qpill"        data-q="losses"      onclick="quickFilter(this)">Losses</button>
   <button class="qpill"        data-q="all"         onclick="quickFilter(this)">All</button>
+  <button class="qpill"        data-q="chain" id="chain-pill" onclick="quickFilter(this)" style="display:none">⊕ Chain</button>
 </div>
 
 <!-- ── Detailed filters ────────────────────────────────────────────────── -->
@@ -90,6 +91,9 @@
   </div>
 </div>
 
+<!-- ── Chain banner ──────────────────────────────────────────────────────── -->
+<div id="chain-banner" style="display:none;padding:6px 10px;background:#1a2940;border-radius:4px;margin-bottom:8px;font-size:11px;color:#79c0ff"></div>
+
 <!-- ── Table ────────────────────────────────────────────────────────────── -->
 <div style="overflow-x:auto">
 <table id="db-table">
@@ -130,24 +134,81 @@
 let _allRows = [];
 let _sortKey = 'id', _sortAsc = false;
 let _quickMode = 'active';
+let _chainRoot = null;   // non-null = chain trace mode
 
-// ── Quick filters ──────────────────────────────────────────────────────────
+// ── Helpers ────────────────────────────────────────────────────────────────
 function isoToday(offset=0){
   const d = new Date(); d.setDate(d.getDate()+offset);
   return d.toISOString().slice(0,10);
 }
+function isReplenished(r){ return r.parent_command_id !== null && r.parent_command_id !== undefined; }
 
+// Walk up parent links to find the chain root id
+function chainRoot(id){
+  const byId = Object.fromEntries(_allRows.map(r=>[r.id, r]));
+  let cur = byId[id];
+  while(cur && isReplenished(cur)) cur = byId[cur.parent_command_id];
+  return cur ? cur.id : id;
+}
+
+// Collect all ids in a chain (root + all descendants recursively)
+function chainIds(rootId){
+  const result = new Set([rootId]);
+  let changed = true;
+  while(changed){
+    changed = false;
+    _allRows.forEach(r => {
+      if(r.parent_command_id !== null && r.parent_command_id !== undefined
+         && result.has(r.parent_command_id) && !result.has(r.id)){
+        result.add(r.id); changed = true;
+      }
+    });
+  }
+  return result;
+}
+
+// Depth in chain (0 = root, 1 = first replenishment, …)
+function chainDepth(r){
+  const byId = Object.fromEntries(_allRows.map(x=>[x.id, x]));
+  let depth = 0, cur = r;
+  while(cur && isReplenished(cur)){ depth++; cur = byId[cur.parent_command_id]; }
+  return depth;
+}
+
+// ── Chain trace mode ───────────────────────────────────────────────────────
+function showChain(id){
+  _chainRoot = chainRoot(id);
+  const pill = document.getElementById('chain-pill');
+  pill.style.display = '';
+  document.querySelectorAll('.qpill').forEach(b => b.classList.remove('active'));
+  pill.classList.add('active');
+  _quickMode = 'chain';
+  applyFilters();
+}
+
+function exitChain(){
+  _chainRoot = null;
+  _quickMode = 'all';
+  document.getElementById('chain-pill').style.display = 'none';
+  document.querySelectorAll('.qpill').forEach(b => b.classList.remove('active'));
+  document.querySelector('[data-q="all"]').classList.add('active');
+  applyFilters();
+}
+
+// ── Quick filters ──────────────────────────────────────────────────────────
 const _quickPresets = {
   active:      r => ['PENDING','SUBMITTING','SUBMITTED','FILLED'].includes(r.status),
   today:       r => (r.created_at||'').slice(0,10) === isoToday(),
   yesterday:   r => (r.created_at||'').slice(0,10) === isoToday(-1),
-  replenished: r => r.parent_command_id != null,
+  replenished: r => isReplenished(r),
   gains:       r => r.status === 'CLOSED' && r.pnl_points != null && r.pnl_points > 0,
   losses:      r => r.status === 'CLOSED' && r.pnl_points != null && r.pnl_points <= 0,
   all:         r => true,
+  chain:       r => _chainRoot !== null && chainIds(_chainRoot).has(r.id),
 };
 
 function quickFilter(btn){
+  _chainRoot = null;
   document.querySelectorAll('.qpill').forEach(b => b.classList.remove('active'));
   btn.classList.add('active');
   _quickMode = btn.dataset.q;
@@ -165,35 +226,51 @@ function applyFilters(){
   const to   = document.getElementById('f-date-to').value;
   const rp   = document.getElementById('f-replenished').checked;
 
+  const preset = _quickPresets[_quickMode] || _quickPresets.all;
   let rows = _allRows.filter(r => {
-    if(!(_quickPresets[_quickMode]||_quickPresets.all)(r)) return false;
+    if(!preset(r)) return false;
     if(st  && r.status     !== st)   return false;
     if(src && r.source     !== src)  return false;
     if(d   && r.direction  !== d)    return false;
     if(t   && r.entry_type !== t)    return false;
     if(rsn && r.exit_reason!== rsn)  return false;
-    if(rp  && r.parent_command_id == null) return false;
+    if(rp  && !isReplenished(r))     return false;
     const dt = (r.created_at||'').slice(0,10);
     if(from && dt < from) return false;
     if(to   && dt > to)   return false;
     return true;
   });
 
-  rows.sort((a,b)=>{
-    let av = a[_sortKey], bv = b[_sortKey];
-    if(av==null) av = _sortAsc ? '\uffff' : '';
-    if(bv==null) bv = _sortAsc ? '\uffff' : '';
-    return _sortAsc ? (av>bv?1:-1) : (av<bv?1:-1);
-  });
+  // In chain mode sort by id ascending to show lineage order
+  if(_quickMode === 'chain'){
+    rows.sort((a,b) => a.id - b.id);
+  } else {
+    rows.sort((a,b)=>{
+      let av = a[_sortKey], bv = b[_sortKey];
+      if(av==null) av = _sortAsc ? '\uffff' : '';
+      if(bv==null) bv = _sortAsc ? '\uffff' : '';
+      return _sortAsc ? (av>bv?1:-1) : (av<bv?1:-1);
+    });
+  }
+
+  // Chain header
+  const chainBanner = document.getElementById('chain-banner');
+  if(_quickMode === 'chain' && _chainRoot !== null){
+    chainBanner.style.display = 'block';
+    chainBanner.innerHTML = `Chain from root #${_chainRoot} — ${rows.length} trade(s)
+      &nbsp;<span onclick="exitChain()" style="cursor:pointer;color:#58a6ff">✕ exit chain view</span>`;
+  } else {
+    chainBanner.style.display = 'none';
+  }
 
   document.getElementById('db-tbody').innerHTML = rows.slice(0, 500).map(buildRow).join('');
   document.getElementById('row-count').textContent = rows.length + ' rows';
   document.getElementById('refresh-indicator').textContent = new Date().toTimeString().slice(0,8);
 
-  // Summary P&L for filtered closed set
+  // P&L summary
   const closed = rows.filter(r => r.pnl_points != null);
   if(closed.length){
-    const net = closed.reduce((s,r) => s+r.pnl_points, 0);
+    const net  = closed.reduce((s,r) => s+r.pnl_points, 0);
     const wins = closed.filter(r => r.pnl_points > 0).length;
     const el = document.getElementById('filter-pnl');
     el.textContent = `${wins}W / ${closed.length-wins}L  NET: ${net>=0?'+':''}${net.toFixed(2)}pts`;
@@ -223,15 +300,21 @@ function pnlFmt(v){
   return `<span class="${v>0?'pnl-pos':'pnl-neg'}">${s}</span>`;
 }
 function buildRow(r){
-  const rp = r.parent_command_id
-    ? `<span style="color:#8b949e;font-size:10px" title="replenished from #${r.parent_command_id}">↻${r.parent_command_id}</span>`
-    : '';
+  const depth = isReplenished(r) ? chainDepth(r) : 0;
+  const indent = '&nbsp;'.repeat(depth * 3);
+  const rpTag = isReplenished(r)
+    ? `${indent}<span onclick="showChain(${r.id})" title="Click to trace chain from root #${chainRoot(r.id)}"
+         style="color:#79c0ff;font-size:10px;cursor:pointer">↻#${r.parent_command_id}</span>`
+    : (chainIds(r.id).size > 1
+        ? `<span onclick="showChain(${r.id})" title="Click to trace ${chainIds(r.id).size} trades in chain"
+             style="color:#58a6ff;font-size:10px;cursor:pointer">⊕chain</span>`
+        : '');
   const src = r.source ? `<span style="font-size:10px;color:#6e7681">${r.source.replace('random_','')}</span>` : '';
   return `<tr>
     <td>${r.id}</td>
     <td class="ts">${(r.created_at||'').slice(0,16)}</td>
     <td>${src}</td>
-    <td>${rp}</td>
+    <td>${rpTag}</td>
     <td>${r.symbol}</td>
     <td><span class="${r.direction}">${r.direction}</span></td>
     <td><span class="${r.entry_type}">${r.entry_type}</span></td>

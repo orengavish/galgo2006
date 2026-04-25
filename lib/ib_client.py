@@ -282,6 +282,7 @@ class IBClient:
                 if self.live.isConnected():
                     log.info(f"Disconnecting LIVE (clientId={self._live_client_id})")
                     try:
+                        self.live.sleep(0)   # drain pending ib_insync events before TCP FIN
                         self.live.disconnect()
                     except Exception as e:
                         log.warning(f"LIVE disconnect error: {e}")
@@ -291,6 +292,7 @@ class IBClient:
                 if self.paper.isConnected():
                     log.info(f"Disconnecting PAPER (clientId={self._paper_client_id})")
                     try:
+                        self.paper.sleep(0)  # drain pending ib_insync events before TCP FIN
                         self.paper.disconnect()
                     except Exception as e:
                         log.warning(f"PAPER disconnect error: {e}")
