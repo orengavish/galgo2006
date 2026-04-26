@@ -35,16 +35,11 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 _TICK          = 0.25
-_SL_SLIP_TICKS = 0       # SL market fill: data shows 64% have 0 slippage (was 1)
+_SL_SLIP_TICKS = 1       # additional adverse ticks applied to SL market fill
 _MES_MULT      = 5.0     # MES: $5 per point = $1.25 per tick
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
-
-def _confirmed_hit(df: pd.DataFrame, first_idx: int, min_ticks: int = 2) -> bool:
-    """True if there are >=min_ticks rows at/past the level starting from first_idx."""
-    return len(df) - first_idx >= min_ticks
-
 
 def simulate_exit(fill_price: float,
                   fill_time: datetime,
@@ -52,104 +47,37 @@ def simulate_exit(fill_price: float,
                   sl_price: float,
                   direction: str,
                   trades_df: pd.DataFrame,
-                  session_end_utc: datetime,
-                  stag_seconds: float | None = None,
-                  stag_move: float | None = None,
-                  tp_confirm_ticks: int = 2) -> dict:
+                  session_end_utc: datetime) -> dict:
     """
     Calibration entry point: IB already filled the entry.
     Skip phase 1 — run only phase 2 (TP/SL OCO) from the known fill.
 
-    stag_seconds / stag_move: when both provided, add STAGNATION detection.
-    tp_confirm_ticks: minimum consecutive at/past-TP ticks to confirm a TP fill.
-      Filters brief "touch and bounce" that IB paper doesn't fill. Default 2.
-
     Returns dict with keys: exit_type, exit_fill_price, exit_fill_time, pnl.
     """
-    from datetime import timedelta
-
     is_buy = direction == "BUY"
     trades_after = trades_df[trades_df["time_utc"] > fill_time]
 
-    # TP: first hit only confirmed if >=tp_confirm_ticks ticks stay at/past tp
     if is_buy:
-        tp_cands = trades_after[trades_after["price"] >= tp_price]
-        sl_cands = trades_after[trades_after["price"] <= sl_price]
-        sl_exit  = sl_price - _TICK * _SL_SLIP_TICKS
+        tp_hit  = _first_gte(tp_price, trades_after)
+        sl_hit  = _first_lte(sl_price, trades_after)
+        sl_exit = sl_price - _TICK * _SL_SLIP_TICKS
     else:
-        tp_cands = trades_after[trades_after["price"] <= tp_price]
-        sl_cands = trades_after[trades_after["price"] >= sl_price]
-        sl_exit  = sl_price + _TICK * _SL_SLIP_TICKS
+        tp_hit  = _first_lte(tp_price, trades_after)
+        sl_hit  = _first_gte(sl_price, trades_after)
+        sl_exit = sl_price + _TICK * _SL_SLIP_TICKS
 
-    # Find confirmed TP: scan each candidate row, check if >=tp_confirm_ticks follow.
-    # Use actual tick price (not tp_price) to model price improvement on gaps:
-    #   SELL TP (BUY limit): fills at ask, which may be < tp on a fast drop.
-    #   BUY  TP (SELL limit): fills at tp (data shows delta=0 for all BUY TPs).
-    tp_hit = None
-    for iloc_i in range(len(tp_cands)):
-        if _confirmed_hit(tp_cands, iloc_i, tp_confirm_ticks):
-            row = tp_cands.iloc[iloc_i]
-            tick_p = row["price"]
-            # For SELL TP: actual fill = tick price (could be < tp on gap)
-            # For BUY  TP: actual fill = tp_price (limit order, no price improvement in data)
-            fill_p = tick_p if not is_buy else tp_price
-            tp_hit = (row["time_utc"], fill_p)
-            break
-
-    sl_hit = (sl_cands.iloc[0]["time_utc"], sl_cands.iloc[0]["price"]) if not sl_cands.empty else None
-
-    # Stagnation: model what the live position_manager sees (last-known trade price).
-    # At fill+stag_seconds, check the last trade price up to that moment.
-    # If within stag_move → stagnation fires at cutoff.
-    # Otherwise, wait for the next trade tick within stag_move.
-    stag_hit = None
-    if stag_seconds is not None and stag_move is not None:
-        stag_cutoff = fill_time + timedelta(seconds=stag_seconds)
-        prior = trades_df[trades_df["time_utc"] <= stag_cutoff]
-        if not prior.empty:
-            last_p = prior.iloc[-1]["price"]
-            if abs(last_p - fill_price) < stag_move * 2:
-                stag_hit = (stag_cutoff, last_p)
-            else:
-                # Check each new trade tick after cutoff (price changes on each tick)
-                cands = trades_after[
-                    (trades_after["time_utc"] > stag_cutoff) &
-                    (trades_after["price"].sub(fill_price).abs() < stag_move * 2)
-                ]
-                if not cands.empty:
-                    stag_hit = (cands.iloc[0]["time_utc"], cands.iloc[0]["price"])
-
-    # OCO priority: SL > TP > STAG (take earliest; SL wins ties)
-    candidates = [(t, kind) for t, kind in [
-        (sl_hit[0]   if sl_hit   else None, "SL"),
-        (tp_hit[0]   if tp_hit   else None, "TP"),
-        (stag_hit[0] if stag_hit else None, "STAGNATION"),
-    ] if t is not None]
-
-    if not candidates:
+    if tp_hit is None and sl_hit is None:
         exit_type       = "EXPIRED"
         exit_time       = session_end_utc
         exit_fill_price = None
+    elif sl_hit is not None and (tp_hit is None or sl_hit[0] <= tp_hit[0]):
+        exit_type       = "SL"
+        exit_time, _    = sl_hit
+        exit_fill_price = round(sl_exit, 10)
     else:
-        # Earliest time wins; on tie SL > TP > STAG (order already sorted above)
-        earliest_time = min(t for t, _ in candidates)
-        for t, kind in candidates:       # first match in SL>TP>STAG order
-            if t == earliest_time:
-                winner = kind
-                break
-
-        if winner == "SL":
-            exit_type       = "SL"
-            exit_time, _    = sl_hit
-            exit_fill_price = round(sl_exit, 10)
-        elif winner == "TP":
-            exit_type           = "TP"
-            exit_time, tp_fill  = tp_hit
-            exit_fill_price     = tp_fill
-        else:
-            exit_type       = "STAGNATION"
-            exit_time, stag_price = stag_hit
-            exit_fill_price = stag_price   # MKT exit at current price
+        exit_type       = "TP"
+        exit_time, _    = tp_hit
+        exit_fill_price = tp_price
 
     pnl = None
     if exit_fill_price is not None:
@@ -400,9 +328,9 @@ def self_test() -> bool:
         results4 = simulate(orders4, trades4, None, session_end)
         r4 = results4[0]
         assert r4["exit_type"] == "SL"
-        # SL at 6497, 0 slippage ticks → fill at 6497.0
-        assert r4["exit_fill_price"] == 6497.0, f"SL fill: {r4['exit_fill_price']}"
-        assert r4["pnl"] == (6497.0 - 6499.0) * 5.0
+        # SL at 6497, slippage 1 tick (0.25) → fill at 6496.75
+        assert r4["exit_fill_price"] == 6497.0 - _TICK, f"SL fill: {r4['exit_fill_price']}"
+        assert r4["pnl"] == (6496.75 - 6499.0) * 5.0
 
         print("[self-test] simulator: PASS")
         return True

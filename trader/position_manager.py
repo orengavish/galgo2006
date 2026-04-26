@@ -1,15 +1,15 @@
 """
 position_manager.py
 Position management for Galao.
-Monitors open positions for stagnation and SL cool-down.
+Monitors open positions for SL cool-down.
 
 Responsibilities:
-  - Stagnation kill-switch (R-POS-01): position open > stagnation_seconds AND
-    price moved < stagnation_min_move_points → MKT exit, reason=STAGNATION
   - SL cool-down (R-POS-02): when a command reaches CLOSED with exit_reason=SL,
     disarm the line for sl_cooldown_seconds before re-arming
-  - Writes EXITING status to DB before placing market exit
   - Stops when SESSION=SHUTDOWN
+
+Note: positions exit ONLY via IB bracket TP/SL fills or explicit abort.
+      No stagnation kill-switch — let the bracket ride.
 
 Usage:
     python position_manager.py            # run manager loop (blocking)
@@ -30,7 +30,7 @@ import sys; sys.path.insert(0, str(_ROOT)) if str(_ROOT) not in sys.path else No
 
 from lib.config_loader import get_config
 from lib.logger import get_logger
-from lib.db import get_db, init_db, get_system_state, update_command_status, record_completed_trade
+from lib.db import get_db, init_db, get_system_state, update_command_status
 from lib.critical_lines import disarm_line, rearm_line
 
 log = get_logger("position_manager")
@@ -49,117 +49,6 @@ def _is_shutdown(db_path) -> bool:
         val = get_system_state(con, "SESSION")
     return val == "SHUTDOWN"
 
-
-def check_stagnation(ibc, db_path, cfg) -> int:
-    """
-    For each FILLED command (open position), check stagnation:
-    - open > stagnation_seconds AND price moved < stagnation_min_move_points
-    → write EXITING, place MKT order, write CLOSED reason=STAGNATION
-
-    Returns number of positions exited.
-    """
-    stag_secs  = cfg.position.stagnation_seconds
-    stag_move  = cfg.position.stagnation_min_move_points
-
-    with get_db(db_path) as con:
-        filled = con.execute(
-            "SELECT * FROM commands WHERE status='FILLED'"
-        ).fetchall()
-
-    if not filled:
-        return 0
-
-    exited = 0
-    now = datetime.now(timezone.utc)
-
-    for cmd in filled:
-        fill_time = _parse_utc(cmd["fill_time"])
-        open_secs = (now - fill_time).total_seconds()
-
-        if open_secs < stag_secs:
-            continue  # Not old enough yet
-
-        # Get current price
-        try:
-            current_price = ibc.get_price(cmd["symbol"])
-        except Exception as e:
-            log.warning(f"Cannot get price for stagnation check cmd {cmd['id']}: {e}")
-            continue
-
-        fill_price = cmd["fill_price"]
-        if fill_price is None:
-            continue
-        movement = abs(current_price - fill_price)
-
-        if movement >= stag_move:
-            continue  # Sufficient movement — not stagnating
-
-        log.warning(
-            f"STAGNATION detected: cmd {cmd['id']} {cmd['symbol']} "
-            f"open={open_secs:.0f}s fill={fill_price} current={current_price} "
-            f"move={movement:.2f}pt (< {stag_move}pt)"
-        )
-
-        # Write EXITING
-        with get_db(db_path) as con:
-            update_command_status(con, cmd["id"], "EXITING")
-
-        # Place MKT exit via PAPER
-        try:
-            _place_market_exit(ibc, cmd)
-            exit_price = current_price  # approximate
-            pnl = (exit_price - fill_price) if cmd["direction"] == "BUY" \
-                  else (fill_price - exit_price)
-            with get_db(db_path) as con:
-                update_command_status(
-                    con, cmd["id"], "CLOSED",
-                    exit_price  = exit_price,
-                    exit_time   = _now_utc(),
-                    exit_reason = "STAGNATION",
-                    pnl_points  = round(pnl, 4),
-                )
-                record_completed_trade(con, cmd["id"])
-            log.info(f"Command {cmd['id']} CLOSED via STAGNATION pnl={pnl:+.2f}pts")
-            exited += 1
-        except Exception as e:
-            log.error(f"Failed to exit stagnant position cmd {cmd['id']}: {e}")
-            with get_db(db_path) as con:
-                update_command_status(con, cmd["id"], "ERROR", error_message=str(e))
-
-    return exited
-
-
-def _place_market_exit(ibc, cmd):
-    """Place a market order to exit the open position."""
-    from ib_insync import MarketOrder
-    if not ibc.is_paper_connected():
-        raise ConnectionError("PAPER not connected")
-
-    contract = ibc.get_contract(cmd["symbol"])
-    exit_action = "SELL" if cmd["direction"] == "BUY" else "BUY"
-    order = MarketOrder(exit_action, cmd["quantity"])
-
-    # Also cancel the open TP and SL orders
-    _cancel_bracket_legs(ibc, cmd)
-
-    trade = ibc.paper.placeOrder(contract, order)
-    log.info(f"MKT exit placed: {exit_action} {cmd['quantity']} {cmd['symbol']} "
-             f"ib_id={trade.order.orderId}")
-    return trade
-
-
-def _cancel_bracket_legs(ibc, cmd):
-    """Cancel the TP and SL child orders of a filled bracket."""
-    from ib_insync import Order
-    for oid in (cmd["ib_tp_order_id"], cmd["ib_sl_order_id"]):
-        if oid:
-            try:
-                o = Order()
-                o.orderId = oid
-                ibc.paper.cancelOrder(o)
-                log.debug(f"Cancelled order {oid}")
-            except Exception as e:
-                log.warning(f"Could not cancel order {oid}: {e}")
 
 
 def check_sl_cooldowns(db_path, cfg, date_str: str) -> int:
@@ -247,13 +136,6 @@ def run_position_manager(db_path=None, date_str: str = None):
                     break
 
             try:
-                n_stag = check_stagnation(ibc, db_path, cfg)
-                if n_stag:
-                    log.info(f"Exited {n_stag} stagnant position(s)")
-            except Exception as e:
-                log.error(f"Error in check_stagnation: {e}")
-
-            try:
                 check_sl_cooldowns(db_path, cfg, date_str)
             except Exception as e:
                 log.error(f"Error in check_sl_cooldowns: {e}")
@@ -326,30 +208,6 @@ def self_test() -> bool:
                     "SELECT armed FROM critical_lines WHERE price=6490.0"
                 ).fetchone()
             assert row2["armed"] == 1, "Line should be re-armed after cooldown"
-
-            # 3. Stagnation detection logic (without IB)
-            # Fake FILLED command with old fill_time and price at entry
-            with get_db(db_path) as con:
-                con.execute("""
-                    INSERT INTO commands
-                        (symbol, line_price, line_type, line_strength,
-                         direction, entry_type, entry_price, tp_price, sl_price,
-                         bracket_size, status, fill_price, fill_time)
-                    VALUES ('MES', 6510.0, 'RESISTANCE', 1,
-                            'SELL', 'LMT', 6510.0, 6508.0, 6512.0,
-                            2.0, 'FILLED', 6510.0, '2000-01-01T00:00:00Z')
-                """)
-                cmd_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-            # Verify the logic: open for 876000+ seconds, movement = 0 → stagnation
-            cmd = None
-            with get_db(db_path) as con:
-                cmd = con.execute("SELECT * FROM commands WHERE id=?", (cmd_id,)).fetchone()
-            fill_time = _parse_utc(cmd["fill_time"])
-            open_secs = (datetime.now(timezone.utc) - fill_time).total_seconds()
-            movement = abs(6510.0 - 6510.0)
-            assert open_secs > cfg.position.stagnation_seconds
-            assert movement < cfg.position.stagnation_min_move_points
 
             reset_loggers()
 

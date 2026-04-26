@@ -108,13 +108,13 @@ def simulate_exit(fill_price: float,
         prior = trades_df[trades_df["time_utc"] <= stag_cutoff]
         if not prior.empty:
             last_p = prior.iloc[-1]["price"]
-            if abs(last_p - fill_price) < stag_move * 2:
+            if abs(last_p - fill_price) < stag_move:
                 stag_hit = (stag_cutoff, last_p)
             else:
                 # Check each new trade tick after cutoff (price changes on each tick)
                 cands = trades_after[
                     (trades_after["time_utc"] > stag_cutoff) &
-                    (trades_after["price"].sub(fill_price).abs() < stag_move * 2)
+                    (trades_after["price"].sub(fill_price).abs() < stag_move)
                 ]
                 if not cands.empty:
                     stag_hit = (cands.iloc[0]["time_utc"], cands.iloc[0]["price"])

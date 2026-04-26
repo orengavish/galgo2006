@@ -288,7 +288,7 @@ def print_grades(grades: dict, target_date: date) -> None:
 def run(date_from: str, date_to: str, symbol: str = "MES",
         reality_model: bool = False) -> None:
     cfg    = get_config()
-    db     = init_db(Path(cfg.paths.db))
+    db     = init_db(Path(cfg.paths.backtest_db))
     d_from = date.fromisoformat(date_from)
     d_to   = date.fromisoformat(date_to)
 

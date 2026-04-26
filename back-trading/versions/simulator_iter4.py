@@ -35,7 +35,7 @@ if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
 _TICK          = 0.25
-_SL_SLIP_TICKS = 0       # SL market fill: data shows 64% have 0 slippage (was 1)
+_SL_SLIP_TICKS = 1       # additional adverse ticks applied to SL market fill
 _MES_MULT      = 5.0     # MES: $5 per point = $1.25 per tick
 
 
@@ -108,13 +108,13 @@ def simulate_exit(fill_price: float,
         prior = trades_df[trades_df["time_utc"] <= stag_cutoff]
         if not prior.empty:
             last_p = prior.iloc[-1]["price"]
-            if abs(last_p - fill_price) < stag_move * 2:
+            if abs(last_p - fill_price) < stag_move:
                 stag_hit = (stag_cutoff, last_p)
             else:
                 # Check each new trade tick after cutoff (price changes on each tick)
                 cands = trades_after[
                     (trades_after["time_utc"] > stag_cutoff) &
-                    (trades_after["price"].sub(fill_price).abs() < stag_move * 2)
+                    (trades_after["price"].sub(fill_price).abs() < stag_move)
                 ]
                 if not cands.empty:
                     stag_hit = (cands.iloc[0]["time_utc"], cands.iloc[0]["price"])
@@ -400,9 +400,9 @@ def self_test() -> bool:
         results4 = simulate(orders4, trades4, None, session_end)
         r4 = results4[0]
         assert r4["exit_type"] == "SL"
-        # SL at 6497, 0 slippage ticks → fill at 6497.0
-        assert r4["exit_fill_price"] == 6497.0, f"SL fill: {r4['exit_fill_price']}"
-        assert r4["pnl"] == (6497.0 - 6499.0) * 5.0
+        # SL at 6497, slippage 1 tick (0.25) → fill at 6496.75
+        assert r4["exit_fill_price"] == 6497.0 - _TICK, f"SL fill: {r4['exit_fill_price']}"
+        assert r4["pnl"] == (6496.75 - 6499.0) * 5.0
 
         print("[self-test] simulator: PASS")
         return True

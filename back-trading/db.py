@@ -88,6 +88,32 @@ def init_db(db_path: Path) -> sqlite3.Connection:
             pnl_diff        REAL,
             created_at      TEXT NOT NULL
         );
+
+        CREATE TABLE IF NOT EXISTS calib_runs (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            ran_at          TEXT NOT NULL,
+            iteration       INTEGER NOT NULL,
+            change_name     TEXT NOT NULL,
+            description     TEXT,
+            trades_analyzed INTEGER NOT NULL,
+            overall_pct     REAL NOT NULL,
+            tp_pct          REAL,
+            sl_pct          REAL,
+            stag_pct        REAL,
+            avg_delta_ticks REAL,
+            is_better       INTEGER    -- 1=yes 0=no NULL=baseline
+        );
+
+        CREATE TABLE IF NOT EXISTS calib_details (
+            id              INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_id          INTEGER NOT NULL REFERENCES calib_runs(id),
+            dimension       TEXT NOT NULL,   -- 'bracket' | 'exit_reason' | 'source'
+            label           TEXT NOT NULL,
+            total           INTEGER NOT NULL,
+            matched         INTEGER NOT NULL,
+            match_pct       REAL NOT NULL,
+            avg_delta_ticks REAL
+        );
     """)
     conn.commit()
     return conn

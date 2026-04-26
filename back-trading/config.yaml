@@ -27,7 +27,7 @@ orders:
   tick_size: 0.25
 
 position:
-  stagnation_seconds: 60
+  stagnation_seconds: 300
   stagnation_min_move_points: 0.5
   sl_cooldown_seconds: 30
 
@@ -47,6 +47,7 @@ visualizer:
   port: 5001                    # different port from trader (5000)
 
 backtest:
+  symbol: MES
   bar_size: "1 min"             # IB bar size string
   what_to_show: TRADES
   use_rth: false                # include extended hours
@@ -66,7 +67,8 @@ grader:
 paths:
   db: data/backtest.db
   test_db: data/test_backtest.db
-  bars: data/bars               # cached historical OHLC bars
+  live_db: ../trader/data/galao.db   # live paper trading DB (read-only for calibration)
+  history: ../trader/data/history    # shared tick CSVs
   results: data/results
   logs: logs
-  versions: ../versions         # shared with trader
+  versions: ../versions              # shared with trader
