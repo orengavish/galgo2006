@@ -1009,6 +1009,88 @@ def lines_page():
                            symbols=cfg.symbols or ["MES"])
 
 
+# ── Fetch Status ──────────────────────────────────────────────────────────────
+
+_FETCH_HOLIDAYS = {
+    "2026-01-01", "2026-01-19", "2026-02-16", "2026-04-03",
+    "2026-05-25", "2026-07-03", "2026-09-07", "2026-11-26", "2026-12-25",
+}
+
+
+def _is_trading_day(d) -> bool:
+    return d.weekday() < 5 and d.strftime("%Y-%m-%d") not in _FETCH_HOLIDAYS
+
+
+def _fetch_symbols():
+    try:
+        cfg = _get_cfg()
+        override = getattr(getattr(cfg, "fetcher", None), "symbols_override", None)
+        return list(override) if override else list(cfg.symbols)
+    except Exception:
+        return ["MES"]
+
+
+@app.route("/api/fetch-status")
+def api_fetch_status():
+    from datetime import date as date_cls, timedelta
+    today = date_cls.today()
+    days = []
+    d = today
+    while len(days) < 30:
+        if _is_trading_day(d):
+            days.append(d.strftime("%Y-%m-%d"))
+        d -= timedelta(days=1)
+
+    symbols = _fetch_symbols()
+
+    with get_db(_get_db_path()) as con:
+        rows = con.execute(
+            "SELECT symbol, date, file_type, status, rows_fetched, error_msg"
+            " FROM fetch_log ORDER BY fetched_at DESC"
+        ).fetchall()
+
+    # Build lookup: (symbol, date, file_type) -> best status
+    lookup: dict = {}
+    for r in rows:
+        key = (r["symbol"], r["date"], r["file_type"])
+        if key not in lookup:   # newest first, so first wins
+            lookup[key] = {"status": r["status"],
+                           "rows": r["rows_fetched"],
+                           "error": r["error_msg"]}
+
+    result = {}
+    for ds in days:
+        result[ds] = {}
+        for sym in symbols:
+            trades = lookup.get((sym, ds, "trades"))
+            bidask = lookup.get((sym, ds, "bidask"))
+            result[ds][sym] = {"trades": trades, "bidask": bidask}
+
+    return jsonify({"days": days, "symbols": symbols, "grid": result})
+
+
+@app.route("/api/fetch-now", methods=["POST"])
+def api_fetch_now():
+    import subprocess
+    data = request.get_json(force=True) or {}
+    symbol = data.get("symbol", "").upper()
+    date_str = data.get("date", "")
+    if not symbol or not date_str:
+        return jsonify({"error": "symbol and date required"}), 400
+
+    scheduler = Path(__file__).parent.parent / "fetch_scheduler.py"
+    subprocess.Popen(
+        [sys.executable, str(scheduler), "--symbol", symbol, "--date", date_str],
+        cwd=str(Path(__file__).parent.parent)
+    )
+    return jsonify({"started": True, "symbol": symbol, "date": date_str})
+
+
+@app.route("/fetch-status")
+def fetch_status_page():
+    return render_template("fetch_status.html", active="fetch_status")
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 def self_test() -> bool:

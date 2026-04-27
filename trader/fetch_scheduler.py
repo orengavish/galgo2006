@@ -283,9 +283,31 @@ def self_test() -> bool:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Galao daily fetch scheduler")
     parser.add_argument("--self-test", action="store_true")
+    parser.add_argument("--symbol", default=None,
+                        help="Manual single-symbol fetch (requires --date)")
+    parser.add_argument("--date", default=None,
+                        help="Date to fetch YYYY-MM-DD (manual mode only)")
     args = parser.parse_args()
 
     if args.self_test:
         sys.exit(0 if self_test() else 1)
+
+    if args.symbol and args.date:
+        # Manual single-symbol fetch triggered from browser "Fetch Now"
+        cfg = get_config()
+        try:
+            db_path = Path(cfg.paths.db)
+            output_dir = Path(cfg.paths.history)
+            progress_db_path = db_path.parent / "fetch_progress.db"
+        except Exception:
+            db_path = Path("data/galao.db")
+            output_dir = Path("data/history")
+            progress_db_path = Path("data/fetch_progress.db")
+        init_db(db_path)
+        target = date.fromisoformat(args.date)
+        fetch_bid_ask = getattr(getattr(cfg, "fetcher", None), "fetch_bid_ask", True)
+        _fetch_symbol_day(args.symbol.upper(), target, fetch_bid_ask,
+                          output_dir, progress_db_path, db_path)
+        sys.exit(0)
 
     run()
