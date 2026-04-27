@@ -15,6 +15,16 @@ ib:
 
 symbols:
   - MES
+  - MNQ
+  - MYM
+  - M2K
+
+fetcher:
+  auto_fetch_enabled: true
+  fetch_bid_ask: true
+  fetch_on_startup: true        # fetch prev day if missing when runner starts
+  symbols_override: []          # empty = use top-level symbols list
+  trigger_time_ct: "17:30"      # HH:MM CT — trigger after market close
 
 session:
   open_offset_minutes: 30
