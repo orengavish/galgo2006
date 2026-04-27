@@ -282,8 +282,15 @@ def _migrate(path: Path = None):
                 con.execute(stmt)
             except Exception:
                 pass
-        # Always recreate the view so schema changes are picked up on restart
-        con.execute("DROP VIEW IF EXISTS verified_trades")
+        # Always recreate the view so schema changes are picked up on restart.
+        # Guard: if verified_trades exists as a TABLE (older DB), drop it as a table first.
+        row = con.execute(
+            "SELECT type FROM sqlite_master WHERE name='verified_trades'"
+        ).fetchone()
+        if row and row[0] == "table":
+            con.execute("DROP TABLE verified_trades")
+        elif row and row[0] == "view":
+            con.execute("DROP VIEW verified_trades")
         con.execute(_VERIFIED_TRADES_VIEW)
 
 
