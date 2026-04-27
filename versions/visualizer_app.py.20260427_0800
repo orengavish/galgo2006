@@ -39,11 +39,9 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 _HERE = Path(__file__).parent
-_TRADER = _HERE.parent          # trader/visualizer -> trader
-_ROOT = _TRADER.parent          # trader -> galgo2026
-for _p in (str(_ROOT), str(_TRADER)):
-    if _p not in sys.path:
-        sys.path.insert(0, _p)
+_ROOT = _HERE.parent.parent   # trader/visualizer -> trader -> galgo2026
+if str(_ROOT) not in sys.path:
+    sys.path.insert(0, str(_ROOT))
 
 import re
 from flask import Flask, jsonify, request, render_template
@@ -111,12 +109,11 @@ def api_session_state():
 
 @app.route("/api/stats")
 def api_stats():
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-
     with get_db(_get_db_path()) as con:
-        status_rows = con.execute(
+        rows = con.execute(
             "SELECT status, COUNT(*) as cnt FROM commands GROUP BY status"
         ).fetchall()
+        today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         closed_today = con.execute(
             "SELECT COUNT(*) FROM commands WHERE status='CLOSED'"
             " AND date(updated_at)=?", (today,)
@@ -125,73 +122,29 @@ def api_stats():
             "SELECT COUNT(*) FROM commands WHERE status IN ('ERROR','RECONCILE_REQUIRED')"
         ).fetchone()[0]
 
-        # Unrealized P&L — read from FILLED commands (positions table not populated)
-        filled_cmds = _rows_to_list(con.execute(
-            "SELECT direction, fill_price, quantity FROM commands WHERE status='FILLED'"
+        # Unrealized P&L from open positions
+        positions = _rows_to_list(con.execute(
+            "SELECT * FROM positions WHERE status='OPEN'"
         ).fetchall())
 
-        # Realized P&L today from completed_trades
-        pnl_today_rows = _rows_to_list(con.execute(
-            "SELECT pnl_points FROM completed_trades WHERE date(exit_time)=?", (today,)
-        ).fetchall())
-
-        # Replenish stats
-        rp_rows = con.execute(
-            "SELECT status, COUNT(*) as cnt FROM commands"
-            " WHERE parent_command_id IS NOT NULL GROUP BY status"
-        ).fetchall()
-        rp_total = con.execute(
-            "SELECT COUNT(*) FROM commands WHERE parent_command_id IS NOT NULL"
-        ).fetchone()[0]
-        rp_closed_pnl = con.execute(
-            "SELECT SUM(ct.pnl_points) FROM completed_trades ct"
-            " JOIN commands c ON c.id = ct.command_id"
-            " WHERE c.parent_command_id IS NOT NULL"
-        ).fetchone()[0]
-
-    counts = {r["status"]: r["cnt"] for r in status_rows}
+    counts = {r["status"]: r["cnt"] for r in rows}
     counts["CLOSED"] = closed_today
     counts["ERROR"]  = errors
 
-    # ── Unrealized P&L ────────────────────────────────────────────────────
     try:
         from visualizer.price_feed import get_latest
         price, _ = get_latest()
     except Exception:
         price = None
 
-    unrealized = None
-    if price and filled_cmds:
-        unrealized = sum(
-            (price - c["fill_price"]) * c["quantity"] if c["direction"] == "BUY"
-            else (c["fill_price"] - price) * c["quantity"]
-            for c in filled_cmds if c["fill_price"] is not None
+    pnl = None
+    if price and positions:
+        pnl = sum(
+            (price - p["entry_price"]) * p["quantity"] if p["direction"] == "BUY"
+            else (p["entry_price"] - price) * p["quantity"]
+            for p in positions
         )
-    counts["unrealized_pnl"] = round(unrealized, 2) if unrealized is not None else None
-
-    # ── Realized P&L today breakdown ──────────────────────────────────────
-    wins   = [r["pnl_points"] for r in pnl_today_rows if r["pnl_points"] > 0]
-    losses = [r["pnl_points"] for r in pnl_today_rows if r["pnl_points"] <= 0]
-    counts["pnl_today"] = {
-        "wins":       len(wins),
-        "gains":      round(sum(wins), 2)   if wins   else 0.0,
-        "losses":     len(losses),
-        "loss_total": round(sum(losses), 2) if losses else 0.0,
-        "net":        round(sum(r["pnl_points"] for r in pnl_today_rows), 2) if pnl_today_rows else 0.0,
-    }
-
-    # ── Replenish stats ───────────────────────────────────────────────────
-    rp_by_status = {r["status"]: r["cnt"] for r in rp_rows}
-    counts["replenish"] = {
-        "total":     rp_total,
-        "pending":   rp_by_status.get("PENDING", 0),
-        "submitted": rp_by_status.get("SUBMITTED", 0) + rp_by_status.get("SUBMITTING", 0),
-        "filled":    rp_by_status.get("FILLED", 0),
-        "closed":    rp_by_status.get("CLOSED", 0),
-        "error":     rp_by_status.get("ERROR", 0),
-        "pnl":       round(rp_closed_pnl, 2) if rp_closed_pnl is not None else None,
-    }
-
+    counts["unrealized_pnl"] = round(pnl, 2) if pnl is not None else None
     return jsonify(counts)
 
 
@@ -352,189 +305,6 @@ def api_release_notes():
     return jsonify(_rows_to_list(rows))
 
 
-# ── Generate API ─────────────────────────────────────────────────────────────
-
-@app.route("/api/generate", methods=["POST"])
-def api_generate():
-    """
-    POST /api/generate
-    Body JSON:
-      mode         str    — "random" (default) or "critical_line"
-      bracket      float  — bracket size in points (default 8.0)
-      types        list   — entry types ["MKT","LMT","STP"]
-      count        int    — trades per line or total (default 10, max 200)
-      max_offset   int    — max entry offset from anchor price in ticks (default 2)
-
-      -- critical_line mode only --
-      line_ids     list   — IDs from critical_lines table (DB-sourced, fully traceable)
-      line_text    str    — free-form text to parse (e.g. "support: 7150!, 7140")
-
-    Returns {count, price, commands: [...]}
-    """
-    import random as _rnd
-
-    body       = request.get_json(force=True) or {}
-    mode       = body.get("mode", "random")
-    bracket    = float(body.get("bracket", 8.0))
-    types      = [t.upper() for t in body.get("types", ["MKT", "LMT", "STP"])]
-    count      = min(int(body.get("count", 10)), 200)
-    max_offset = int(body.get("max_offset", 2))
-
-    if not types:
-        return jsonify({"error": "At least one entry type required"}), 400
-
-    try:
-        from visualizer.price_feed import get_latest
-        price, _ = get_latest()
-    except Exception:
-        price = None
-
-    if price is None:
-        return jsonify({"error": "No price available — price feed not running"}), 400
-
-    cfg  = _get_cfg()
-    tick = cfg.orders.tick_size
-    sym  = (cfg.symbols or ["MES"])[0]
-
-    def rt(p):
-        return round(round(p / tick) * tick, 10)
-
-    def _make_cmd(anchor_price, direction, entry_type, source, critical_line_id=None,
-                  line_type=None, strength=1):
-        offset = _rnd.randint(1, max(1, max_offset)) * tick
-        if entry_type == "MKT":
-            ep = rt(anchor_price)
-        elif entry_type == "LMT":
-            ep = rt(anchor_price - offset) if direction == "BUY" else rt(anchor_price + offset)
-        else:  # STP
-            ep = rt(anchor_price + offset) if direction == "BUY" else rt(anchor_price - offset)
-        tp = rt(ep + bracket) if direction == "BUY" else rt(ep - bracket)
-        sl = rt(ep - bracket) if direction == "BUY" else rt(ep + bracket)
-        return {
-            "symbol":           sym,
-            "line_price":       anchor_price,
-            "line_type":        line_type or ("SUPPORT" if direction == "BUY" else "RESISTANCE"),
-            "line_strength":    strength,
-            "direction":        direction,
-            "entry_type":       entry_type,
-            "entry_price":      ep,
-            "tp_price":         tp,
-            "sl_price":         sl,
-            "bracket_size":     bracket,
-            "source":           source,
-            "critical_line_id": critical_line_id,
-            "quantity":         cfg.orders.quantity,
-        }
-
-    def _insert(trade):
-        with get_db(_get_db_path()) as con:
-            con.execute("""
-                INSERT INTO commands
-                    (symbol, line_price, line_type, line_strength,
-                     direction, entry_type, entry_price, tp_price, sl_price,
-                     bracket_size, source, critical_line_id, quantity, status)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
-            """, (
-                trade["symbol"], trade["line_price"], trade["line_type"], trade["line_strength"],
-                trade["direction"], trade["entry_type"],
-                trade["entry_price"], trade["tp_price"], trade["sl_price"],
-                trade["bracket_size"], trade["source"], trade["critical_line_id"],
-                trade["quantity"],
-            ))
-            return con.execute("SELECT last_insert_rowid()").fetchone()[0]
-
-    inserted = []
-
-    if mode == "critical_line":
-        # ── Resolve lines from DB IDs and/or parsed text ──────────────────────
-        lines_to_use = []
-
-        line_ids = body.get("line_ids", [])
-        if line_ids:
-            with get_db(_get_db_path()) as con:
-                for lid in line_ids:
-                    row = con.execute(
-                        "SELECT * FROM critical_lines WHERE id=?", (lid,)
-                    ).fetchone()
-                    if row:
-                        lines_to_use.append({
-                            "id":        row["id"],
-                            "price":     row["price"],
-                            "line_type": row["line_type"],
-                            "strength":  row["strength"],
-                            "from_db":   True,
-                        })
-
-        line_text = body.get("line_text", "").strip()
-        if line_text:
-            parsed = _parse_lines_text(line_text)
-            today  = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-            # Save parsed lines to DB so they're traceable, then use their IDs
-            with get_db(_get_db_path()) as con:
-                for pl in parsed:
-                    con.execute(
-                        "INSERT INTO critical_lines (symbol, date, line_type, price, strength, armed)"
-                        " VALUES (?, ?, ?, ?, ?, 1)",
-                        (sym, today, pl["line_type"], pl["price"], pl["strength"])
-                    )
-                    new_id = con.execute("SELECT last_insert_rowid()").fetchone()[0]
-                    lines_to_use.append({
-                        "id":        new_id,
-                        "price":     pl["price"],
-                        "line_type": pl["line_type"],
-                        "strength":  pl["strength"],
-                        "from_db":   False,
-                    })
-
-        if not lines_to_use:
-            return jsonify({"error": "No critical lines found — select DB lines or paste line text"}), 400
-
-        # Generate `count` trades per line; direction fixed by line_type
-        for ln in lines_to_use:
-            direction = "BUY" if ln["line_type"] == "SUPPORT" else "SELL"
-            for _ in range(count):
-                entry_type = _rnd.choice(types)
-                trade = _make_cmd(
-                    anchor_price     = ln["price"],
-                    direction        = direction,
-                    entry_type       = entry_type,
-                    source           = "critical_line",
-                    critical_line_id = ln["id"],
-                    line_type        = ln["line_type"],
-                    strength         = ln["strength"],
-                )
-                cmd_id = _insert(trade)
-                inserted.append({
-                    "id": cmd_id, "direction": direction, "entry_type": entry_type,
-                    "entry_price": trade["entry_price"],
-                    "critical_line_id": ln["id"], "line_price": ln["price"],
-                })
-
-        log.info(f"[generate] critical_line: {len(inserted)} cmds across {len(lines_to_use)} lines "
-                 f"bracket={bracket}")
-
-    else:
-        # ── Random mode (existing behaviour) ─────────────────────────────────
-        for _ in range(count):
-            entry_type = _rnd.choice(types)
-            direction  = _rnd.choice(["BUY", "SELL"])
-            trade = _make_cmd(
-                anchor_price = price,
-                direction    = direction,
-                entry_type   = entry_type,
-                source       = f"random_{entry_type.lower()}",
-            )
-            cmd_id = _insert(trade)
-            inserted.append({
-                "id": cmd_id, "direction": direction, "entry_type": entry_type,
-                "entry_price": trade["entry_price"],
-            })
-
-        log.info(f"[generate] random: {len(inserted)} cmds near price={price} bracket={bracket}")
-
-    return jsonify({"count": len(inserted), "price": price, "commands": inserted})
-
-
 # ── Test Trades API ───────────────────────────────────────────────────────────
 
 @app.route("/api/test-trades", methods=["POST"])
@@ -582,8 +352,8 @@ def api_test_trades():
             con.execute(
                 "INSERT INTO commands"
                 " (symbol, line_price, line_type, line_strength,"
-                "  direction, entry_type, entry_price, tp_price, sl_price, bracket_size, source)"
-                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'test')",
+                "  direction, entry_type, entry_price, tp_price, sl_price, bracket_size)"
+                " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (symbol, rt(price), line_type, 1,
                  direction, entry_type, entry_price, tp_price, sl_price, bracket)
             )
@@ -639,27 +409,6 @@ def api_ib_gateway_log():
         return jsonify({"lines": lines, "file": str(latest), "error": None})
     except Exception as e:
         return jsonify({"lines": [], "file": str(latest), "error": str(e)})
-
-
-# ── Replenish toggle API ──────────────────────────────────────────────────────
-
-@app.route("/api/replenish", methods=["GET"])
-def api_replenish_get():
-    with get_db(_get_db_path()) as con:
-        from lib.db import get_system_state
-        val = get_system_state(con, "REPLENISH_ENABLED")
-    return jsonify({"enabled": val == "1"})
-
-
-@app.route("/api/replenish", methods=["POST"])
-def api_replenish_set():
-    body    = request.get_json(force=True) or {}
-    enabled = bool(body.get("enabled", False))
-    with get_db(_get_db_path()) as con:
-        from lib.db import set_system_state
-        set_system_state(con, "REPLENISH_ENABLED", "1" if enabled else "0")
-    log.info(f"[replenish] {'ENABLED' if enabled else 'DISABLED'} via API")
-    return jsonify({"enabled": enabled})
 
 
 # ── System State API ──────────────────────────────────────────────────────────
@@ -851,102 +600,6 @@ def api_reset():
     return jsonify(result)
 
 
-# ── Report API ────────────────────────────────────────────────────────────────
-
-@app.route("/api/report")
-def api_report():
-    """
-    GET /api/report?source=X&symbol=Y&limit=N
-    Reads from completed_trades — guaranteed no duplicates, no missing data.
-      trades       — list of completed trades (newest first)
-      by_source    — per-source stats
-      by_exit      — per-exit-reason stats
-      summary      — overall totals
-      equity_curve — [{time, pnl, cumulative}] sorted by exit_time
-    """
-    source  = request.args.get("source")
-    symbol  = request.args.get("symbol")
-    limit   = int(request.args.get("limit", 5000))
-
-    query  = "SELECT * FROM completed_trades WHERE 1=1"
-    params = []
-    if source:
-        query += " AND source=?"
-        params.append(source)
-    if symbol:
-        query += " AND symbol=?"
-        params.append(symbol)
-    query += " ORDER BY exit_time ASC LIMIT ?"
-    params.append(limit)
-
-    with get_db(_get_db_path()) as con:
-        rows = _rows_to_list(con.execute(query, params).fetchall())
-
-    trades_with_pnl = rows  # completed_trades always has pnl_points (NOT NULL)
-
-    # ── by_source ──
-    src_map: dict = {}
-    for r in rows:
-        src = r["source"] or "unknown"
-        if src not in src_map:
-            src_map[src] = {"source": src, "count": 0, "wins": 0, "losses": 0, "total_pnl": 0.0}
-        src_map[src]["count"] += 1
-        pnl = r.get("pnl_points")
-        if pnl is not None:
-            src_map[src]["total_pnl"] += pnl
-            if pnl > 0:
-                src_map[src]["wins"] += 1
-            else:
-                src_map[src]["losses"] += 1
-    for s in src_map.values():
-        n = s["wins"] + s["losses"]
-        s["win_rate"]  = round(100.0 * s["wins"] / n, 1) if n else None
-        s["avg_pnl"]   = round(s["total_pnl"] / n, 4)    if n else None
-        s["total_pnl"] = round(s["total_pnl"], 4)
-    by_source = sorted(src_map.values(), key=lambda x: x["total_pnl"], reverse=True)
-
-    # ── by_exit ──
-    exit_map: dict = {}
-    for r in rows:
-        reason = r["exit_reason"] or "unknown"
-        exit_map[reason] = exit_map.get(reason, 0) + 1
-    by_exit = [{"reason": k, "count": v} for k, v in sorted(exit_map.items())]
-
-    # ── summary ──
-    pnl_vals = [r["pnl_points"] for r in trades_with_pnl]
-    total_pnl = sum(pnl_vals) if pnl_vals else 0.0
-    wins = sum(1 for p in pnl_vals if p > 0)
-    summary = {
-        "total_trades": len(rows),
-        "trades_with_pnl": len(pnl_vals),
-        "total_pnl":    round(total_pnl, 4),
-        "win_rate":     round(100.0 * wins / len(pnl_vals), 1) if pnl_vals else None,
-        "avg_pnl":      round(total_pnl / len(pnl_vals), 4)    if pnl_vals else None,
-        "best_trade":   round(max(pnl_vals), 4)                 if pnl_vals else None,
-        "worst_trade":  round(min(pnl_vals), 4)                 if pnl_vals else None,
-    }
-
-    # ── equity_curve ──
-    equity_curve = []
-    cumulative = 0.0
-    for r in trades_with_pnl:
-        cumulative += r["pnl_points"]
-        equity_curve.append({
-            "time":       r["exit_time"],
-            "pnl":        round(r["pnl_points"], 4),
-            "cumulative": round(cumulative, 4),
-            "source":     r["source"] or "unknown",
-        })
-
-    return jsonify({
-        "trades":       list(reversed(rows)),   # newest first for table display
-        "by_source":    by_source,
-        "by_exit":      by_exit,
-        "summary":      summary,
-        "equity_curve": equity_curve,
-    })
-
-
 # ── HTML routes ───────────────────────────────────────────────────────────────
 
 @app.route("/")
@@ -990,16 +643,6 @@ def preflight_page():
 @app.route("/release-notes")
 def release_notes_page():
     return render_template("release_notes.html", active="release_notes")
-
-
-@app.route("/db")
-def db_view_page():
-    return render_template("db_view.html", active="db_view")
-
-
-@app.route("/report")
-def report_page():
-    return render_template("report.html", active="report")
 
 
 @app.route("/lines")
@@ -1148,11 +791,9 @@ if __name__ == "__main__":
     init_db(Path(cfg.paths.db))
 
     if not args.no_price_feed:
-        import atexit
-        from visualizer.price_feed import start as start_price_feed, stop as stop_price_feed
+        from visualizer.price_feed import start as start_price_feed
         symbol = cfg.symbols[0] if cfg.symbols else "MES"
         start_price_feed(cfg, symbol=symbol, interval=5)
-        atexit.register(stop_price_feed)
         log.info(f"Price feed started for {symbol}")
 
     log.info(f"Visualizer starting on {cfg.visualizer.host}:{cfg.visualizer.port}")

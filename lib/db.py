@@ -3,7 +3,8 @@ lib/db.py
 SQLite database setup and helpers for Galao.
 Initializes schema, enables WAL mode, and provides CRUD helpers.
 
-Tables: commands, positions, ib_events, system_state, critical_lines, release_notes
+Tables: commands, positions, ib_events, system_state, critical_lines, release_notes,
+        fetch_log, completed_trades
 
 Usage:
     from lib.db import get_db, init_db
@@ -146,6 +147,17 @@ CREATE TABLE IF NOT EXISTS release_notes (
     created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
+CREATE TABLE IF NOT EXISTS fetch_log (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol       TEXT    NOT NULL,
+    date         TEXT    NOT NULL,       -- YYYY-MM-DD
+    file_type    TEXT    NOT NULL,       -- trades | bidask
+    status       TEXT    NOT NULL,       -- ok | skipped | error
+    rows_fetched INTEGER,
+    error_msg    TEXT,
+    fetched_at   TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
 CREATE TABLE IF NOT EXISTS completed_trades (
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     command_id   INTEGER NOT NULL UNIQUE REFERENCES commands(id),
@@ -159,7 +171,7 @@ CREATE TABLE IF NOT EXISTS completed_trades (
     fill_time    TEXT    NOT NULL,
     exit_price   REAL    NOT NULL,
     exit_time    TEXT    NOT NULL,
-    exit_reason  TEXT    NOT NULL,       -- TP | SL | STAGNATION | SHUTDOWN | MANUAL
+    exit_reason  TEXT    NOT NULL,       -- TP | SL | SHUTDOWN | MANUAL
     pnl_points   REAL    NOT NULL,
     recorded_at  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
@@ -168,6 +180,7 @@ CREATE INDEX IF NOT EXISTS idx_commands_status      ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_commands_symbol      ON commands(symbol);
 CREATE INDEX IF NOT EXISTS idx_positions_status     ON positions(status);
 CREATE INDEX IF NOT EXISTS idx_critical_lines_sd    ON critical_lines(symbol, date);
+CREATE INDEX IF NOT EXISTS idx_fetch_log_sd         ON fetch_log(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_completed_source     ON completed_trades(source);
 CREATE INDEX IF NOT EXISTS idx_completed_exit_time  ON completed_trades(exit_time);
 """
@@ -422,6 +435,34 @@ def get_filled_commands(con, symbol: str = None) -> list:
     ).fetchall()
 
 
+def insert_fetch_log(con, symbol: str, date: str, file_type: str,
+                     status: str, rows_fetched: int = None, error_msg: str = None):
+    con.execute(
+        "INSERT INTO fetch_log(symbol, date, file_type, status, rows_fetched, error_msg)"
+        " VALUES(?,?,?,?,?,?)",
+        (symbol, date, file_type, status, rows_fetched, error_msg)
+    )
+
+
+def get_fetch_log(con, days: int = 30) -> list:
+    """Return fetch_log rows for the last N calendar days, newest first."""
+    return con.execute(
+        "SELECT * FROM fetch_log"
+        " WHERE date >= date('now', ?)"
+        " ORDER BY fetched_at DESC",
+        (f"-{days} days",)
+    ).fetchall()
+
+
+def get_fetch_log_latest(con, symbol: str, date: str) -> list:
+    """Return all fetch_log rows for a specific symbol + date."""
+    return con.execute(
+        "SELECT * FROM fetch_log WHERE symbol=? AND date=? ORDER BY fetched_at DESC",
+        (symbol, date)
+    ).fetchall()
+
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 def self_test() -> bool:
@@ -437,7 +478,7 @@ def self_test() -> bool:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()}
             expected = {"commands", "positions", "ib_events", "system_state",
-                        "critical_lines", "release_notes"}
+                        "critical_lines", "release_notes", "fetch_log", "completed_trades"}
             assert expected <= tables, f"Missing tables: {expected - tables}"
 
             # 2. WAL mode is active
@@ -484,7 +525,36 @@ def self_test() -> bool:
                 pending = get_pending_commands(con)
             assert len(pending) == 0, f"Expected 0 pending, got {len(pending)}"
 
-            # 7. Rollback on error — no partial writes
+            # 7. fetch_log round-trip
+            with get_db(db_path) as con:
+                insert_fetch_log(con, "MES", "2026-04-07", "trades", "ok", 45000)
+                insert_fetch_log(con, "MNQ", "2026-04-07", "trades", "error",
+                                 error_msg="IB timeout")
+            with get_db(db_path) as con:
+                rows = get_fetch_log(con, days=365)
+            assert len(rows) == 2, f"Expected 2 fetch_log rows, got {len(rows)}"
+            assert rows[0]["symbol"] in ("MES", "MNQ")
+
+            # 8. completed_trades round-trip via record_completed_trade
+            with get_db(db_path) as con:
+                update_command_status(
+                    con, cmd_id, "CLOSED",
+                    fill_price=6500.25, fill_time="2026-04-07T10:00:05Z",
+                    exit_price=6502.25, exit_time="2026-04-07T10:05:00Z",
+                    exit_reason="TP", pnl_points=2.0,
+                )
+                inserted = record_completed_trade(con, cmd_id)
+            assert inserted, "record_completed_trade should return True on first insert"
+            with get_db(db_path) as con:
+                ct = con.execute(
+                    "SELECT * FROM completed_trades WHERE command_id=?", (cmd_id,)
+                ).fetchone()
+            assert ct is not None and ct["exit_reason"] == "TP"
+            with get_db(db_path) as con:
+                again = record_completed_trade(con, cmd_id)
+            assert not again, "record_completed_trade must be idempotent"
+
+            # 9. Rollback on error — no partial writes
             try:
                 with get_db(db_path) as con:
                     con.execute("INSERT INTO system_state(key,value) VALUES('ROLLBACK_TEST','yes')")
