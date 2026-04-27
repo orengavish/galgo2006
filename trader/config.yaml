@@ -14,16 +14,17 @@ ib:
   fetcher_client_ids: [801, 802, 803]
 
 symbols:
-  - MES
-  - MNQ
-  - MYM
-  - M2K
+  - MES              # trading symbols only — used by decider, broker, position_manager
 
 fetcher:
   auto_fetch_enabled: true
   fetch_bid_ask: true
   fetch_on_startup: true        # fetch prev day if missing when runner starts
-  symbols_override: []          # empty = use top-level symbols list
+  symbols_override:             # data symbols — independent of trading symbols
+    - MES
+    - MNQ
+    - MYM
+    - M2K
   trigger_time_ct: "17:30"      # HH:MM CT — trigger after market close
 
 session:
