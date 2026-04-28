@@ -229,18 +229,20 @@ def backfill_history(db_path: Path, output_dir: Path):
     log.info(f"Found {len(csv_files)} files")
 
     for path in csv_files:
-        stem = path.stem
-        parts = stem.rsplit("_", 1)
+        # Filename format: {SYMBOL}_{trades|bidask}_{YYYYMMDD}.csv
+        stem = path.stem                              # e.g. "MES_trades_20260427"
+        parts = stem.rsplit("_", 1)                   # ["MES_trades", "20260427"]
         if len(parts) != 2:
             continue
-        sym_type, date_compact = parts[0].rsplit("_", 1)
-        symbol = sym_type
+        prefix, date_compact = parts[0], parts[1]    # "MES_trades", "20260427"
+
+        file_type = None
         for ft in ("trades", "bidask"):
-            if sym_type.endswith(f"_{ft}"):
-                symbol = sym_type[: -len(f"_{ft}")]
+            if prefix.endswith(f"_{ft}"):
+                symbol = prefix[: -len(f"_{ft}")]
                 file_type = ft
                 break
-        else:
+        if file_type is None:
             continue
 
         if len(date_compact) != 8:
