@@ -118,7 +118,7 @@ def _fetch_symbol_day(symbol: str, target_date: date,
 
 def _run_fetch_cycle(target_date: date, cfg, db_path: Path,
                      output_dir: Path, progress_db_path: Path):
-    """Fetch all symbols for a single date."""
+    """Fetch all symbols for a single date, then validate."""
     if not _is_trading_day(target_date):
         log.info(f"Skipping {target_date} — not a trading day")
         return
@@ -132,6 +132,17 @@ def _run_fetch_cycle(target_date: date, cfg, db_path: Path,
             break
         _fetch_symbol_day(symbol, target_date, fetch_bid_ask,
                           output_dir, progress_db_path, db_path)
+
+    # Post-fetch validation
+    try:
+        from validate_fetch import validate_and_update
+        date_str = target_date.strftime("%Y-%m-%d")
+        file_types = ["trades"] + (["bidask"] if fetch_bid_ask else [])
+        for symbol in symbols:
+            for ft in file_types:
+                validate_and_update(symbol, date_str, ft, output_dir, db_path)
+    except Exception as e:
+        log.warning(f"Post-fetch validation failed: {e}")
 
 
 def _startup_backfill(cfg, db_path: Path, output_dir: Path, progress_db_path: Path):
