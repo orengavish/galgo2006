@@ -1091,6 +1091,115 @@ def fetch_status_page():
     return render_template("fetch_status.html", active="fetch_status")
 
 
+# ── Traceback ─────────────────────────────────────────────────────────────────
+
+@app.route("/api/traceback-stats")
+def api_traceback_stats():
+    """
+    Returns verification pipeline stats:
+      - closed_commands: all CLOSED commands
+      - recorded: rows in completed_trades
+      - verified: rows passing verified_trades view filters
+      - drop_reasons: breakdown of why trades were not verified
+      - daily: per-day {date, closed, recorded, verified, rate}
+      - recent_verified: last 50 verified trades (from verified_trades view)
+    """
+    with get_db(_get_db_path()) as con:
+        closed = con.execute(
+            "SELECT COUNT(*) FROM commands WHERE status='CLOSED'"
+        ).fetchone()[0]
+
+        recorded = con.execute(
+            "SELECT COUNT(*) FROM completed_trades"
+        ).fetchone()[0]
+
+        verified = con.execute(
+            "SELECT COUNT(*) FROM verified_trades"
+        ).fetchone()[0]
+
+        # ── Drop reason breakdown ──────────────────────────────────────────
+        # Tier 1: CLOSED but not recorded (incomplete data from broker)
+        incomplete = con.execute("""
+            SELECT COUNT(*) FROM commands
+            WHERE status='CLOSED'
+            AND id NOT IN (SELECT command_id FROM completed_trades)
+        """).fetchone()[0]
+
+        # Tier 2: recorded but filtered by view
+        shutdown_exits = con.execute(
+            "SELECT COUNT(*) FROM completed_trades WHERE exit_reason='SHUTDOWN'"
+        ).fetchone()[0]
+
+        instant_exits = con.execute(
+            "SELECT COUNT(*) FROM completed_trades WHERE fill_time=exit_time"
+        ).fetchone()[0]
+
+        null_source = con.execute(
+            "SELECT COUNT(*) FROM completed_trades WHERE source IS NULL"
+        ).fetchone()[0]
+
+        test_source = con.execute(
+            "SELECT COUNT(*) FROM completed_trades WHERE source='test'"
+        ).fetchone()[0]
+
+        drop_reasons = [
+            {"reason": "INCOMPLETE_DATA",  "count": incomplete,
+             "note": "CLOSED command missing fill/exit/pnl"},
+            {"reason": "SHUTDOWN_EXIT",    "count": shutdown_exits,
+             "note": "Position closed by session shutdown"},
+            {"reason": "INSTANT_EXIT",     "count": instant_exits,
+             "note": "fill_time = exit_time (reconnect artifact)"},
+            {"reason": "NULL_SOURCE",      "count": null_source,
+             "note": "No source tag on command"},
+            {"reason": "TEST_SOURCE",      "count": test_source,
+             "note": "Test command excluded by design"},
+        ]
+
+        # ── Per-day breakdown ──────────────────────────────────────────────
+        daily_rows = _rows_to_list(con.execute("""
+            SELECT
+                date(exit_time) as day,
+                COUNT(*) as recorded,
+                SUM(CASE WHEN exit_reason != 'SHUTDOWN'
+                         AND fill_time != exit_time
+                         AND source IS NOT NULL
+                         AND source != 'test'
+                    THEN 1 ELSE 0 END) as verified
+            FROM completed_trades
+            GROUP BY day
+            ORDER BY day DESC
+            LIMIT 30
+        """).fetchall())
+
+        # ── Recent verified trades ─────────────────────────────────────────
+        recent = _rows_to_list(con.execute("""
+            SELECT command_id, symbol, direction, entry_type,
+                   fill_price, fill_time, exit_price, exit_time,
+                   exit_reason, pnl_points, bracket_size, source,
+                   chain_depth
+            FROM verified_trades
+            ORDER BY fill_time DESC
+            LIMIT 50
+        """).fetchall())
+
+    rate = round(100.0 * verified / closed, 1) if closed else None
+
+    return jsonify({
+        "closed":       closed,
+        "recorded":     recorded,
+        "verified":     verified,
+        "rate":         rate,
+        "drop_reasons": drop_reasons,
+        "daily":        daily_rows,
+        "recent":       recent,
+    })
+
+
+@app.route("/traceback")
+def traceback_page():
+    return render_template("traceback.html", active="traceback")
+
+
 # ── Self-test ─────────────────────────────────────────────────────────────────
 
 def self_test() -> bool:
