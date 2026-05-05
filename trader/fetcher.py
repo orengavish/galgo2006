@@ -56,6 +56,7 @@ UTC = ZoneInfo("UTC")
 _TICK_TIMEOUT  = 45   # seconds per reqHistoricalTicks call
 _TICKS_PER_REQ = 1000
 _PROGRESS_LOG_INTERVAL = 15  # seconds between telemetry lines
+_N_WORKERS     = 8    # parallel async windows for paginate_ticks
 
 _EXCHANGE_MAP = {"MES": "CME", "MNQ": "CME", "M2K": "CME", "MYM": "CBOT"}
 
@@ -179,127 +180,176 @@ def _mark_finished(conn, symbol, date_str, dtype, count):
 
 # ── Pagination core ───────────────────────────────────────────────────────────
 
+async def _progress_reporter(progress: list, what: str, interval: float = 15.0):
+    """Print a summary line every `interval` seconds while windows are running."""
+    loop = asyncio.get_event_loop()
+    t0   = loop.time()
+    while True:
+        await asyncio.sleep(interval)
+        collected = sum(progress)
+        elapsed   = loop.time() - t0
+        speed     = collected / max(elapsed, 0.001)
+        per_win   = "  ".join(f"W{i}:{progress[i]:>6,}" for i in range(len(progress)))
+        print(f"    [{what}] {elapsed:5.0f}s  {collected:>8,} ticks  "
+              f"{speed:5.0f} t/s  |  {per_win}", flush=True)
+
+
+async def _paginate_window_async(ib: IB, contract,
+                                  win_start: datetime, win_end: datetime,
+                                  what: str, win_idx: int,
+                                  progress: list) -> list:
+    """
+    Fetch all ticks in [win_start, win_end) for one parallel window.
+    Returns list of raw tuples:
+      TRADES:  (t_utc, price, size)
+      BID_ASK: (t_utc, bid_p, bid_s, ask_p, ask_s)
+    Storing primitives instead of tick objects keeps memory ~4× lower.
+    """
+    ticks: list = []
+    cursor = win_start
+    last_processed_ts = None
+    last_batch_fps: set = set()
+
+    while _running and cursor < win_end:
+        # Stop cleanly on disconnect rather than hammering a dead connection
+        if not ib.isConnected():
+            log.warning(f"W{win_idx} {what}: IB not connected — waiting for reconnect")
+            while not ib.isConnected() and _running:
+                await asyncio.sleep(5)
+            if not _running:
+                break
+            log.info(f"W{win_idx} {what}: reconnected — resuming")
+            await asyncio.sleep(2)
+
+        try:
+            batch = await asyncio.wait_for(
+                ib.reqHistoricalTicksAsync(
+                    contract,
+                    startDateTime=cursor,
+                    endDateTime="",
+                    numberOfTicks=_TICKS_PER_REQ,
+                    whatToShow=what,
+                    useRth=False,
+                ),
+                timeout=_TICK_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            await asyncio.sleep(2)
+            continue
+        except Exception as e:
+            log.warning(f"W{win_idx} {what} error: {e} — retrying")
+            await asyncio.sleep(5)
+            continue
+
+        if not batch:
+            break
+
+        new_ticks = 0
+        batch_end_ts = None
+        batch_end_fps: set = set()
+        reached_end = False
+
+        for tick in batch:
+            t_u = tick.time
+            if not isinstance(t_u, datetime):
+                t_u = datetime.fromtimestamp(t_u, tz=timezone.utc)
+            if t_u.tzinfo is None:
+                t_u = t_u.replace(tzinfo=timezone.utc)
+
+            if t_u >= win_end:
+                reached_end = True
+                continue
+
+            ts_ms = int(t_u.timestamp() * 1000)
+            if what == "TRADES":
+                fp  = (ts_ms, tick.price, tick.size)
+                row = (t_u, tick.price, tick.size)
+            else:
+                bp  = getattr(tick, "priceBid", 0.0)
+                bs  = getattr(tick, "sizeBid",  0)
+                ap  = getattr(tick, "priceAsk", 0.0)
+                as_ = getattr(tick, "sizeAsk",  0)
+                fp  = (ts_ms, bp, ap, bs, as_)
+                row = (t_u, bp, bs, ap, as_)
+
+            if t_u >= cursor:
+                if not (t_u == last_processed_ts and fp in last_batch_fps):
+                    ticks.append(row)
+                    new_ticks += 1
+
+            if batch_end_ts is None or t_u > batch_end_ts:
+                batch_end_ts = t_u
+                batch_end_fps = {fp}
+            elif t_u == batch_end_ts:
+                batch_end_fps.add(fp)
+
+        if reached_end or (new_ticks == 0 and len(batch) < _TICKS_PER_REQ):
+            break
+
+        if new_ticks == 0:
+            cursor = max(cursor + timedelta(milliseconds=1),
+                         cursor.replace(microsecond=0) + timedelta(seconds=1))
+        elif batch_end_ts is not None:
+            cursor = max(cursor, batch_end_ts)
+
+        last_processed_ts = batch_end_ts
+        last_batch_fps    = batch_end_fps
+        progress[win_idx] = len(ticks)   # reporter reads this every 15 s
+
+        # Brief yield — lets GC run and avoids IB pacing violations
+        await asyncio.sleep(0.05)
+
+    ct_str = cursor.astimezone(CT).strftime("%H:%M CT")
+    print(f"    W{win_idx} done: {len(ticks):,} ticks  last={ct_str}", flush=True)
+    return ticks
+
+
 def paginate_ticks(ib: IB, contract, start_utc: datetime, end_utc: datetime,
                    what: str, write_row, conn, symbol, date_str) -> int:
     """
-    Paginate reqHistoricalTicks from start_utc to end_utc.
-    Calls write_row(tick) for each unique tick within the window.
+    Fetch all ticks for [start_utc, end_utc) using _N_WORKERS parallel async windows.
+    Each window paginates its sub-range independently via asyncio.gather.
+    All ticks are collected into lists, merged and sorted in memory, then written once.
     Returns total tick count.
     """
-    total = 0
-    cursor = start_utc
-    batch_count   = 0
-    last_log      = time.time()
-    session_start = time.time()
-    last_processed_ts = None
-    last_batch_fps: set = set()
-    reached_end = False
-    total_secs = max((end_utc - start_utc).total_seconds(), 1)
+    duration = (end_utc - start_utc) / _N_WORKERS
+    windows  = [(start_utc + i * duration, start_utc + (i + 1) * duration, i)
+                for i in range(_N_WORKERS)]
 
-    async def _fetch():
-        return await asyncio.wait_for(
-            ib.reqHistoricalTicksAsync(
-                contract,
-                startDateTime=cursor,
-                endDateTime="",
-                numberOfTicks=_TICKS_PER_REQ,
-                whatToShow=what,
-                useRth=False,
-            ),
-            timeout=_TICK_TIMEOUT,
-        )
+    t0 = time.time()
+    print(f"\n    [{what}] {_N_WORKERS} parallel windows × "
+          f"{duration.total_seconds() / 3600:.1f}h each", flush=True)
 
-    while _running and cursor < end_utc and not reached_end:
-        if not ib.isConnected():
-            log.warning("IB disconnected during pagination — stopping")
-            break
-
+    async def _run_all():
+        progress = [0] * _N_WORKERS
+        reporter = asyncio.create_task(_progress_reporter(progress, what))
         try:
-            loop = asyncio.get_event_loop()
-            batch_count += 1
-            batch = loop.run_until_complete(_fetch())
+            tasks = [_paginate_window_async(ib, contract, ws, we, what, wi, progress)
+                     for ws, we, wi in windows]
+            return await asyncio.gather(*tasks)
+        finally:
+            reporter.cancel()
 
-            if not batch:
-                break
+    loop = asyncio.get_event_loop()
+    results = loop.run_until_complete(_run_all())
 
-            new_ticks = 0
-            batch_end_ts = None
-            batch_end_fps: set = set()
+    # Merge: windows are non-overlapping → extend then sort to guarantee order
+    all_ticks: list = []
+    for window_ticks in results:
+        all_ticks.extend(window_ticks)
+    all_ticks.sort(key=lambda x: x[0])
 
-            for tick in batch:
-                t_u = tick.time
-                if not isinstance(t_u, datetime):
-                    t_u = datetime.fromtimestamp(t_u, tz=timezone.utc)
-                if t_u.tzinfo is None:
-                    t_u = t_u.replace(tzinfo=timezone.utc)
+    total = len(all_ticks)
+    elapsed_fetch = time.time() - t0
+    speed = total / max(elapsed_fetch, 0.001)
+    print(f"\n    {what} collected: {total:,} ticks in {elapsed_fetch:.1f}s"
+          f"  ({speed:.0f} t/s) — writing to disk...", flush=True)
+    log.info(f"{symbol} {what} | {date_str} | {total:,} ticks in {elapsed_fetch:.1f}s")
 
-                if t_u >= end_utc:
-                    reached_end = True
-                    continue
+    for row in all_ticks:
+        write_row(*row)
 
-                ts_ms = int(t_u.timestamp() * 1000)
-                fp = (ts_ms, tick.price, tick.size) if what == "TRADES" \
-                     else (ts_ms, getattr(tick, "priceBid", 0),
-                           getattr(tick, "priceAsk", 0),
-                           getattr(tick, "sizeBid", 0),
-                           getattr(tick, "sizeAsk", 0))
-
-                if t_u >= cursor:
-                    if t_u == last_processed_ts and fp in last_batch_fps:
-                        continue  # duplicate at boundary
-                    write_row(tick, t_u)
-                    total += 1
-                    new_ticks += 1
-
-                if batch_end_ts is None or t_u > batch_end_ts:
-                    batch_end_ts = t_u
-                    batch_end_fps = {fp}
-                elif t_u == batch_end_ts:
-                    batch_end_fps.add(fp)
-
-            # Advance cursor
-            if new_ticks == 0:
-                if len(batch) < _TICKS_PER_REQ:
-                    reached_end = True
-                else:
-                    cursor = max(cursor + timedelta(milliseconds=1),
-                                 cursor.replace(microsecond=0) + timedelta(seconds=1))
-            elif batch_end_ts is not None:
-                cursor = max(cursor, batch_end_ts)
-
-            last_processed_ts = batch_end_ts
-            last_batch_fps    = batch_end_fps
-
-            # Per-batch console output
-            pct     = min(100.0, (cursor - start_utc).total_seconds() / total_secs * 100)
-            ct_str  = cursor.astimezone(CT).strftime("%H:%M CT")
-            now     = time.time()
-            elapsed = max(now - session_start, 0.001)
-            if batch_count % 5 == 0:
-                speed = total / elapsed
-                print(f"    Batch {batch_count:3d} [{pct:5.1f}%]  {total:>8,} ticks"
-                      f"  {speed:5.0f}/s  cursor={ct_str}", flush=True)
-            else:
-                print(f"    Batch {batch_count:3d}  +{new_ticks:<5}  cursor={ct_str}",
-                      flush=True)
-
-            # Log + progress-DB update every 15 s
-            if now - last_log > _PROGRESS_LOG_INTERVAL:
-                log.info(f"{symbol} {what} | {date_str} | cursor={ct_str} "
-                         f"total={total:,} speed={total/elapsed:.0f} t/s")
-                _update_progress(conn, symbol, date_str, what, total)
-                last_log = now
-
-            if cursor == start_utc:           # paranoid: force advance if stuck
-                cursor += timedelta(milliseconds=1)
-
-        except asyncio.TimeoutError:
-            log.warning(f"{symbol} {what} tick request timed out — retrying")
-            time.sleep(2)
-        except Exception as e:
-            log.error(f"{symbol} {what} pagination error: {e}")
-            time.sleep(5)
-
+    _update_progress(conn, symbol, date_str, what, total)
     return total
 
 
@@ -353,7 +403,7 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
         _mark_started(progress_conn, symbol, date_str, dtype)
         start_ct = start_utc.astimezone(CT).strftime("%H:%M CT")
         end_ct   = end_utc.astimezone(CT).strftime("%H:%M CT")
-        print(f"\n  [{dtype}] {symbol} {date_str}  ({start_ct} → {end_ct})",
+        print(f"\n  [{dtype}] {symbol} {date_str}  ({start_ct} -> {end_ct})",
               flush=True)
         log.info(f"[START] {symbol} {dtype} {date_str}")
 
@@ -366,15 +416,16 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
             w = csv.writer(fh)
             w.writerow(headers)
 
-            def write_row(tick, t_u):
-                t_c = t_u.astimezone(CT)
-                if dtype == "TRADES":
+            if dtype == "TRADES":
+                def write_row(t_u, price, size):
+                    t_c = t_u.astimezone(CT)
                     w.writerow([t_c.isoformat(), t_u.isoformat(),
-                                tick.price, tick.size, contract.localSymbol])
-                else:
+                                price, size, contract.localSymbol])
+            else:
+                def write_row(t_u, bid_p, bid_s, ask_p, ask_s):
+                    t_c = t_u.astimezone(CT)
                     w.writerow([t_c.isoformat(), t_u.isoformat(),
-                                tick.priceBid, tick.sizeBid,
-                                tick.priceAsk, tick.sizeAsk,
+                                bid_p, bid_s, ask_p, ask_s,
                                 contract.localSymbol])
 
             count = paginate_ticks(ib, contract, start_utc, end_utc,
@@ -382,7 +433,7 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
 
         if _running:
             _mark_finished(progress_conn, symbol, date_str, dtype, count)
-            print(f"  [DONE] {symbol} {dtype} {date_str}: {count:,} ticks → {file_path.name}",
+            print(f"  [DONE] {symbol} {dtype} {date_str}: {count:,} ticks -> {file_path.name}",
                   flush=True)
             log.info(f"[DONE] {symbol} {dtype} {date_str}: {count:,} ticks -> {file_path.name}")
         results[dtype] = count
@@ -553,10 +604,10 @@ def self_test() -> bool:
                 with open(sample_path, "w", newline="", encoding="utf-8") as fh:
                     w = csv.writer(fh)
                     w.writerow(["time_ct", "time_utc", "price", "size", "symbol"])
-                    def _wr(tick, t_u):
+                    def _wr(t_u, price, size):
                         t_c = t_u.astimezone(CT)
                         w.writerow([t_c.isoformat(), t_u.isoformat(),
-                                    tick.price, tick.size, contract.localSymbol])
+                                    price, size, contract.localSymbol])
                     count = paginate_ticks(ib, contract, start_u2, end_u2,
                                           "TRADES", _wr, conn2, "MES", "2026-04-07")
 
@@ -635,7 +686,7 @@ if __name__ == "__main__":
     progress_conn = _init_progress_db(prog_db)
 
     types_label = "TRADES + BID_ASK" if args.bid_ask else "TRADES"
-    print(f"\nFetching {types_label} for {len(days)} day(s) → {output_dir}")
+    print(f"\nFetching {types_label} for {len(days)} day(s) -> {output_dir}")
 
     try:
         for i, day in enumerate(days, 1):

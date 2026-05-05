@@ -711,20 +711,26 @@ def _parse_lines_text(text: str) -> list[dict]:
 
     def _parse_section(raw: str, line_type: str):
         items = []
+        raw = re.sub(r'\s*\([^)]*\)\s*', ' ', raw)  # strip (parenthetical comments)
         for token in raw.split(","):
-            for sub in token.split(" - "):
+            for sub in re.split(r'\s+-\s+', token):  # split on " - " zone separator
                 sub = sub.strip()
                 if not sub:
                     continue
-                if sub.endswith("!"):
-                    strength, price_str = 3, sub[:-1].strip()
-                elif sub.endswith("?"):
-                    strength, price_str = 2, sub[:-1].strip()
+                m = re.match(r'(\d+(?:\.\d+)?)(.*)', sub)
+                if not m:
+                    continue
+                price_str, suffix = m.group(1), m.group(2)
+                # * and ! both mean strong; ? means medium; bare = weak
+                if '!' in suffix or '*' in suffix:
+                    strength = 3
+                elif '?' in suffix:
+                    strength = 2
                 else:
-                    strength, price_str = 1, sub.strip()
+                    strength = 1
                 try:
-                    price = float(price_str)
-                    items.append({"line_type": line_type, "price": price, "strength": strength})
+                    items.append({"line_type": line_type,
+                                  "price": float(price_str), "strength": strength})
                 except ValueError:
                     pass
         return items
@@ -787,6 +793,96 @@ def api_lines():
 
     log.info(f"Lines input: saved {len(lines)} lines for {symbol} {date_str}")
     return jsonify({"count": len(lines), "lines": lines})
+
+
+# ── Cancel-all / Flatten API ──────────────────────────────────────────────────
+
+@app.route("/api/cancel-all", methods=["POST"])
+def api_cancel_all():
+    """
+    POST /api/cancel-all
+    Cancels all pending IB orders (reqGlobalCancel) and flattens all filled
+    positions by placing reverse MKT orders via PAPER.
+    Updates DB: PENDING/SUBMITTING/SUBMITTED → CANCELLED; FILLED → CLOSED.
+    Does NOT delete any records.
+    Returns {ib_cancel, ib_flatten, db_cancelled, db_flattened, errors}.
+    """
+    from lib.ib_client import IBClient
+    from ib_insync import MarketOrder
+    now    = datetime.now(timezone.utc).isoformat()
+    result = {"ib_cancel": "skipped", "ib_flatten": 0,
+              "db_cancelled": 0, "db_flattened": 0, "errors": []}
+    ibc = None
+    try:
+        cfg = _get_cfg()
+        ibc = IBClient(cfg)
+        ibc.connect(live=True, paper=True)
+
+        # Cancel all open IB orders on both connections
+        for label, ib_conn in [("LIVE", ibc.live), ("PAPER", ibc.paper)]:
+            if ib_conn and ib_conn.isConnected():
+                try:
+                    ib_conn.reqGlobalCancel()
+                    log.info(f"[cancel-all] reqGlobalCancel → {label}")
+                except Exception as e:
+                    result["errors"].append(f"reqGlobalCancel {label}: {e}")
+        result["ib_cancel"] = "ok"
+
+        # Flatten open positions via PAPER
+        if ibc.paper and ibc.paper.isConnected():
+            try:
+                ibc.paper.reqPositions()
+                ibc.paper.sleep(1.5)
+                for pos in ibc.paper.positions():
+                    qty = pos.position
+                    if qty == 0:
+                        continue
+                    action = "SELL" if qty > 0 else "BUY"
+                    try:
+                        ibc.place_order(pos.contract,
+                                        MarketOrder(action, abs(qty)))
+                        result["ib_flatten"] += 1
+                        log.info(f"[cancel-all] flatten {pos.contract.symbol}"
+                                 f" {qty:+} → {action} MKT")
+                    except Exception as e:
+                        result["errors"].append(
+                            f"close {pos.contract.symbol}: {e}")
+            except Exception as e:
+                result["errors"].append(f"positions: {e}")
+
+    except Exception as e:
+        result["errors"].append(f"IB connect: {e}")
+        result["ib_cancel"] = "failed"
+        log.warning(f"[cancel-all] IB error: {e}")
+    finally:
+        if ibc:
+            try:
+                ibc.disconnect()
+            except Exception:
+                pass
+
+    # DB: update statuses — no records deleted
+    try:
+        with get_db(_get_db_path()) as con:
+            r1 = con.execute(
+                "UPDATE commands SET status='CANCELLED', updated_at=?"
+                " WHERE status IN ('PENDING','SUBMITTING','SUBMITTED')",
+                (now,)
+            )
+            result["db_cancelled"] = r1.rowcount
+            r2 = con.execute(
+                "UPDATE commands SET status='CLOSED',"
+                " exit_reason='manual_flatten', exit_time=?, updated_at=?"
+                " WHERE status='FILLED'",
+                (now, now)
+            )
+            result["db_flattened"] = r2.rowcount
+    except Exception as e:
+        result["errors"].append(f"DB: {e}")
+        log.error(f"[cancel-all] DB update failed: {e}")
+
+    log.info(f"[cancel-all] {result}")
+    return jsonify(result)
 
 
 # ── Reset API ─────────────────────────────────────────────────────────────────

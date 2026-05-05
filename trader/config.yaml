@@ -4,7 +4,7 @@
 ib:
   gateway_log_dir: ""   # optional: IB Gateway log dir, e.g. C:\Jts\username
   live_host: 127.0.0.1
-  live_port: 4001
+  live_port: 4002  # single paper gateway — handles both data and orders
   live_client_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
   paper_host: 127.0.0.1
   paper_port: 4002
@@ -12,6 +12,8 @@ ib:
   reconnect_interval_seconds: 30
   connection_timeout: 5
   fetcher_client_ids: [801, 802, 803]
+  ibc_startgateway_bat: "C:\\IBC\\StartGateway.bat"
+  ibc_mode: paper
 
 symbols:
   - MES              # trading symbols only — used by decider, broker, position_manager

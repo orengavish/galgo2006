@@ -11,6 +11,14 @@
       REPLENISH: OFF
     </button>
 
+    <button id="btn-flatten" onclick="doFlattenAll()"
+      style="font-family:monospace;font-size:12px;font-weight:bold;padding:6px 16px;
+             border-radius:5px;cursor:pointer;border:1px solid #f85149;
+             background:#2d1a1a;color:#f85149;white-space:nowrap">
+      ✕ Flatten All
+    </button>
+    <span id="flatten-status" style="font-size:11px;color:#8b949e"></span>
+
     <div id="rp-stats" style="display:flex;gap:10px;flex-wrap:wrap;align-items:center">
       <span class="rp-pill" id="rp-total"  style="font-size:11px;color:#8b949e">total: —</span>
       <span class="rp-pill" id="rp-pending"  style="font-size:11px;color:#d29922"></span>
@@ -96,8 +104,14 @@
           style="width:100%;background:#0d1117;color:#c9d1d9;border:1px solid #30363d;
                  padding:5px;border-radius:3px;font-family:monospace;font-size:11px;resize:vertical">
         </textarea>
-        <div style="font-size:10px;color:#6e7681;margin-top:3px">
-          Pasted lines are saved to critical_lines DB and get a traceable ID.
+        <div style="display:flex;align-items:center;gap:8px;margin-top:5px">
+          <button onclick="doSaveLines()"
+            style="background:#0d2a4a;color:#58a6ff;border:1px solid #58a6ff;
+                   padding:3px 12px;border-radius:4px;cursor:pointer;
+                   font-family:monospace;font-size:11px">
+            → Save to DB
+          </button>
+          <span id="save-lines-status" style="font-size:11px;color:#8b949e"></span>
         </div>
       </div>
 
@@ -454,6 +468,51 @@ function doGenerate(){
   })
   .catch(e=>{ st.style.color='#f85149'; st.textContent='✗ '+e; })
   .finally(()=>{ btn.disabled=false; btn.textContent='Generate'; });
+}
+
+// ── Save lines to DB ─────────────────────────────────────────────────────────
+function doSaveLines(){
+  const text = (document.getElementById('g-cl-text').value || '').trim();
+  const st   = document.getElementById('save-lines-status');
+  if(!text){ st.style.color='#f85149'; st.textContent='✗ empty'; return; }
+  st.style.color='#8b949e'; st.textContent='saving…';
+  fetch('/api/lines', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({text})
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){ st.style.color='#f85149'; st.textContent='✗ '+d.error; return; }
+    const sup = d.lines.filter(l=>l.line_type==='SUPPORT').length;
+    const res = d.lines.filter(l=>l.line_type==='RESISTANCE').length;
+    st.style.color='#3fb950';
+    st.textContent=`✓ ${d.count} lines (${sup} sup / ${res} res)`;
+    refreshCLLines();
+  })
+  .catch(e=>{ st.style.color='#f85149'; st.textContent='✗ '+e; });
+}
+
+// ── Flatten All ──────────────────────────────────────────────────────────────
+function doFlattenAll(){
+  const btn = document.getElementById('btn-flatten');
+  const st  = document.getElementById('flatten-status');
+  if(!confirm('Cancel all pending orders and close all filled positions?\n\nDB records are preserved (no deletion).'))
+    return;
+  btn.disabled = true;
+  st.style.color = '#8b949e'; st.textContent = 'working…';
+  fetch('/api/cancel-all', {method:'POST', headers:{'Content-Type':'application/json'}, body:'{}'})
+    .then(r=>r.json())
+    .then(d=>{
+      const errs = d.errors && d.errors.length ? `  ⚠ ${d.errors.join(', ')}` : '';
+      st.style.color = errs ? '#d29922' : '#3fb950';
+      st.textContent = `✓ cancelled ${d.db_cancelled}  flattened ${d.db_flattened}`
+                     + (d.ib_flatten ? `  (${d.ib_flatten} IB close orders)` : '')
+                     + errs;
+      refreshCommands(); refreshStats();
+    })
+    .catch(e=>{ st.style.color='#f85149'; st.textContent='✗ '+e; })
+    .finally(()=>{ btn.disabled=false; });
 }
 </script>
 {% endblock %}
