@@ -180,8 +180,10 @@ def _mark_finished(conn, symbol, date_str, dtype, count):
 
 # ── Pagination core ───────────────────────────────────────────────────────────
 
-async def _progress_reporter(progress: list, what: str, interval: float = 15.0):
-    """Print a summary line every `interval` seconds while windows are running."""
+async def _progress_reporter(progress: list, what: str, interval: float = 15.0,
+                              db_conn=None, symbol: str = "", date_str: str = ""):
+    """Print a summary line every `interval` seconds while windows are running.
+    If db_conn is provided, also writes intermediate count to fetch_progress DB."""
     loop = asyncio.get_event_loop()
     t0   = loop.time()
     while True:
@@ -192,6 +194,11 @@ async def _progress_reporter(progress: list, what: str, interval: float = 15.0):
         per_win   = "  ".join(f"W{i}:{progress[i]:>6,}" for i in range(len(progress)))
         print(f"    [{what}] {elapsed:5.0f}s  {collected:>8,} ticks  "
               f"{speed:5.0f} t/s  |  {per_win}", flush=True)
+        if db_conn and symbol and date_str:
+            try:
+                _update_progress(db_conn, symbol, date_str, what, collected)
+            except Exception:
+                pass
 
 
 async def _paginate_window_async(ib: IB, contract,
@@ -322,7 +329,9 @@ def paginate_ticks(ib: IB, contract, start_utc: datetime, end_utc: datetime,
 
     async def _run_all():
         progress = [0] * _N_WORKERS
-        reporter = asyncio.create_task(_progress_reporter(progress, what))
+        reporter = asyncio.create_task(
+            _progress_reporter(progress, what, db_conn=conn, symbol=symbol, date_str=date_str)
+        )
         try:
             tasks = [_paginate_window_async(ib, contract, ws, we, what, wi, progress)
                      for ws, we, wi in windows]

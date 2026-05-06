@@ -13,9 +13,12 @@ Usage:
   python fetcher_status.py
   python fetcher_status.py --days 20
   python fetcher_status.py --no-tail
+  python fetcher_status.py --watch          # refresh every 5s
+  python fetcher_status.py --watch 10       # refresh every 10s
 """
 
 import sys
+import time
 import argparse
 import statistics
 from datetime import date, datetime, timedelta
@@ -120,6 +123,9 @@ def _cell(sym: str, date_s: str, ft: str,
 
     r = done.get(key)
     if r is None:
+        # fetch_log only written after full day completes — fall back to progress_db
+        if p and p["finished"]:
+            return f"{_fmt_k(p['records_fetched'])}/{exp_k} DONE"
         return "MISS"
 
     status = r["status"]
@@ -172,6 +178,30 @@ def _print_pivot(days: list[date], symbols: list[str], file_types: list[str],
     print(sep)
 
 
+def _print_active(prog: dict, all_rows: list[dict], symbols: list[str], file_types: list[str]):
+    """Print a compact ACTIVE NOW block if any fetch is in progress."""
+    active = {k: v for k, v in prog.items() if not v["finished"]}
+    if not active:
+        return
+    print("ACTIVE NOW")
+    print("-" * 50)
+    for (sym, date_s, ft), p in sorted(active.items()):
+        counts = [
+            r["rows_fetched"] for r in all_rows
+            if r["symbol"] == sym and r["file_type"] == ft
+            and r["status"] == "ok" and r["rows_fetched"]
+        ]
+        exp = int(statistics.median(counts)) if len(counts) >= 3 else None
+        fetched = p["records_fetched"]
+        if exp:
+            pct = min(100, int(fetched / exp * 100))
+            bar = "#" * (pct // 5) + "." * (20 - pct // 5)
+            print(f"  {sym} {ft} {date_s}  [{bar}] {pct:3d}%  {_fmt_k(fetched)}/{_fmt_k(exp)}")
+        else:
+            print(f"  {sym} {ft} {date_s}  {_fmt_k(fetched)} ticks (no baseline yet)")
+    print()
+
+
 def run(lookback: int = 10, show_tail: bool = True):
     cfg = get_config()
     try:
@@ -192,6 +222,8 @@ def run(lookback: int = 10, show_tail: bool = True):
     all_rows = _load_fetch_log(db_path)
     done     = {(r["symbol"], r["date"], r["file_type"]): r for r in all_rows}
     prog     = _load_fetch_progress(progress_db_path)
+
+    _print_active(prog, all_rows, symbols, file_types)
 
     main_days = _expected_days(lookback)
     main_set  = {d.isoformat() for d in main_days}
@@ -227,5 +259,21 @@ if __name__ == "__main__":
                         help="Lookback trading days (default 10)")
     parser.add_argument("--no-tail", action="store_true",
                         help="Skip older data tail")
+    parser.add_argument("--watch", nargs="?", const=5, type=int, metavar="SECS",
+                        help="Live-refresh every N seconds (default 5)")
     args = parser.parse_args()
-    run(lookback=args.days, show_tail=not args.no_tail)
+
+    if args.watch:
+        import os
+        interval = args.watch
+        try:
+            while True:
+                os.system("cls" if os.name == "nt" else "clear")
+                now = datetime.now().strftime("%H:%M:%S")
+                print(f"[live — refreshing every {interval}s — {now} — Ctrl+C to stop]\n")
+                run(lookback=args.days, show_tail=not args.no_tail)
+                time.sleep(interval)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+    else:
+        run(lookback=args.days, show_tail=not args.no_tail)

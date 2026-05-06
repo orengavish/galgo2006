@@ -1,6 +1,6 @@
 # Galao System — Running Book
 # Operational command reference, sorted by session order
-Version: 0.3.0 | Date: 2026-04-12
+Version: 0.4.0 | Date: 2026-05-05
 
 ---
 
@@ -37,11 +37,25 @@ mkdir -p logs data/critical_lines data/history
 git pull
 ```
 
-### Step 2 — Enter critical lines (GUI)
+### Step 2 — Start background data fetcher (keep running all month)
 ```bash
-python runner.py --no-preflight   # start visualizer only to enter lines
+python trader/may_scheduler.py --no-paper
+# or with backfill from a date:
+python trader/may_scheduler.py --no-paper --backfill-from 2026-04-14
+# or with paper sessions too (17:00 IL + fetch 17:30 CT):
+python trader/may_scheduler.py
 ```
-Open http://127.0.0.1:5000/lines
+> **Note:** Backfill blocks the scheduler loop until complete — paper sessions
+> will not fire during a long backfill. Run `--no-paper` for pure data collection.
+
+### Step 3 — Start visualizer
+```bash
+python trader/visualizer/app.py
+```
+Open http://127.0.0.1:5001
+
+### Step 4 — Enter critical lines (GUI)
+Open http://127.0.0.1:5001/lines
 
 Paste your lines in this format:
 ```
@@ -50,16 +64,13 @@ Paste your lines in this format:
 ```
 Click **Parse** → verify preview → click **Save to DB**
 
-Strength: no suffix = 1 (strong) · ? = 2 (medium) · ! = 3 (weak)
+Strength: `!` = strong · `?` = medium · no suffix = weak
 
-Then stop runner (Ctrl+C) and proceed to Step 3.
-
-### Step 3 — Run full system
+### Step 5 — Run full trading session
 ```bash
-python runner.py
+cd trader && python runner.py
 ```
-
-Dashboard: http://127.0.0.1:5000
+Starts broker + decider + position_manager. Broker immediately picks up any PENDING commands.
 
 ---
 
@@ -88,23 +99,55 @@ python runner.py --no-preflight
 
 ## 5. GUI Pages
 
+Visualizer runs on **port 5001**.
+
 | URL | Purpose |
 |-----|---------|
-| http://127.0.0.1:5000 | Dashboard — price ladder, active commands, stats |
-| http://127.0.0.1:5000/lines | **Enter critical lines, reset DB+IB** |
-| http://127.0.0.1:5000/active | Active commands (PENDING/SUBMITTED/FILLED) |
-| http://127.0.0.1:5000/positions | Open positions with P&L |
-| http://127.0.0.1:5000/orders | All commands (full history) |
-| http://127.0.0.1:5000/ib-trace | IB events log + IB Gateway raw log |
-| http://127.0.0.1:5000/logs | Component log files |
-| http://127.0.0.1:5000/preflight | Last preflight results |
+| http://127.0.0.1:5001 | Dashboard — price ladder, active commands, stats, **✕ Flatten All** |
+| http://127.0.0.1:5001/lines | **Enter critical lines, reset DB+IB** |
+| http://127.0.0.1:5001/active | Active commands (PENDING/SUBMITTED/FILLED) |
+| http://127.0.0.1:5001/positions | Open positions with P&L |
+| http://127.0.0.1:5001/orders | All commands (full history) |
+| http://127.0.0.1:5001/ib-trace | IB events log + IB Gateway raw log |
+| http://127.0.0.1:5001/logs | Component log files |
+| http://127.0.0.1:5001/preflight | Last preflight results |
+| http://127.0.0.1:5001/fetch-status | Fetch progress browser page |
 
 ---
 
-## 6. Reset — Cancel IB Orders + Wipe DB
+## 6. Fetch Monitoring
+
+```bash
+python trader/fetcher_status.py              # snapshot: pivot table (dates × symbols)
+python trader/fetcher_status.py --watch      # live refresh every 5s (Ctrl+C to stop)
+python trader/fetcher_status.py --watch 10   # refresh every 10s
+python trader/fetcher_status.py --days 20    # show last 20 trading days
+python trader/validate_fetch.py              # validate CSV files vs fetch_log
+```
+
+Cell values: `RUN` = actively fetching · `DONE` = finished (not yet in fetch_log) · `OK` = logged · `ERR` = error · `MISS` = not fetched
+
+> `fetch_log` is only written after **both** TRADES and BID_ASK complete for a day.
+> Use `DONE` cells to track in-progress days.
+
+---
+
+## 6b. Verified Trade Count
+
+```bash
+python trader/trade_count.py                 # all symbols, last 60 days
+python trader/trade_count.py --symbol MES
+python trader/trade_count.py --days 0        # all time
+```
+
+Shows: date · symbol · N trades · TP count · SL count · net PnL points
+
+---
+
+## 7. Reset — Cancel IB Orders + Wipe DB
 
 ### Via GUI (recommended)
-http://127.0.0.1:5000/lines → **Reset** card at the bottom.
+http://127.0.0.1:5001/lines → **Reset** card at the bottom.
 Check "Cancel IB orders" and/or "Wipe DB tables" → click **Reset** → confirm.
 
 ### Via CLI
@@ -170,7 +213,7 @@ ib:
   gateway_log_dir: "C:\\Jts\\<your_username>"
 ```
 
-Then open http://127.0.0.1:5000/ib-trace — right panel shows the live log.
+Then open http://127.0.0.1:5001/ib-trace — right panel shows the live log.
 
 ---
 
