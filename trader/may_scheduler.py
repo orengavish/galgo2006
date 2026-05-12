@@ -128,6 +128,38 @@ def _find_missing(db_path: Path, symbols: list, fetch_bid_ask: bool,
     return missing
 
 
+def _priority_dates(db_path: Path, history_dir: Path) -> list:
+    """Return [(sym, date)] that have verified trades but missing tick files, sorted by VT count desc."""
+    present = set()
+    if history_dir.exists():
+        for f in history_dir.glob("*.csv"):
+            parts = f.stem.split("_")
+            if len(parts) < 3:
+                continue
+            sym, ftype, dc = parts[0], parts[1], parts[2]
+            if f.stat().st_size > 100:
+                date_s = f"{dc[:4]}-{dc[4:6]}-{dc[6:]}"
+                present.add((sym, date_s, ftype))
+
+    with get_db(db_path) as con:
+        rows = con.execute(
+            "SELECT DATE(fill_time) AS d, symbol, COUNT(*) AS n "
+            "FROM verified_trades GROUP BY d, symbol ORDER BY n DESC"
+        ).fetchall()
+
+    result = []
+    for r in rows:
+        sym, d = r["symbol"], r["d"]
+        has_t = (sym, d, "trades") in present
+        has_b = (sym, d, "bidask") in present
+        if not (has_t and has_b):
+            try:
+                result.append((sym, date.fromisoformat(d)))
+            except ValueError:
+                pass
+    return result
+
+
 def _run_backfill(from_date: date, cfg, db_path: Path,
                   output_dir: Path, progress_db_path: Path):
     from fetch_scheduler import _fetch_symbol_day
@@ -135,18 +167,37 @@ def _run_backfill(from_date: date, cfg, db_path: Path,
     symbols = _get_symbols(cfg)
     fetch_bid_ask = getattr(getattr(cfg, "fetcher", None), "fetch_bid_ask", True)
 
-    missing = _find_missing(db_path, symbols, fetch_bid_ask, from_date, yesterday)
-    if not missing:
+    # Pass 1: priority dates (have verified trades, missing tick files) — sorted by VT count desc
+    try:
+        history_dir = Path(cfg.paths.history)
+    except Exception:
+        history_dir = Path("data/history")
+
+    priority = _priority_dates(db_path, history_dir)
+    regular  = _find_missing(db_path, symbols, fetch_bid_ask, from_date, yesterday)
+
+    # remove priority dates from regular to avoid double-fetching
+    priority_set = {(sym, d) for sym, d in priority}
+    regular = [(sym, d) for sym, d in regular if (sym, d) not in priority_set]
+
+    total = len(priority) + len(regular)
+    if total == 0:
         log.info("Backfill: nothing missing from %s to %s", from_date, yesterday)
         print(f"  Backfill: all data present from {from_date} ✓\n")
         return
 
-    log.info(f"Backfill: {len(missing)} symbol-days to fetch")
-    print(f"  Backfill: {len(missing)} missing symbol-days ({from_date} → {yesterday})\n")
+    log.info(f"Backfill: {len(priority)} priority + {len(regular)} regular = {total} symbol-days")
+    if priority:
+        print(f"  Backfill priority ({len(priority)} dates with verified trades, no tick files):")
+        for sym, d in priority:
+            print(f"    {d} {sym}")
+    print(f"  Backfill: {total} symbol-days total ({from_date} → {yesterday})\n")
 
-    for i, (sym, d) in enumerate(missing, 1):
-        log.info(f"Backfill {i}/{len(missing)}: {sym} {d}")
-        print(f"  [{i}/{len(missing)}] {sym} {d}", flush=True)
+    queue = priority + regular
+    for i, (sym, d) in enumerate(queue, 1):
+        tag = "[P]" if (sym, d) in priority_set else "   "
+        log.info(f"Backfill {i}/{total}: {tag} {sym} {d}")
+        print(f"  [{i}/{total}] {tag} {sym} {d}", flush=True)
         _fetch_symbol_day(sym, d, fetch_bid_ask, output_dir, progress_db_path, db_path)
 
     log.info("Backfill complete")
