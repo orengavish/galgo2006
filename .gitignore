@@ -10,4 +10,4 @@ back-trading/data/
 logs/
 *.pptx
 *.csv
-.claude/
+.claude/settings.local.json
