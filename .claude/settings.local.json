@@ -10,7 +10,52 @@
       "Bash(cmd *)",
       "Bash(powershell *)",
       "Bash(git add *)",
-      "Bash(git commit -m ' *)"
+      "Bash(git commit -m ' *)",
+      "Bash(git fetch *)",
+      "Bash(git merge *)",
+      "Bash(python -m lib.db --self-test)",
+      "Bash(git push *)",
+      "Bash(git pull *)",
+      "Bash(python trader/validate_fetch.py)",
+      "Bash(python trader/fetcher_status.py)",
+      "Bash(python -c ' *)",
+      "Bash(curl -s -X POST http://localhost:5001/api/lines -H \"Content-Type: application/json\" -d \"{\\\\\"text\\\\\":\\\\\"test\\\\\"}\")",
+      "Bash(curl *)",
+      "Bash(xargs grep *)",
+      "Bash(python trade_count.py)",
+      "Bash(python trader/fetcher_status.py --watch)",
+      "Bash(python trader/validate_fetch.py --help)",
+      "Bash(python validate_fetch.py --backfill)",
+      "Bash(python data_status.py)",
+      "Bash(python show_verified.py)",
+      "Bash(python calibrate.py)",
+      "Bash(python fetch_priority.py --all)",
+      "PowerShell(Get-WmiObject *)",
+      "Bash(Get-Process python*)",
+      "PowerShell(Get-ScheduledTask *)",
+      "PowerShell(Get-ScheduledTaskInfo *)",
+      "Bash(python *)",
+      "Bash(Get-ChildItem -Path \"C:\\\\Projects\\\\galgo2026\" -Recurse -Directory -Depth 2)",
+      "Bash(Select-Object FullName)"
+    ]
+  },
+  "enableAllProjectMcpServers": true,
+  "enabledMcpjsonServers": [
+    "galao-db"
+  ],
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python C:/Projects/galgo2026/.claude/hooks/selftest_on_edit.py",
+            "timeout": 35,
+            "statusMessage": "Running --self-test..."
+          }
+        ]
+      }
     ]
   }
 }
