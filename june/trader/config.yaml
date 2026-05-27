@@ -1,0 +1,93 @@
+# Galao June 2026 Configuration
+# Single-computer setup: this PC only. IBC paper gateway on demand.
+
+ib:
+  gateway_log_dir: ""
+  live_host: 127.0.0.1
+  live_port: 4002          # paper gateway — data + orders
+  live_client_ids: [101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115, 116, 117, 118, 119, 120]
+  paper_host: 127.0.0.1
+  paper_port: 4002
+  paper_client_ids: [201, 202, 203, 204, 205, 206, 207, 208, 209, 210]
+  reconnect_interval_seconds: 30
+  connection_timeout: 5
+  fetcher_client_ids: [801, 802, 803]
+  ibc_startgateway_bat: "C:\\IBC\\StartGateway.bat"
+  ibc_mode: paper
+
+symbols:
+  - MES    # trading symbols (broker/decider)
+  - MNQ
+  - MYM
+  - M2K
+
+fetcher:
+  auto_fetch_enabled: true
+  fetch_bid_ask: true
+  fetch_on_startup: true
+  symbols_override:
+    - MES
+    - MNQ
+    - MYM
+    - M2K
+  trigger_time_ct: "17:30"
+
+session:
+  open_offset_minutes: 30
+  shutdown_offset_minutes: 60
+  timezone: America/Chicago
+
+orders:
+  # fast-exit brackets: 4 ticks TP / 4 ticks SL (1:1 symmetric)
+  # MES: 1 tick = 0.25 points = $1.25. 4 ticks = $5/contract.
+  tp_ticks: 4
+  sl_ticks: 4
+  active_brackets: [4, 4]
+  tick_size: 0.25
+
+  # Contracts per symbol (paper trading)
+  quantity_per_symbol:
+    MES: 2
+    MNQ: 1
+    MYM: 1
+    M2K: 1
+
+position:
+  stagnation_seconds: 300
+  stagnation_min_move_points: 0.5
+  sl_cooldown_seconds: 30
+
+shutdown:
+  exit_patience_seconds: 30
+  panic_threshold_minutes: 10
+
+decider:
+  replenishment_poll_seconds: 10
+
+broker:
+  command_poll_seconds: 5
+  ib_poll_seconds: 30
+
+visualizer:
+  host: 127.0.0.1
+  port: 5001
+
+paths:
+  db: data/galao.db
+  test_db: data/test_galao.db
+  backtest_db: data/backtest.db
+  bt_db: data/bt.db              # new backtrader DB
+  critical_lines: data/critical_lines
+  history: data/history
+  logs: logs
+  versions: versions
+
+google_drive:
+  enabled: false                 # set true + add credentials_path when ready
+  credentials_path: ""           # path to service account JSON
+  history_folder_id: ""          # Google Drive folder ID for tick data files
+
+backtest:
+  symbol: MES
+  default_tp_ticks: 4
+  default_sl_ticks: 4
