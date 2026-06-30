@@ -1,12 +1,16 @@
 __pycache__/
 *.py[cod]
 *.log
-data/galao.db
-data/fetch_progress.db
-data/*.db-wal
-data/*.db-shm
-trader/data/
+# june trader data — track galao.db only, ignore everything else
+june/trader/data/history/
+june/trader/data/fetch_progress.db
+june/trader/data/bt.db
+june/trader/data/backtest.db
+june/trader/data/test_galao.db
+june/trader/data/*.db-wal
+june/trader/data/*.db-shm
 back-trading/data/
+/data/
 logs/
 *.pptx
 *.csv
