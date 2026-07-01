@@ -89,6 +89,77 @@ CREATE INDEX IF NOT EXISTS idx_tick_data_lookup
 
 CREATE INDEX IF NOT EXISTS idx_bt_commands_status
     ON bt_commands(status);
+
+-- ── Cartesian backtrader tables ───────────────────────────────────────────────
+
+CREATE TABLE IF NOT EXISTS bt_param_sets (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    tp_ticks        INTEGER NOT NULL,
+    sl_ticks        INTEGER NOT NULL,
+    entry_delay_s   INTEGER NOT NULL DEFAULT 0,
+    entry_offset_t  INTEGER NOT NULL DEFAULT 0,
+    tp_confirm_t    INTEGER NOT NULL DEFAULT 2,
+    session_window  TEXT    NOT NULL DEFAULT 'ALL',
+    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(tp_ticks, sl_ticks, entry_delay_s, entry_offset_t, tp_confirm_t, session_window)
+);
+
+CREATE TABLE IF NOT EXISTS bt_matrix_results (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    trade_id        INTEGER NOT NULL,
+    param_set_id    INTEGER NOT NULL,
+    symbol          TEXT    NOT NULL,
+    trade_date      TEXT    NOT NULL,
+    direction       TEXT    NOT NULL,
+    exit_reason     TEXT    NOT NULL,
+    pnl_ticks       REAL,
+    ticks_to_exit   INTEGER,
+    ms_to_exit      INTEGER,
+    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(trade_id, param_set_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_mx_param  ON bt_matrix_results(param_set_id);
+CREATE INDEX IF NOT EXISTS idx_mx_trade  ON bt_matrix_results(trade_id);
+CREATE INDEX IF NOT EXISTS idx_mx_date   ON bt_matrix_results(trade_date);
+
+CREATE TABLE IF NOT EXISTS bt_scores (
+    param_set_id    INTEGER PRIMARY KEY,
+    n_trades        INTEGER NOT NULL DEFAULT 0,
+    win_rate        REAL,
+    profit_factor   REAL,
+    expectancy      REAL,
+    sharpe          REAL,
+    sortino         REAL,
+    calmar          REAL,
+    max_drawdown_t  REAL,
+    avg_win_loss    REAL,
+    sqn             REAL,
+    fill_rate       REAL,
+    max_consec_loss INTEGER,
+    mc_pvalue       REAL,
+    composite_score REAL,
+    loocv_score     REAL,
+    stability_zone  REAL,
+    status          TEXT NOT NULL DEFAULT 'ok',
+    updated_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS bt_score_history (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    snapshot_date   TEXT    NOT NULL,
+    param_set_id    INTEGER NOT NULL,
+    rank            INTEGER,
+    composite_score REAL,
+    n_trades        INTEGER,
+    win_rate        REAL,
+    expectancy      REAL,
+    sqn             REAL,
+    created_at      TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(snapshot_date, param_set_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_score_hist_date ON bt_score_history(snapshot_date);
 """
 
 
