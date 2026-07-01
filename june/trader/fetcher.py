@@ -150,6 +150,32 @@ def _is_finished(conn, symbol, date_str, dtype) -> bool:
     return bool(row and row[0])
 
 
+def _get_csv_last_ts(file_path: Path, dtype: str) -> datetime | None:
+    """
+    Return the last time_utc in a partial CSV, or None if unreadable.
+    Reads only the last ~4KB to avoid loading large files.
+    Used to resume partial downloads after restart.
+    """
+    try:
+        size = file_path.stat().st_size
+        if size < 50:
+            return None
+        with open(file_path, "rb") as f:
+            f.seek(max(0, size - 4096))
+            tail = f.read().decode("utf-8", errors="replace")
+        lines = [ln for ln in tail.splitlines() if ln.strip()]
+        if not lines:
+            return None
+        last = lines[-1].split(",")
+        # time_utc is column index 1 for both TRADES and BID_ASK
+        ts_str = last[1].strip()
+        if not ts_str or ts_str == "time_utc":
+            return None
+        return datetime.fromisoformat(ts_str).replace(tzinfo=timezone.utc)
+    except Exception:
+        return None
+
+
 def _is_actively_running(conn, symbol, date_str, dtype, grace_seconds=120) -> bool:
     """Return True if another process updated this row within the last grace_seconds."""
     row = conn.execute(
@@ -420,31 +446,42 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
         suffix    = "trades" if dtype == "TRADES" else "bidask"
         file_path = output_dir / f"{symbol}_{suffix}_{date_compact}.csv"
 
-        # Delete incomplete file for clean restart
+        # Resume partial file if possible; delete only if unreadable
+        resume_from = None
         if file_path.exists():
-            log.info(f"Deleting incomplete file: {file_path.name}")
-            for _ in range(5):
-                try:
-                    file_path.unlink()
-                    break
-                except OSError:
-                    time.sleep(1)
+            resume_from = _get_csv_last_ts(file_path, dtype)
+            if resume_from is not None and resume_from > start_utc:
+                log.info(f"Resuming {file_path.name} from {resume_from.isoformat()}")
+            else:
+                resume_from = None
+                log.info(f"Deleting incomplete file (no usable resume point): {file_path.name}")
+                for _ in range(5):
+                    try:
+                        file_path.unlink()
+                        break
+                    except OSError:
+                        time.sleep(1)
+
+        fetch_start = resume_from + timedelta(milliseconds=1) if resume_from else start_utc
 
         _mark_started(progress_conn, symbol, date_str, dtype)
-        start_ct = start_utc.astimezone(CT).strftime("%H:%M CT")
+        start_ct = fetch_start.astimezone(CT).strftime("%H:%M CT")
         end_ct   = end_utc.astimezone(CT).strftime("%H:%M CT")
-        print(f"\n  [{dtype}] {symbol} {date_str}  ({start_ct} -> {end_ct})",
+        mode = "RESUME" if resume_from else "START"
+        print(f"\n  [{dtype}] {symbol} {date_str}  ({mode} {start_ct} -> {end_ct})",
               flush=True)
-        log.info(f"[START] {symbol} {dtype} {date_str}")
+        log.info(f"[{mode}] {symbol} {dtype} {date_str}")
 
         if dtype == "TRADES":
             headers = ["time_ct", "time_utc", "price", "size", "symbol"]
         else:
             headers = ["time_ct", "time_utc", "bid_p", "bid_s", "ask_p", "ask_s", "symbol"]
 
-        with open(file_path, "w", newline="", encoding="utf-8") as fh:
+        open_mode = "a" if resume_from else "w"
+        with open(file_path, open_mode, newline="", encoding="utf-8") as fh:
             w = csv.writer(fh)
-            w.writerow(headers)
+            if not resume_from:
+                w.writerow(headers)
 
             if dtype == "TRADES":
                 def write_row(t_u, price, size):
@@ -458,7 +495,7 @@ def fetch_day(ib: IB, symbol: str, target_date: date,
                                 bid_p, bid_s, ask_p, ask_s,
                                 contract.localSymbol])
 
-            count = paginate_ticks(ib, contract, start_utc, end_utc,
+            count = paginate_ticks(ib, contract, fetch_start, end_utc,
                                    dtype, write_row, progress_conn, symbol, date_str)
 
         if _running:
@@ -617,6 +654,18 @@ def self_test() -> bool:
                              6501.25, 5, "MESM6"])
             ok = verify_csv("MES", day, "trades", output_dir)
             assert ok, "verify_csv returned False on valid data"
+
+            # 4b. Resume point detection
+            resume_ts = _get_csv_last_ts(fake_path, "TRADES")
+            assert resume_ts is not None, "_get_csv_last_ts returned None on valid CSV"
+            assert resume_ts == datetime(2026, 4, 7, 14, 0, 1, tzinfo=timezone.utc), \
+                f"Unexpected resume ts: {resume_ts}"
+
+            # Empty file → None
+            empty = output_dir / "empty.csv"
+            empty.write_text("")
+            assert _get_csv_last_ts(empty, "TRADES") is None, \
+                "_get_csv_last_ts should return None for empty file"
 
             # 5. IB connection + real fetch attempt
             try:
