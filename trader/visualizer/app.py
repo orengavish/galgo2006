@@ -677,6 +677,60 @@ def api_state():
     return jsonify(_rows_to_list(rows))
 
 
+# ── Backtrader Scores API ────────────────────────────────────────────────────
+
+def _get_bt_db_path():
+    return _ROOT / "june" / "trader" / "data" / "bt.db"
+
+
+@app.route("/api/bt-scores")
+def api_bt_scores():
+    """Return top N param_sets by composite_score + summary stats."""
+    limit = min(int(request.args.get("limit", 20)), 200)
+    bt_path = _get_bt_db_path()
+    if not bt_path.exists():
+        return jsonify({"rows": [], "summary": {}, "error": "bt.db not found"})
+    import sqlite3
+    try:
+        conn = sqlite3.connect(str(bt_path), timeout=5)
+        conn.row_factory = sqlite3.Row
+        rows = conn.execute("""
+            SELECT s.composite_score, s.win_rate, s.expectancy, s.sqn,
+                   s.profit_factor, s.n_trades, s.status,
+                   s.loocv_score, s.stability_zone, s.mc_pvalue,
+                   p.tp_ticks, p.sl_ticks, p.entry_delay_s,
+                   p.entry_offset_t, p.tp_confirm_t, p.session_window
+            FROM bt_scores s JOIN bt_param_sets p ON p.id = s.param_set_id
+            WHERE s.status IN ('ok', 'low_confidence')
+            ORDER BY s.composite_score DESC LIMIT ?
+        """, (limit,)).fetchall()
+
+        total_scored = conn.execute("SELECT COUNT(*) FROM bt_scores").fetchone()[0]
+        ok_count     = conn.execute(
+            "SELECT COUNT(*) FROM bt_scores WHERE status='ok'"
+        ).fetchone()[0]
+        total_results = conn.execute("SELECT COUNT(*) FROM bt_matrix_results").fetchone()[0]
+        conn.close()
+
+        top = [dict(r) for r in rows]
+        summary = {
+            "total_scored": total_scored,
+            "ok_count": ok_count,
+            "total_results": total_results,
+        }
+        if top:
+            best = top[0]
+            summary["best_score"]       = best["composite_score"]
+            summary["best_win_rate"]    = best["win_rate"]
+            summary["best_tp"]          = best["tp_ticks"]
+            summary["best_sl"]          = best["sl_ticks"]
+            summary["best_window"]      = best["session_window"]
+        return jsonify({"rows": top, "summary": summary})
+    except Exception as e:
+        log.warning("api_bt_scores error: %s", e)
+        return jsonify({"rows": [], "summary": {}, "error": str(e)})
+
+
 # ── Lines input API ───────────────────────────────────────────────────────────
 
 _STRENGTH_LABELS = {1: "strong (!)", 2: "medium (?)", 3: "weak (no suffix)"}

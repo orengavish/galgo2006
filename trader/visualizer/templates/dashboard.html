@@ -268,6 +268,22 @@
 
   </div><!-- /left-col -->
 
+  <!-- ── Backtrader scores ─────────────────────────────────────── -->
+  <div class="card" id="bt-scores-card" style="flex:0 0 auto;width:360px;overflow-x:auto">
+    <h2>Backtrader Scores
+      <span id="bt-summary" style="font-size:11px;color:#8b949e;margin-left:8px"></span>
+    </h2>
+    <table id="bt-scores-table" style="font-size:11px">
+      <thead><tr>
+        <th>#</th><th>Score</th><th>Win%</th><th>EV</th><th>SQN</th>
+        <th>PF</th><th>N</th><th>TP</th><th>SL</th><th>Window</th>
+      </tr></thead>
+      <tbody id="bt-scores-tbody">
+        <tr><td colspan="10" style="color:#6e7681;text-align:center">Loading...</td></tr>
+      </tbody>
+    </table>
+  </div>
+
   <!-- ── Active commands ───────────────────────────────────────── -->
   <div class="card" style="flex:1;overflow-x:auto">
     <h2>Commands &nbsp;<span id="filter-label" style="font-size:11px;color:#58a6ff"></span>
@@ -693,6 +709,43 @@ function _fUpdate(d) {
 (function pollFetch() {
   fetch('/api/fetch-live').then(r=>r.json()).then(_fUpdate).catch(()=>{});
   setTimeout(pollFetch, 3000);
+})();
+
+// ── Backtrader scores panel ───────────────────────────────────────────────────
+function _btUpdate(data) {
+  const tbody = document.getElementById('bt-scores-tbody');
+  const sumEl = document.getElementById('bt-summary');
+  if (!tbody) return;
+
+  const s = data.summary || {};
+  if (s.total_scored !== undefined) {
+    sumEl.textContent = `${s.ok_count||0} ok / ${s.total_scored} scored · ${(s.total_results||0).toLocaleString()} results`;
+  }
+
+  const rows = data.rows || [];
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="10" style="color:#6e7681;text-align:center">' +
+      (data.error || 'No scores yet') + '</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map((r, i) => {
+    const score = r.composite_score != null ? r.composite_score.toFixed(4) : '—';
+    const wr    = r.win_rate    != null ? (r.win_rate*100).toFixed(0)+'%' : '—';
+    const ev    = r.expectancy  != null ? r.expectancy.toFixed(2)         : '—';
+    const sqn   = r.sqn         != null ? r.sqn.toFixed(2)                : '—';
+    const pf    = r.profit_factor!= null? r.profit_factor.toFixed(2)      : '—';
+    const cls   = r.status === 'low_confidence' ? 'style="color:#d29922"' : '';
+    return `<tr ${cls}>
+      <td>${i+1}</td><td>${score}</td><td>${wr}</td><td>${ev}</td><td>${sqn}</td>
+      <td>${pf}</td><td>${r.n_trades||0}</td><td>${r.tp_ticks}</td>
+      <td>${r.sl_ticks}</td><td>${r.session_window}</td>
+    </tr>`;
+  }).join('');
+}
+
+(function pollBtScores() {
+  fetch('/api/bt-scores?limit=10').then(r=>r.json()).then(_btUpdate).catch(()=>{});
+  setTimeout(pollBtScores, 30000);
 })();
 </script>
 {% endblock %}
