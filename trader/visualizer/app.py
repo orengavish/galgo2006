@@ -1478,13 +1478,17 @@ def api_fetch_live():
             return None
         return max(0, total_rec - past["records"])
 
+    midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
+    secs_since_midnight = max(1, (now_utc - midnight_utc).total_seconds())
+
     throughput = {
-        "rec_s_1m":  _trate(60),
-        "rec_s_1h":  _trate(3600),
-        "rec_s_24h": _trate(86400),
-        "total_1m":  _total(60),
-        "total_1h":  _total(3600),
-        "total_24h": _total(86400),
+        "rec_s_1m":             _trate(60),
+        "rec_s_1h":             _trate(3600),
+        "rec_s_24h":            _trate(86400),
+        "total_1m":             _total(60),
+        "total_1h":             _total(3600),
+        "total_24h":            _total(86400),
+        "total_since_midnight": _total(secs_since_midnight),
         "total_rec": total_rec,
     }
 

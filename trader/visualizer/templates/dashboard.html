@@ -209,6 +209,12 @@
           </button>
         </span>
       </div>
+      <!-- since-midnight banner -->
+      <div style="text-align:center;border-bottom:1px solid #21262d;margin-bottom:6px;padding-bottom:6px">
+        <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">Since midnight UTC</div>
+        <div id="ftp-midnight" style="font-size:24px;font-family:monospace;font-weight:bold;color:#58a6ff;letter-spacing:1px">—</div>
+        <div style="font-size:8px;color:#6e7681">records fetched today</div>
+      </div>
       <!-- throughput clocks -->
       <div style="display:flex;gap:0;border-bottom:1px solid #21262d;margin-bottom:6px;padding-bottom:6px;align-items:center">
         <div style="flex:1;text-align:center">
@@ -736,6 +742,8 @@ function _fUpdate(d) {
     return Math.round(n).toString();
   }
   function _ftpColor(n) { return (n != null && n > 0) ? '#3fb950' : '#6e7681'; }
+  const midEl = document.getElementById('ftp-midnight');
+  if (midEl) { midEl.textContent = _ftpFmt(tp.total_since_midnight); midEl.style.color = _ftpColor(tp.total_since_midnight); }
   [['1m','total_1m'],['1h','total_1h'],['24h','total_24h']].forEach(([k,key]) => {
     const el = document.getElementById('ftp-'+k);
     if (el) { el.textContent = _ftpFmt(tp[key]); el.style.color = _ftpColor(tp[key]); }
