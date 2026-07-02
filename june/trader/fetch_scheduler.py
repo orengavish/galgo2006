@@ -150,16 +150,23 @@ def _present_files(cfg) -> set:
 def _get_priority_dates(cfg, symbols: list) -> list:
     """
     Return list of (symbol, date) pairs to fetch, priority order:
-      1. Days with verified trades AND missing tick files, sorted by trade count DESC
-         (more verified trades = higher backtest value → fetch first)
-      2. Yesterday for each symbol if not yet fetched
-      3. Other recent dates missing tick files
+      1. Days with verified trades AND missing TRADES files, sorted by trade count DESC
+      2. Yesterday for each symbol if TRADES not yet fetched
+    Only considers BID_ASK as missing if fetch_bid_ask is enabled in config.
     Called repeatedly during the fetch loop so priority stays current.
     """
     from pathlib import Path as P
-    present = _present_files(cfg)
-    pairs   = []
-    seen    = set()
+    present    = _present_files(cfg)
+    do_bid_ask = bool(getattr(cfg.fetcher, "fetch_bid_ask", True))
+    pairs      = []
+    seen       = set()
+
+    def _is_missing(sym, d):
+        if (sym, d, "trades") not in present:
+            return True
+        if do_bid_ask and (sym, d, "bidask") not in present:
+            return True
+        return False
 
     # Priority 1: verified_trades dates — sorted by trade count DESC
     try:
@@ -176,9 +183,7 @@ def _get_priority_dates(cfg, symbols: list) -> list:
             sym, d = r["symbol"], r["d"]
             if sym not in symbols:
                 continue
-            missing_trades = (sym, d, "trades") not in present
-            missing_bidask = (sym, d, "bidask") not in present
-            if missing_trades or missing_bidask:
+            if _is_missing(sym, d):
                 key = (sym, d)
                 if key not in seen:
                     seen.add(key)
@@ -186,13 +191,11 @@ def _get_priority_dates(cfg, symbols: list) -> list:
     except Exception as e:
         log.warning("Could not query verified_trades: %s", e)
 
-    # Priority 2: yesterday for each symbol if not present
+    # Priority 2: yesterday for each symbol if TRADES not present
     yesterday = (datetime.now(CT) - timedelta(days=1)).date()
     yd_str = yesterday.strftime("%Y-%m-%d")
     for sym in symbols:
-        missing_trades = (sym, yd_str, "trades") not in present
-        missing_bidask = (sym, yd_str, "bidask") not in present
-        if missing_trades or missing_bidask:
+        if _is_missing(sym, yd_str):
             key = (sym, yd_str)
             if key not in seen:
                 seen.add(key)
@@ -209,11 +212,12 @@ def run(specific_date: date = None, backfill: bool = False,
     Execute one full fetch cycle.
     Returns True if all fetches succeeded and verified.
     """
-    cfg     = get_config()
-    symbols = list(cfg.fetcher.symbols_override or cfg.symbols)
-    gdrive  = GDriveClient(cfg)
+    cfg        = get_config()
+    symbols    = list(cfg.fetcher.symbols_override or cfg.symbols)
+    do_bid_ask = bool(getattr(cfg.fetcher, "fetch_bid_ask", True))
+    gdrive     = GDriveClient(cfg)
 
-    log.info("=== fetch_scheduler start | symbols=%s ===", symbols)
+    log.info("=== fetch_scheduler start | symbols=%s bid_ask=%s ===", symbols, do_bid_ask)
 
     # ── Determine what to fetch ──
     if specific_date:
@@ -263,7 +267,7 @@ def run(specific_date: date = None, backfill: bool = False,
             log.info("--- %s  %s ---", sym, target_day)
             try:
                 results = fetch_day(ib, sym, target_day,
-                                    fetch_bid_ask=True,
+                                    fetch_bid_ask=do_bid_ask,
                                     output_dir=output_dir,
                                     progress_conn=progress_conn)
                 log.info("fetch_day results: %s", results)
@@ -365,8 +369,10 @@ def _self_test():
 
         class FakeFetcher:
             symbols_override = ["MES", "MNQ", "MYM", "M2K"]
+            fetch_bid_ask    = False
 
-        cfg = FakeCfg()
+        cfg         = FakeCfg()
+        cfg.fetcher = FakeFetcher()
 
         # Monkey-patch get_db to work with our temp DB
         import lib.db as _libdb

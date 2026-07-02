@@ -23,13 +23,13 @@ symbols:
 
 fetcher:
   auto_fetch_enabled: true
-  fetch_bid_ask: true
+  fetch_bid_ask: false          # BID_ASK not needed for backtrader; re-enable after backfill complete
+  backfill_bid_ask: false       # keep false until 6-month backfill is done (~7 days)
   fetch_on_startup: true
   symbols_override:
     - MES
     - MNQ
-    - MYM
-    - M2K
+    - MYM                       # M2K dropped: fewest trades, lowest backtest value
   trigger_time_ct: "17:30"
 
 session:
