@@ -1471,10 +1471,20 @@ def api_fetch_live():
         dr = total_rec - past["records"]
         return round(max(0.0, dr / dt), 1) if dt > 0.5 else None
 
+    def _total(seconds):
+        cutoff = now_mono - seconds
+        past = next((h for h in _fetch_throughput_hist if h["ts"] >= cutoff), None)
+        if past is None:
+            return None
+        return max(0, total_rec - past["records"])
+
     throughput = {
         "rec_s_1m":  _trate(60),
         "rec_s_1h":  _trate(3600),
         "rec_s_24h": _trate(86400),
+        "total_1m":  _total(60),
+        "total_1h":  _total(3600),
+        "total_24h": _total(86400),
         "total_rec": total_rec,
     }
 

@@ -147,11 +147,15 @@ def _present_files(cfg) -> set:
     return present
 
 
+MIN_TRADES_FOR_PRIORITY = 20  # dates with more verified trades than this go first
+
 def _get_priority_dates(cfg, symbols: list) -> list:
     """
     Return list of (symbol, date) pairs to fetch, priority order:
-      1. Days with verified trades AND missing TRADES files, sorted by trade count DESC
-      2. Yesterday for each symbol if TRADES not yet fetched
+      P1. Verified-trade dates with n > MIN_TRADES_FOR_PRIORITY — scored immediately by backtrader
+      P2. Yesterday per symbol
+      P3. Verified-trade dates with n <= MIN_TRADES_FOR_PRIORITY — lower value, fetch after yesterday
+      P4. Backfill — last backfill_days trading days, Mon-Fri, most recent first
     Only considers BID_ASK as missing if fetch_bid_ask is enabled in config.
     Called repeatedly during the fetch loop so priority stays current.
     """
@@ -160,6 +164,7 @@ def _get_priority_dates(cfg, symbols: list) -> list:
     do_bid_ask = bool(getattr(cfg.fetcher, "fetch_bid_ask", True))
     pairs      = []
     seen       = set()
+    _p3_pairs  = []  # verified dates with n <= threshold — inserted after P2
 
     def _is_missing(sym, d):
         if (sym, d, "trades") not in present:
@@ -168,7 +173,7 @@ def _get_priority_dates(cfg, symbols: list) -> list:
             return True
         return False
 
-    # Priority 1: verified_trades dates — sorted by trade count DESC
+    # P1 + collect P3: verified_trades dates, sorted by count DESC
     try:
         from lib.db import get_db
         db_path = P(cfg.paths.db)
@@ -180,18 +185,21 @@ def _get_priority_dates(cfg, symbols: list) -> list:
                 "ORDER BY n DESC, d DESC"
             ).fetchall()
         for r in rows:
-            sym, d = r["symbol"], r["d"]
+            sym, d, n = r["symbol"], r["d"], r["n"]
             if sym not in symbols:
                 continue
             if _is_missing(sym, d):
                 key = (sym, d)
                 if key not in seen:
                     seen.add(key)
-                    pairs.append((sym, date.fromisoformat(d)))
+                    if n > MIN_TRADES_FOR_PRIORITY:
+                        pairs.append((sym, date.fromisoformat(d)))
+                    else:
+                        _p3_pairs.append((sym, date.fromisoformat(d)))
     except Exception as e:
         log.warning("Could not query verified_trades: %s", e)
 
-    # Priority 2: yesterday for each symbol if TRADES not present
+    # P2: yesterday per symbol
     yesterday = (datetime.now(CT) - timedelta(days=1)).date()
     yd_str = yesterday.strftime("%Y-%m-%d")
     for sym in symbols:
@@ -201,8 +209,10 @@ def _get_priority_dates(cfg, symbols: list) -> list:
                 seen.add(key)
                 pairs.append((sym, yesterday))
 
-    # Priority 3: backfill — last BACKFILL_DAYS trading days, most recent first
-    # Skips weekends; adds any (sym, date) missing from history
+    # P3: verified dates with n <= threshold (context, not yet fully scoreable)
+    pairs.extend(_p3_pairs)
+
+    # P4: backfill — last backfill_days trading days, most recent first
     backfill_days = int(getattr(cfg.fetcher, "backfill_days", 180))
     if backfill_days > 0:
         scan_date = yesterday - timedelta(days=1)
@@ -352,6 +362,9 @@ def _self_test():
     tmp_dir = tempfile.mkdtemp()
     try:
         # Create minimal galao.db with completed_trades
+        # MES 2026-06-20 has 25 trades  -> P1 (n > MIN_TRADES_FOR_PRIORITY=20)
+        # MES 2026-06-27 has  3 trades  -> P3 (n <= 20, after yesterday)
+        # MNQ 2026-06-27 has  1 trade   -> P3
         ga_conn = sqlite3.connect(tmp_ga)
         ga_conn.execute("""
             CREATE TABLE completed_trades (
@@ -361,9 +374,13 @@ def _self_test():
                 entry_type TEXT, source TEXT
             )
         """)
-        # MES 2026-06-27 has 3 trades (highest priority)
-        # MNQ 2026-06-27 has 1 trade (lower)
-        ga_conn.executemany("INSERT INTO completed_trades VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)", [
+        rows = []
+        for i in range(25):
+            rows.append((100+i, "MES", "BUY", 5500.0,
+                         f"2026-06-20T{14+i//4:02d}:{(i%4)*15:02d}:00+00:00",
+                         5501.0, f"2026-06-20T{14+i//4:02d}:{(i%4)*15+5:02d}:00+00:00",
+                         "TP", 5.0, 4.0))
+        rows += [
             (1, "MES", "BUY",  5500.0, "2026-06-27T14:00:00+00:00",
              5501.0, "2026-06-27T14:05:00+00:00", "TP", 5.0, 4.0),
             (2, "MES", "SELL", 5501.0, "2026-06-27T14:10:00+00:00",
@@ -372,7 +389,8 @@ def _self_test():
              5498.0, "2026-06-27T14:25:00+00:00", "SL", -10.0, 4.0),
             (4, "MNQ", "BUY", 19500.0, "2026-06-27T14:00:00+00:00",
              19502.0, "2026-06-27T14:05:00+00:00", "TP", 4.0, 4.0),
-        ])
+        ]
+        ga_conn.executemany("INSERT INTO completed_trades VALUES (?,?,?,?,?,?,?,?,?,?,NULL,NULL)", rows)
         ga_conn.commit()
         ga_conn.close()
 
@@ -420,25 +438,30 @@ def _self_test():
         _libdb.get_db = _fake_get_db
 
         try:
-            # Test 1: MES 2026-06-27 should be #1 (3 trades vs MNQ's 1)
+            # Test 1: MES 2026-06-20 (25 trades, P1) must come before yesterday (P2)
             pairs = _get_priority_dates(cfg, ["MES", "MNQ", "MYM", "M2K"])
             assert len(pairs) > 0, "Expected at least 1 pair"
             assert pairs[0][0] == "MES", \
-                f"Expected MES first (3 trades), got {pairs[0][0]}"
-            assert pairs[0][1].isoformat() == "2026-06-27", \
-                f"Expected 2026-06-27, got {pairs[0][1]}"
+                f"Expected MES first (P1 with 25 trades), got {pairs[0][0]}"
+            assert pairs[0][1].isoformat() == "2026-06-20", \
+                f"Expected 2026-06-20 (P1), got {pairs[0][1]}"
 
-            # Test 2: after MES CSV added, MNQ should be next
-            # Simulate MES trades CSV now present
-            mes_csv = Path(tmp_dir) / "MES_trades_20260627.csv"
+            # Test 2: MES 2026-06-27 (3 trades, P3) must come AFTER yesterday entries
+            yesterday_str = (datetime.now(CT) - timedelta(days=1)).date().isoformat()
+            p1_idx   = next(i for i,p in enumerate(pairs) if p[1].isoformat()=="2026-06-20")
+            p3_idx   = next((i for i,p in enumerate(pairs) if p[1].isoformat()=="2026-06-27"), None)
+            yd_idx   = next((i for i,p in enumerate(pairs) if p[1].isoformat()==yesterday_str), None)
+            assert p3_idx is None or (yd_idx is None or p3_idx > yd_idx), \
+                f"P3 date should come after yesterday in queue"
+
+            # Test 3: after MES Jun-20 CSV added, MNQ should still appear
+            mes_csv = Path(tmp_dir) / "MES_trades_20260620.csv"
             mes_csv.write_text("time_utc,price,size\n" + "x" * 200)
             pairs2 = _get_priority_dates(cfg, ["MES", "MNQ", "MYM", "M2K"])
-            # MES trades done, MES bidask still missing AND MNQ trades missing
-            # First should still be MES (bidask missing) or MNQ
             found_mnq = any(p[0] == "MNQ" for p in pairs2)
             assert found_mnq, "MNQ should appear in priority list"
 
-            print("PASS -- MES (3 trades) ranked before MNQ (1 trade), "
+            print("PASS -- P1 (n>20) before P2 (yesterday) before P3 (n<=20), "
                   "dynamic re-priority confirmed")
             return True
         finally:

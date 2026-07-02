@@ -210,27 +210,31 @@
         </span>
       </div>
       <!-- throughput clocks -->
-      <div style="display:flex;gap:0;border-bottom:1px solid #21262d;margin-bottom:6px;padding-bottom:6px">
+      <div style="display:flex;gap:0;border-bottom:1px solid #21262d;margin-bottom:6px;padding-bottom:6px;align-items:center">
         <div style="flex:1;text-align:center">
           <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">1 min</div>
           <div id="ftp-1m" style="font-size:15px;font-family:monospace;color:#d29922;letter-spacing:1px">—</div>
-          <div style="font-size:8px;color:#6e7681">rec/s</div>
+          <div style="font-size:8px;color:#6e7681">records</div>
         </div>
-        <div style="width:1px;background:#21262d;margin:2px 0"></div>
+        <div style="width:1px;background:#21262d;margin:2px 0;align-self:stretch"></div>
         <div style="flex:1;text-align:center">
           <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">1 hour</div>
           <div id="ftp-1h" style="font-size:15px;font-family:monospace;color:#d29922;letter-spacing:1px">—</div>
-          <div style="font-size:8px;color:#6e7681">rec/s</div>
+          <div style="font-size:8px;color:#6e7681">records</div>
         </div>
-        <div style="width:1px;background:#21262d;margin:2px 0"></div>
+        <div style="width:1px;background:#21262d;margin:2px 0;align-self:stretch"></div>
         <div style="flex:1;text-align:center">
           <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">24 hours</div>
           <div id="ftp-24h" style="font-size:15px;font-family:monospace;color:#d29922;letter-spacing:1px">—</div>
-          <div style="font-size:8px;color:#6e7681">rec/s</div>
+          <div style="font-size:8px;color:#6e7681">records</div>
+        </div>
+        <div style="width:1px;background:#21262d;margin:2px 0;align-self:stretch"></div>
+        <div style="flex:0 0 32px;text-align:center">
+          <span id="ftp-dot" style="font-size:18px;line-height:1;color:#6e7681" title="Fetching active">●</span>
         </div>
       </div>
 
-      <div id="fetch-grid" style="flex:1;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;overflow:hidden">
+      <div id="fetch-grid" style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr;gap:8px;min-height:0">
 
         <!-- MES -->
         <div class="fetch-sym-card" data-sym="MES">
@@ -261,19 +265,6 @@
         <!-- MYM -->
         <div class="fetch-sym-card" data-sym="MYM">
           <div class="fetch-sym-name">MYM</div>
-          <div class="fetch-slot" data-dtype="TRADES">
-            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">T</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
-            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
-          </div>
-          <div class="fetch-slot" data-dtype="BID_ASK">
-            <div style="display:flex;align-items:center;gap:4px"><span class="fsl">B</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
-            <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
-          </div>
-        </div>
-
-        <!-- M2K -->
-        <div class="fetch-sym-card" data-sym="M2K">
-          <div class="fetch-sym-name">M2K</div>
           <div class="fetch-slot" data-dtype="TRADES">
             <div style="display:flex;align-items:center;gap:4px"><span class="fsl">T</span><div class="fbar-wrap"><div class="fbar-fill"></div></div><span class="fpct">—</span></div>
             <div class="fdetail"><span class="fcount">—</span><span class="frate" style="color:#6e7681">—</span></div>
@@ -675,7 +666,7 @@ function _updateFetchButtons(running) {
 function _fUpdate(d) {
   document.getElementById('fetch-ts').textContent = new Date().toLocaleTimeString();
   const bidAskOn = d.bid_ask_enabled !== false;  // default true if not set
-  const syms   = ['MES','MNQ','MYM','M2K'];
+  const syms   = d.symbols || ['MES','MNQ','MYM'];
   const dtypes = ['TRADES','BID_ASK'];
 
   for (const sym of syms) {
@@ -738,17 +729,23 @@ function _fUpdate(d) {
 
   // ── Throughput clocks ──────────────────────────────────────────────────────
   const tp = d.throughput || {};
-  function _ftpFmt(recs) {
-    if (recs == null) return '—';
-    if (recs >= 1000) return (recs/1000).toFixed(1)+'k';
-    return Math.round(recs).toString();
+  function _ftpFmt(n) {
+    if (n == null) return '—';
+    if (n >= 1e6) return (n/1e6).toFixed(1)+'M';
+    if (n >= 1e3) return (n/1e3).toFixed(1)+'K';
+    return Math.round(n).toString();
   }
-  function _ftpColor(recs) { return (recs != null && recs > 0) ? '#3fb950' : '#6e7681'; }
-  ['1m','1h','24h'].forEach(k => {
+  function _ftpColor(n) { return (n != null && n > 0) ? '#3fb950' : '#6e7681'; }
+  [['1m','total_1m'],['1h','total_1h'],['24h','total_24h']].forEach(([k,key]) => {
     const el = document.getElementById('ftp-'+k);
-    const key = k==='1m' ? 'rec_s_1m' : k==='1h' ? 'rec_s_1h' : 'rec_s_24h';
     if (el) { el.textContent = _ftpFmt(tp[key]); el.style.color = _ftpColor(tp[key]); }
   });
+  const dot = document.getElementById('ftp-dot');
+  if (dot) {
+    const active = tp.total_1m != null && tp.total_1m > 0;
+    dot.style.color = active ? '#3fb950' : '#f85149';
+    dot.title = active ? 'Fetching active' : 'Idle / no data in last minute';
+  }
 }
 
 (function pollFetch() {
