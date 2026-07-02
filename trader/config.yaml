@@ -26,7 +26,6 @@ fetcher:
     - MES
     - MNQ
     - MYM
-    - M2K
   trigger_time_ct: "17:30"      # HH:MM CT — trigger after market close
 
 session:

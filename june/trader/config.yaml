@@ -19,7 +19,6 @@ symbols:
   - MES    # trading symbols (broker/decider)
   - MNQ
   - MYM
-  - M2K
 
 fetcher:
   auto_fetch_enabled: true
