@@ -209,6 +209,27 @@
           </button>
         </span>
       </div>
+      <!-- throughput clocks -->
+      <div style="display:flex;gap:0;border-bottom:1px solid #21262d;margin-bottom:6px;padding-bottom:6px">
+        <div style="flex:1;text-align:center">
+          <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">1 min</div>
+          <div id="ftp-1m" style="font-size:15px;font-family:monospace;color:#d29922;letter-spacing:1px">—</div>
+          <div style="font-size:8px;color:#6e7681">rec/s</div>
+        </div>
+        <div style="width:1px;background:#21262d;margin:2px 0"></div>
+        <div style="flex:1;text-align:center">
+          <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">1 hour</div>
+          <div id="ftp-1h" style="font-size:15px;font-family:monospace;color:#d29922;letter-spacing:1px">—</div>
+          <div style="font-size:8px;color:#6e7681">rec/s</div>
+        </div>
+        <div style="width:1px;background:#21262d;margin:2px 0"></div>
+        <div style="flex:1;text-align:center">
+          <div style="font-size:9px;color:#8b949e;letter-spacing:.5px;text-transform:uppercase">24 hours</div>
+          <div id="ftp-24h" style="font-size:15px;font-family:monospace;color:#d29922;letter-spacing:1px">—</div>
+          <div style="font-size:8px;color:#6e7681">rec/s</div>
+        </div>
+      </div>
+
       <div id="fetch-grid" style="flex:1;display:grid;grid-template-columns:1fr 1fr;grid-template-rows:1fr 1fr;gap:8px;overflow:hidden">
 
         <!-- MES -->
@@ -653,50 +674,60 @@ function _updateFetchButtons(running) {
 // ── Fetch Progress Panel ─────────────────────────────────────────────────────
 function _fUpdate(d) {
   document.getElementById('fetch-ts').textContent = new Date().toLocaleTimeString();
-  const syms = ['MES','MNQ','MYM','M2K'];
+  const bidAskOn = d.bid_ask_enabled !== false;  // default true if not set
+  const syms   = ['MES','MNQ','MYM','M2K'];
   const dtypes = ['TRADES','BID_ASK'];
+
   for (const sym of syms) {
     const card = document.querySelector(`.fetch-sym-card[data-sym="${sym}"]`);
     if (!card) continue;
     for (const dtype of dtypes) {
       const slot = card.querySelector(`.fetch-slot[data-dtype="${dtype}"]`);
       if (!slot) continue;
-      const sd = ((d.data||{})[sym]||{})[dtype] || null;
-      const bar   = slot.querySelector('.fbar-fill');
-      const pctEl = slot.querySelector('.fpct');
-      const cntEl = slot.querySelector('.fcount');
-      const rateEl= slot.querySelector('.frate');
+      const sd     = ((d.data||{})[sym]||{})[dtype] || null;
+      const bar    = slot.querySelector('.fbar-fill');
+      const pctEl  = slot.querySelector('.fpct');
+      const cntEl  = slot.querySelector('.fcount');
+      const rateEl = slot.querySelector('.frate');
+
+      // BID_ASK disabled and no real data → show "off"
+      if (dtype==='BID_ASK' && !bidAskOn && (!sd || sd.status==='missing')) {
+        bar.style.width='0%'; bar.className='fbar-fill';
+        pctEl.textContent=''; cntEl.textContent='off';
+        cntEl.style.color='#6e7681';
+        rateEl.textContent=''; rateEl.style.color='#6e7681'; continue;
+      }
 
       if (!sd || sd.status==='missing' || sd.status==='idle') {
         bar.style.width='0%'; bar.className='fbar-fill';
-        pctEl.textContent='—'; cntEl.textContent='—';
+        pctEl.textContent='—'; cntEl.textContent='—'; cntEl.style.color='';
         rateEl.textContent='—'; rateEl.style.color='#6e7681'; continue;
       }
 
-      const rec  = sd.records||0;
-      const pct  = sd.pct!=null ? sd.pct : 0;
-      const done = sd.finished;
+      const rec    = sd.records||0;
+      const pct    = sd.pct!=null ? sd.pct : 0;
+      const done   = sd.finished;
       const active = sd.status==='active';
       const stale  = sd.status==='stale';
 
       bar.style.width = Math.min(pct,100)+'%';
       bar.className = 'fbar-fill'+(done?' fdone':active?' factive':'');
-      if (done) bar.style.background='#3fb950';
+      if (done)       bar.style.background='#3fb950';
       else if (stale) bar.style.background='#9e6a03';
-      else bar.style.background='#d29922';
+      else            bar.style.background='#d29922';
 
       pctEl.textContent = sd.pct!=null ? pct+'%' : '?%';
-      const dates = sd.dates ? ` (${sd.dates})` : '';
-      const dateHint = sd.cur_date ? ' '+sd.cur_date.slice(5) : (dates||'');
+      const dateHint = sd.cur_date ? ' '+sd.cur_date.slice(5) : (sd.dates ? ` (${sd.dates})` : '');
       cntEl.textContent = rec>0 ? (rec/1000).toFixed(1)+'k'+dateHint : '—';
+      cntEl.style.color = '';
 
       if (done) {
         rateEl.textContent='✓'; rateEl.style.color='#3fb950';
-      } else if (sd.rate_ks!==null && sd.rate_ks!==undefined && sd.rate_ks>0) {
+      } else if (sd.rate_ks!=null && sd.rate_ks>0) {
         rateEl.textContent='+'+sd.rate_ks.toFixed(1)+'k/s'; rateEl.style.color='#d29922';
       } else if (stale) {
         const age = sd.age_s!=null ? Math.round(sd.age_s/60)+'m ago' : '';
-        rateEl.textContent='stale'+( age?' '+age:''); rateEl.style.color='#9e6a03';
+        rateEl.textContent='stale'+(age?' '+age:''); rateEl.style.color='#9e6a03';
       } else if (active) {
         rateEl.textContent='calc…'; rateEl.style.color='#d29922';
       } else {
@@ -704,11 +735,25 @@ function _fUpdate(d) {
       }
     }
   }
+
+  // ── Throughput clocks ──────────────────────────────────────────────────────
+  const tp = d.throughput || {};
+  function _ftpFmt(recs) {
+    if (recs == null) return '—';
+    if (recs >= 1000) return (recs/1000).toFixed(1)+'k';
+    return Math.round(recs).toString();
+  }
+  function _ftpColor(recs) { return (recs != null && recs > 0) ? '#3fb950' : '#6e7681'; }
+  ['1m','1h','24h'].forEach(k => {
+    const el = document.getElementById('ftp-'+k);
+    const key = k==='1m' ? 'rec_s_1m' : k==='1h' ? 'rec_s_1h' : 'rec_s_24h';
+    if (el) { el.textContent = _ftpFmt(tp[key]); el.style.color = _ftpColor(tp[key]); }
+  });
 }
 
 (function pollFetch() {
   fetch('/api/fetch-live').then(r=>r.json()).then(_fUpdate).catch(()=>{});
-  setTimeout(pollFetch, 3000);
+  setTimeout(pollFetch, 5000);
 })();
 
 // ── Backtrader scores panel ───────────────────────────────────────────────────

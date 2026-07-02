@@ -231,7 +231,7 @@ def run(specific_date: date = None, backfill: bool = False,
         if not initial:
             log.info("Nothing to fetch — all priority dates covered")
             return True
-        log.info("Fetch plan (dynamic): first target → %s %s", initial[0][0], initial[0][1])
+        log.info("Fetch plan (dynamic): first target -> %s %s", initial[0][0], initial[0][1])
 
     # ── Start gateway ──
     if not _start_gateway(cfg):

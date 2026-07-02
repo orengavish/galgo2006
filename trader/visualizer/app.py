@@ -58,6 +58,7 @@ _cfg = None
 _db_path = None
 _fetch_proc = None        # tracked fetcher process
 _fetch_rate_state = {}    # "SYM_DTYPE" -> {ts, records} for server-side rate
+_fetch_throughput_hist = []  # [{ts: monotonic, records: int}] — global fetch rate history
 
 
 def _get_cfg():
@@ -1323,6 +1324,14 @@ def api_fetch_live():
     symbols = _fetch_symbols() or ["MES", "MNQ", "MYM", "M2K"]
     dtypes  = ["TRADES", "BID_ASK"]
     result  = {sym: {} for sym in symbols}
+    try:
+        import yaml as _yaml
+        _june_cfg_path = _ROOT / "june" / "trader" / "config.yaml"
+        with open(_june_cfg_path) as _f:
+            _jy = _yaml.safe_load(_f)
+        bid_ask_enabled = bool((_jy.get("fetcher") or {}).get("fetch_bid_ask", True))
+    except Exception:
+        bid_ask_enabled = True
 
     june_db = _june_fetch_db()
     if not june_db.exists():
@@ -1343,6 +1352,7 @@ def api_fetch_live():
             "SELECT symbol, date, data_type, records_fetched, finished, updated_at"
             " FROM fetch_progress"
         ).fetchall()
+        total_rec = sum(r["records_fetched"] or 0 for r in all_rows)
         con.close()
 
         def _age(upd):
@@ -1438,6 +1448,7 @@ def api_fetch_live():
 
     except Exception as exc:
         log.warning("fetch-live error: %s", exc)
+        total_rec = 0
 
     for sym in symbols:
         for dtype in dtypes:
@@ -1445,7 +1456,31 @@ def api_fetch_live():
                 result[sym][dtype] = {"status": "missing", "records": 0, "pct": None,
                                       "finished": False, "rate_ks": None, "age_s": None}
 
-    return jsonify({"data": result, "symbols": symbols})
+    # ── Global throughput history (records/s over last 1m / 1h / 24h) ──────────
+    _fetch_throughput_hist.append({"ts": now_mono, "records": total_rec})
+    cutoff_24h = now_mono - 86400
+    while _fetch_throughput_hist and _fetch_throughput_hist[0]["ts"] < cutoff_24h:
+        _fetch_throughput_hist.pop(0)
+
+    def _trate(seconds):
+        cutoff = now_mono - seconds
+        past = next((h for h in _fetch_throughput_hist if h["ts"] >= cutoff), None)
+        if not past:
+            return None
+        dt = now_mono - past["ts"]
+        dr = total_rec - past["records"]
+        return round(max(0.0, dr / dt), 1) if dt > 0.5 else None
+
+    throughput = {
+        "rec_s_1m":  _trate(60),
+        "rec_s_1h":  _trate(3600),
+        "rec_s_24h": _trate(86400),
+        "total_rec": total_rec,
+    }
+
+    return jsonify({"data": result, "symbols": symbols,
+                    "bid_ask_enabled": bid_ask_enabled,
+                    "throughput": throughput})
 
 
 @app.route("/api/fetch-start", methods=["POST"])

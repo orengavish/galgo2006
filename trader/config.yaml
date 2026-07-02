@@ -56,7 +56,7 @@ broker:
   ib_poll_seconds: 30
 
 visualizer:
-  host: 127.0.0.1
+  host: 0.0.0.0      # listen on all interfaces — allows access from other devices on LAN
   port: 5001
 
 paths:
