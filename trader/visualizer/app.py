@@ -58,7 +58,9 @@ _cfg = None
 _db_path = None
 _fetch_proc = None        # tracked fetcher process
 _fetch_rate_state = {}    # "SYM_DTYPE" -> {ts, records} for server-side rate
-_fetch_throughput_hist = []  # [{ts: monotonic, records: int}] — global fetch rate history
+_fetch_throughput_hist = []  # [{ts: monotonic, wall_ts: float, total_dl: int}]
+_fetch_last_db_total  = 0   # last total_rec seen from DB (detects resets)
+_fetch_running_dl     = 0   # monotonically increasing downloaded-records counter
 
 
 def _get_cfg():
@@ -1456,30 +1458,47 @@ def api_fetch_live():
                 result[sym][dtype] = {"status": "missing", "records": 0, "pct": None,
                                       "finished": False, "rate_ks": None, "age_s": None}
 
-    # ── Global throughput history (records/s over last 1m / 1h / 24h) ──────────
-    _fetch_throughput_hist.append({"ts": now_mono, "records": total_rec})
+    # ── Global throughput — monotonic counter (immune to DB resets) ─────────────
+    # _fetch_running_dl counts only records fetched since this process started.
+    # On first call we seed the baseline without adding to running_dl, so the
+    # existing 19M+ historical rows don't appear as "just fetched".
+    import time as _time
+    now_wall = _time.time()
+    global _fetch_last_db_total, _fetch_running_dl
+    if _fetch_last_db_total == 0 and _fetch_running_dl == 0:
+        _fetch_last_db_total = total_rec          # seed baseline, count nothing
+    else:
+        _fetch_running_dl   += max(0, total_rec - _fetch_last_db_total)
+        _fetch_last_db_total = total_rec
+
+    _fetch_throughput_hist.append({
+        "ts":       now_mono,
+        "wall_ts":  now_wall,
+        "total_dl": _fetch_running_dl,
+    })
     cutoff_24h = now_mono - 86400
     while _fetch_throughput_hist and _fetch_throughput_hist[0]["ts"] < cutoff_24h:
         _fetch_throughput_hist.pop(0)
 
-    def _trate(seconds):
+    def _past(seconds):
         cutoff = now_mono - seconds
-        past = next((h for h in _fetch_throughput_hist if h["ts"] >= cutoff), None)
-        if not past:
+        return next((h for h in _fetch_throughput_hist if h["ts"] >= cutoff), None)
+
+    def _trate(seconds):
+        p = _past(seconds)
+        if not p:
             return None
-        dt = now_mono - past["ts"]
-        dr = total_rec - past["records"]
+        dt = now_mono - p["ts"]
+        dr = _fetch_running_dl - p["total_dl"]
         return round(max(0.0, dr / dt), 1) if dt > 0.5 else None
 
     def _total(seconds):
-        cutoff = now_mono - seconds
-        past = next((h for h in _fetch_throughput_hist if h["ts"] >= cutoff), None)
-        if past is None:
-            return None
-        return max(0, total_rec - past["records"])
+        p = _past(seconds)
+        return max(0, _fetch_running_dl - p["total_dl"]) if p else None
 
-    midnight_utc = now_utc.replace(hour=0, minute=0, second=0, microsecond=0)
-    secs_since_midnight = max(1, (now_utc - midnight_utc).total_seconds())
+    midnight_wall = now_utc.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+    p_midnight = next((h for h in _fetch_throughput_hist if h["wall_ts"] >= midnight_wall), None)
+    total_since_midnight = (_fetch_running_dl - p_midnight["total_dl"]) if p_midnight else None
 
     throughput = {
         "rec_s_1m":             _trate(60),
@@ -1488,7 +1507,7 @@ def api_fetch_live():
         "total_1m":             _total(60),
         "total_1h":             _total(3600),
         "total_24h":            _total(86400),
-        "total_since_midnight": _total(secs_since_midnight),
+        "total_since_midnight": total_since_midnight,
         "total_rec": total_rec,
     }
 
