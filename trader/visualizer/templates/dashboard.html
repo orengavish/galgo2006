@@ -726,17 +726,19 @@ function _fUpdate(d) {
         rateEl.textContent='—'; rateEl.style.color='#6e7681'; continue;
       }
 
-      const rec    = sd.records||0;
-      const pct    = sd.pct!=null ? sd.pct : 0;
-      const done   = sd.finished;
-      const active = sd.status==='active';
-      const stale  = sd.status==='stale';
+      const rec     = sd.records||0;
+      const pct     = sd.pct!=null ? sd.pct : 0;
+      const done    = sd.finished;
+      const active  = sd.status==='active';
+      const stale   = sd.status==='stale';
+      const partial = sd.status==='partial';
 
       bar.style.width = Math.min(pct,100)+'%';
       bar.className = 'fbar-fill'+(done?' fdone':active?' factive':'');
-      if (done)       bar.style.background='#3fb950';
-      else if (stale) bar.style.background='#9e6a03';
-      else            bar.style.background='#d29922';
+      if (done)         bar.style.background='#3fb950';
+      else if (partial) bar.style.background='#58a6ff';
+      else if (stale)   bar.style.background='#9e6a03';
+      else              bar.style.background='#d29922';
 
       pctEl.textContent = sd.pct!=null ? pct+'%' : '?%';
       const dateHint = sd.cur_date ? ' '+sd.cur_date.slice(5) : (sd.dates ? ` (${sd.dates})` : '');
@@ -745,6 +747,9 @@ function _fUpdate(d) {
 
       if (done) {
         rateEl.textContent='✓'; rateEl.style.color='#3fb950';
+      } else if (partial) {
+        rateEl.textContent = sd.dates ? `(${sd.dates})` : 'partial';
+        rateEl.style.color='#58a6ff';
       } else if (sd.rate_ks!=null && sd.rate_ks>0) {
         rateEl.textContent='+'+sd.rate_ks.toFixed(1)+'k/s'; rateEl.style.color='#d29922';
       } else if (stale) {

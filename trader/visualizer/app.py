@@ -1247,7 +1247,7 @@ def api_fetch_status():
             for r in rows:
                 sym   = r["symbol"]
                 ds    = r["date"]
-                dtype = r["data_type"].lower()   # TRADES -> trades
+                dtype = r["data_type"].lower().replace("_", "")  # BID_ASK → bidask
                 rec   = r["records_fetched"] or 0
                 done  = bool(r["finished"])
                 age_s = None
@@ -1392,11 +1392,16 @@ def api_fetch_live():
         for sym in symbols:
             for dtype in dtypes:
                 rows = by_slot.get((sym, dtype), [])
-                n_total = len(rows)
-                n_done  = sum(1 for r in rows if r["finished"])
+                # Exclude holiday dates from counts so partial holiday fetches don't distort totals
+                rows_trading = [r for r in rows if r["date"] not in _FETCH_HOLIDAYS]
+                n_total = len(rows_trading)
+                n_done  = sum(1 for r in rows_trading if r["finished"])
 
                 # Find the most recently updated unfinished row (what's being fetched now)
-                active_rows = [r for r in rows if not r["finished"]]
+                # Exclude holiday dates so they don't pollute the "current" slot
+                active_rows = [r for r in rows
+                               if not r["finished"]
+                               and r["date"] not in _FETCH_HOLIDAYS]
                 active_rows.sort(key=lambda r: r["updated_at"] or "", reverse=True)
                 active_row = active_rows[0] if active_rows else None
 
@@ -1440,24 +1445,41 @@ def api_fetch_live():
 
                     is_active = age_s is not None and age_s < 90
                     status    = "active" if is_active else "stale"
+                    # For BID_ASK, denominator = total TRADES done (real backfill target)
+                    if dtype == "BID_ASK":
+                        n_needed_all = sum(1 for r in by_slot.get((sym, "TRADES"), [])
+                                           if r["finished"] and r["date"] not in _FETCH_HOLIDAYS)
+                        dates_label = f"{n_done}/{max(n_needed_all, n_total)}"
+                    else:
+                        dates_label = f"{n_done}/{n_total}"
                     result[sym][dtype] = {
                         "status":   status,
                         "records":  rec,
                         "pct":      pct,
                         "finished": False,
-                        "dates":    f"{n_done}/{n_total}",
+                        "dates":    dates_label,
                         "cur_date": active_row["date"],
                         "rate_ks":  rate_ks,
                         "age_s":    age_s,
                     }
                 elif n_done > 0:
+                    # For BID_ASK, denominator = TRADES done for this sym (real backfill target).
+                    # For TRADES, denominator = n_total (already holidays-excluded above).
+                    if dtype == "BID_ASK":
+                        n_needed = sum(1 for r in by_slot.get((sym, "TRADES"), [])
+                                       if r["finished"] and r["date"] not in _FETCH_HOLIDAYS)
+                        n_needed = max(n_needed, n_total)
+                    else:
+                        n_needed = n_total
+                    all_done = (n_done >= n_needed and n_needed > 0)
+                    pct_done = int(n_done / max(n_needed, 1) * 100)
                     result[sym][dtype] = {
-                        "status":  "done",
-                        "records": sum(r["records_fetched"] for r in rows),
-                        "pct":     100,
-                        "finished": True,
-                        "dates":   f"{n_done}/{n_total}",
-                        "rate_ks": None, "age_s": None,
+                        "status":   "done" if all_done else "partial",
+                        "records":  sum(r["records_fetched"] for r in rows),
+                        "pct":      100 if all_done else pct_done,
+                        "finished": all_done,
+                        "dates":    f"{n_done}/{n_needed}",
+                        "rate_ks":  None, "age_s": None,
                     }
                 else:
                     result[sym][dtype] = {
