@@ -56,7 +56,9 @@ _LOCK_FILE = _ROOT / "data" / "fetch_scheduler.lock"
 
 
 def _acquire_lock() -> bool:
-    """Write PID lock file. Returns True if we got the lock, False if another instance is running."""
+    """Atomically write PID lock file using O_CREAT|O_EXCL. Returns True if we got the lock."""
+    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    # First: if lock exists, check if owning process is actually alive
     if _LOCK_FILE.exists():
         try:
             pid = int(_LOCK_FILE.read_text().strip())
@@ -66,11 +68,19 @@ def _acquire_lock() -> bool:
                 if any("fetch_scheduler" in " ".join(p) for p in [proc.cmdline()]):
                     log.warning("Another fetch_scheduler is already running (pid=%d) — exiting", pid)
                     return False
+            # Stale lock (process dead or not fetch_scheduler) — remove it
+            _LOCK_FILE.unlink(missing_ok=True)
         except Exception:
-            pass  # stale lock — overwrite it
-    _LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
-    _LOCK_FILE.write_text(str(os.getpid()))
-    return True
+            _LOCK_FILE.unlink(missing_ok=True)
+    # Atomic create: fails if another process just created it between our check and now
+    try:
+        fd = os.open(str(_LOCK_FILE), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        os.write(fd, str(os.getpid()).encode())
+        os.close(fd)
+        return True
+    except FileExistsError:
+        log.warning("Lost lock race — another fetch_scheduler grabbed it first")
+        return False
 
 
 def _release_lock():
@@ -152,19 +162,19 @@ MIN_TRADES_FOR_PRIORITY = 20  # dates with more verified trades than this go fir
 def _get_priority_dates(cfg, symbols: list) -> list:
     """
     Return list of (symbol, date) pairs to fetch, priority order:
-      P1. Verified-trade dates with n > MIN_TRADES_FOR_PRIORITY — scored immediately by backtrader
-      P2. Yesterday per symbol
-      P3. Verified-trade dates with n <= MIN_TRADES_FOR_PRIORITY — lower value, fetch after yesterday
-      P4. Backfill — last backfill_days trading days, Mon-Fri, most recent first
+      P1. CRITICAL  — dates in verified_trades (ANY symbol), missing CSV for each symbol.
+                      All symbols are fetched for each critical date (needed for correlation).
+      P2. RESUME    — partial files in fetch_progress (finished=0, records>0) not covered by P1.
+      P3. STANDARD  — backfill last backfill_days trading days, most recent first.
     Only considers BID_ASK as missing if fetch_bid_ask is enabled in config.
     Called repeatedly during the fetch loop so priority stays current.
     """
+    import sqlite3 as _sq3
     from pathlib import Path as P
     present    = _present_files(cfg)
     do_bid_ask = bool(getattr(cfg.fetcher, "fetch_bid_ask", True))
     pairs      = []
     seen       = set()
-    _p3_pairs  = []  # verified dates with n <= threshold — inserted after P2
 
     def _is_missing(sym, d):
         if (sym, d, "trades") not in present:
@@ -173,62 +183,83 @@ def _get_priority_dates(cfg, symbols: list) -> list:
             return True
         return False
 
-    # P1 + collect P3: verified_trades dates, sorted by count DESC
+    # ── P1: CRITICAL — verified trade dates, all symbols ─────────────────────
+    # Key insight: MNQ/MYM have no verified trades themselves but we need their
+    # tick data on the same dates as MES verified trades for correlation backtests.
+    # Query dates only (not date+symbol), then add ALL symbols for each date.
+    vt_dates = []
     try:
         from lib.db import get_db
         db_path = P(cfg.paths.db)
         with get_db(db_path) as con:
             rows = con.execute(
-                "SELECT DATE(fill_time) AS d, symbol, COUNT(*) AS n "
-                "FROM verified_trades "
-                "GROUP BY DATE(fill_time), symbol "
-                "ORDER BY n DESC, d DESC"
+                "SELECT DISTINCT DATE(fill_time) AS d FROM verified_trades ORDER BY d ASC"
             ).fetchall()
-        for r in rows:
-            sym, d, n = r["symbol"], r["d"], r["n"]
-            if sym not in symbols:
-                continue
-            if _is_missing(sym, d):
-                key = (sym, d)
-                if key not in seen:
-                    seen.add(key)
-                    if n > MIN_TRADES_FOR_PRIORITY:
-                        pairs.append((sym, date.fromisoformat(d)))
-                    else:
-                        _p3_pairs.append((sym, date.fromisoformat(d)))
+        vt_dates = [r["d"] for r in rows]
     except Exception as e:
         log.warning("Could not query verified_trades: %s", e)
 
-    # P2: yesterday per symbol
-    yesterday = (datetime.now(CT) - timedelta(days=1)).date()
-    yd_str = yesterday.strftime("%Y-%m-%d")
-    for sym in symbols:
-        if _is_missing(sym, yd_str):
-            key = (sym, yd_str)
-            if key not in seen:
-                seen.add(key)
-                pairs.append((sym, yesterday))
+    # Partial files (finished=0, records>0) — needed to promote CRITICAL partials to P1
+    partial_keys: set = set()
+    try:
+        pdb = P(cfg.paths.db).parent / "fetch_progress.db"
+        with _sq3.connect(str(pdb)) as pcon:
+            pcon.row_factory = _sq3.Row
+            partial_rows = pcon.execute(
+                "SELECT symbol, date FROM fetch_progress "
+                "WHERE finished=0 AND records_fetched > 0 ORDER BY updated_at DESC"
+            ).fetchall()
+        for r in partial_rows:
+            if r["symbol"] in symbols:
+                partial_keys.add((r["symbol"], r["date"]))
+    except Exception as e:
+        log.warning("Could not query partial files: %s", e)
 
-    # P3: verified dates with n <= threshold (context, not yet fully scoreable)
-    pairs.extend(_p3_pairs)
+    for d_str in vt_dates:
+        for sym in symbols:
+            # CRITICAL if CSV missing -OR- CSV exists but fetch is unfinished
+            is_unfinished = (sym, d_str) in partial_keys
+            if _is_missing(sym, d_str) or is_unfinished:
+                key = (sym, d_str)
+                if key not in seen:
+                    seen.add(key)
+                    pairs.append((sym, date.fromisoformat(d_str)))
 
-    # P4: backfill — last backfill_days trading days, most recent first
+    # ── P2: RESUME — partial files not already covered by P1 ─────────────────
+    for sym, d_str in sorted(partial_keys):
+        key = (sym, d_str)
+        if key not in seen:
+            seen.add(key)
+            pairs.append((sym, date.fromisoformat(d_str)))
+
+    # ── P3: STANDARD — backfill recent trading days, most recent first ──────────
+    # P3a: trades CSV already present, only bidask missing — fast path, completes
+    #      the day without re-fetching trades (fetcher resumes from last tick instantly).
+    # P3b: trades missing — full fetch needed.
+    # P3a before P3b maximises number of fully complete days produced per unit time.
+    yesterday     = (datetime.now(CT) - timedelta(days=1)).date()
     backfill_days = int(getattr(cfg.fetcher, "backfill_days", 180))
-    if backfill_days > 0:
-        scan_date = yesterday - timedelta(days=1)
-        days_checked = 0
-        while days_checked < backfill_days:
-            if scan_date.weekday() < 5:  # Mon-Fri only
-                d_str = scan_date.strftime("%Y-%m-%d")
-                for sym in symbols:
-                    if _is_missing(sym, d_str):
-                        key = (sym, d_str)
-                        if key not in seen:
-                            seen.add(key)
-                            pairs.append((sym, scan_date))
-                days_checked += 1
-            scan_date -= timedelta(days=1)
+    scan_date     = yesterday
+    days_checked  = 0
+    p3a = []  # bidask-only (trades done)
+    p3b = []  # full fetch  (trades missing)
+    while days_checked < backfill_days:
+        if scan_date.weekday() < 5:  # Mon-Fri only
+            d_str = scan_date.strftime("%Y-%m-%d")
+            for sym in symbols:
+                if _is_missing(sym, d_str):
+                    key = (sym, d_str)
+                    if key not in seen:
+                        seen.add(key)
+                        if (sym, d_str, "trades") in present:
+                            p3a.append((sym, scan_date))
+                        else:
+                            p3b.append((sym, scan_date))
+            days_checked += 1
+        scan_date -= timedelta(days=1)
 
+    pairs.extend(p3a)
+    pairs.extend(p3b)
     return pairs
 
 
@@ -299,9 +330,27 @@ def run(specific_date: date = None, backfill: bool = False,
                                     output_dir=output_dir,
                                     progress_conn=progress_conn)
                 log.info("fetch_day results: %s", results)
+                # If another process is holding the lock on this (sym, date), back off
+                if results and all(v == "skipped_active" for v in results.values()):
+                    log.warning("%s %s held by another fetcher — sleeping 30 s", sym, target_day)
+                    time.sleep(30)
             except Exception as e:
                 log.error("fetch_day %s %s failed: %s", sym, target_day, e)
                 all_ok = False
+                err_str = str(e).lower()
+                if "not connected" in err_str or "connection" in err_str or "disconnect" in err_str:
+                    log.warning("IB disconnected — trying to reconnect in 60 s...")
+                    time.sleep(60)
+                    try:
+                        ib.disconnect()
+                    except Exception:
+                        pass
+                    try:
+                        ib = _connect(cfg)
+                        log.info("Reconnected to IB")
+                    except Exception as re:
+                        log.error("Reconnect failed: %s — will retry in 120 s", re)
+                        time.sleep(120)
                 continue
 
             # Verify + upload each completed file
