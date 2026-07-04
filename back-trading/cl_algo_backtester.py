@@ -234,6 +234,8 @@ def run(db_path: Path, history_dir: Path,
         return {"ready_days": len(ready_days), "combos": len(all_combos),
                 "already_done": done, "dry_run": True}
 
+    from lib.algo_engine import _build_cmds
+
     # Pre-load critical lines per (symbol, date) from DB
     lines_cache: dict[tuple, list[dict]] = {}
     with get_db(db_path) as con:
@@ -259,12 +261,8 @@ def run(db_path: Path, history_dir: Path,
 
         cache_key = (sym, date_str)
         if cache_key not in csv_cache:
-            # Load both CSVs
-            dc = date_str.replace("-", "")
-            t_path = Path(day["trades_path"])
-            b_path = Path(day["bidask_path"])
-            t_df = _load_trades_csv(t_path)
-            b_df = _load_bidask_csv(b_path)
+            t_df = _load_trades_csv(Path(day["trades_path"]))
+            b_df = _load_bidask_csv(Path(day["bidask_path"]))
             csv_cache[cache_key] = (t_df, b_df)
 
         trades_df, bidask_df = csv_cache[cache_key]
@@ -276,11 +274,30 @@ def run(db_path: Path, history_dir: Path,
 
         # Trim CSVs to session window once
         t_session = trades_df[(trades_df["time_utc"] >= signal_time) &
-                              (trades_df["time_utc"] < session_end)]
+                              (trades_df["time_utc"] < session_end)].reset_index(drop=True)
         b_session = None
         if bidask_df is not None:
             b_session = bidask_df[(bidask_df["time_utc"] >= signal_time) &
-                                  (bidask_df["time_utc"] < session_end)]
+                                  (bidask_df["time_utc"] < session_end)].reset_index(drop=True)
+
+        current_price = t_session.iloc[0]["price"] if not t_session.empty else lines[0]["price"]
+
+        # ── OPTIMIZATION: pre-compute entry fills once per (line_price, direction, entry_type)
+        # Entry price does NOT depend on tp/sl — same entry fill for all combos on same line+dir.
+        entry_cache: dict[tuple, tuple] = {}  # (line_price, direction, entry_type) → (fill_p, fill_t, entry_p)
+        for line in lines:
+            lp = line["price"]
+            for direction in ["BUY", "SELL"]:
+                for entry_type in ["LMT", "STP"]:
+                    if entry_type == "LMT":
+                        ep = round(round(lp / _TICK) * _TICK, 10)
+                    else:
+                        ep = round(round((lp + _TICK if direction == "BUY" else lp - _TICK) / _TICK) * _TICK, 10)
+                    fill_p, fill_t = _simulate_entry(
+                        direction, entry_type, ep, signal_time, session_end,
+                        b_session, t_session
+                    )
+                    entry_cache[(lp, direction, entry_type)] = (fill_p, fill_t, ep)
 
         # Fetch already-done unique keys for this (sym, date) to skip fast
         with get_db(db_path) as con:
@@ -290,27 +307,20 @@ def run(db_path: Path, history_dir: Path,
                 " FROM cl_algo_sim_results WHERE symbol=? AND date=?",
                 (sym, date_str)
             ).fetchall()
-        done_set = {
-            (r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in done_rows
-        }
+        done_set = {(r[0], r[1], r[2], r[3], r[4], r[5], r[6]) for r in done_rows}
 
+        batch_all = []
         for combo in all_combos:
-            at = combo["algo_type"]
-            tp = combo["tp_ticks"]
-            sl_t = combo["sl_ticks"]
+            at      = combo["algo_type"]
+            tp      = combo["tp_ticks"]
+            sl_t    = combo["sl_ticks"]
             df_filt = combo["direction_filter"]
-            sm  = combo["strength_max"]
+            sm      = combo["strength_max"]
 
             params = AlgoParams(algo_type=at, tp_ticks=tp, sl_ticks=sl_t,
                                 direction_filter=df_filt, strength_max=sm)
 
-            # Import private helper to get commands without DB insert
-            from lib.algo_engine import _build_cmds
-            batch = []
             for line in lines:
-                # Use open price as current_price (first trade tick)
-                current_price = (t_session.iloc[0]["price"]
-                                 if not t_session.empty else line["price"])
                 cmds = _build_cmds(line, params, current_price)
                 for cmd in cmds:
                     key = (at, tp, sl_t, df_filt, sm, line["price"], cmd["direction"])
@@ -318,39 +328,30 @@ def run(db_path: Path, history_dir: Path,
                         skipped += 1
                         continue
 
-                    fill_p, fill_t = _simulate_entry(
-                        cmd["direction"], cmd["entry_type"],
-                        cmd["entry_price"], signal_time, session_end,
-                        b_session, t_session
+                    # Lookup pre-computed entry fill
+                    fill_p, fill_t, entry_ep = entry_cache.get(
+                        (line["price"], cmd["direction"], cmd["entry_type"]),
+                        (None, None, cmd["entry_price"])
                     )
 
                     if fill_p is None:
-                        batch.append((date_str, sym, at, tp, sl_t, df_filt, sm,
-                                      line["price"], line["line_type"], line["strength"],
-                                      cmd["direction"], cmd["entry_type"],
-                                      cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
-                                      None, None, "EXPIRED", None, None, None))
+                        batch_all.append((date_str, sym, at, tp, sl_t, df_filt, sm,
+                                          line["price"], line["line_type"], line["strength"],
+                                          cmd["direction"], cmd["entry_type"],
+                                          cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
+                                          None, None, "EXPIRED", None, None, None))
                         continue
 
-                    # Adjust TP/SL relative to actual fill price for STP
-                    tp_price = fill_p + tp * _TICK if cmd["direction"] == "BUY" else fill_p - tp * _TICK
-                    sl_price = fill_p - sl_t * _TICK if cmd["direction"] == "BUY" else fill_p + sl_t * _TICK
-                    tp_price = round(round(tp_price / _TICK) * _TICK, 10)
-                    sl_price = round(round(sl_price / _TICK) * _TICK, 10)
-
-                    # Trades from fill onwards
-                    post_fill = t_session[t_session["time_utc"] > fill_t]
-                    if post_fill.empty:
-                        batch.append((date_str, sym, at, tp, sl_t, df_filt, sm,
-                                      line["price"], line["line_type"], line["strength"],
-                                      cmd["direction"], cmd["entry_type"],
-                                      cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
-                                      fill_p, fill_t.isoformat(),
-                                      "EXPIRED", None, None, None))
-                        continue
+                    # TP/SL relative to actual fill price (matters for STP where fill includes slippage)
+                    if cmd["direction"] == "BUY":
+                        tp_price = round(round((fill_p + tp   * _TICK) / _TICK) * _TICK, 10)
+                        sl_price = round(round((fill_p - sl_t * _TICK) / _TICK) * _TICK, 10)
+                    else:
+                        tp_price = round(round((fill_p - tp   * _TICK) / _TICK) * _TICK, 10)
+                        sl_price = round(round((fill_p + sl_t * _TICK) / _TICK) * _TICK, 10)
 
                     try:
-                        result = sim.simulate_exit(
+                        result  = sim.simulate_exit(
                             fill_price=fill_p, fill_time=fill_t,
                             tp_price=tp_price, sl_price=sl_price,
                             direction=cmd["direction"],
@@ -359,48 +360,48 @@ def run(db_path: Path, history_dir: Path,
                         )
                         exit_r  = result["exit_type"]
                         exit_fp = result["exit_fill_price"]
-                        pnl = None
-                        ticks_ex = None
+                        pnl, ticks_ex = None, None
                         if exit_fp is not None:
                             diff = (exit_fp - fill_p) if cmd["direction"] == "BUY" else (fill_p - exit_fp)
-                            pnl = round(diff / _TICK, 4)
+                            pnl  = round(diff / _TICK, 4)
                             exit_t = result["exit_fill_time"]
                             if exit_t:
                                 ticks_ex = len(t_session[
                                     (t_session["time_utc"] > fill_t) &
                                     (t_session["time_utc"] <= exit_t)
                                 ])
-                        batch.append((date_str, sym, at, tp, sl_t, df_filt, sm,
-                                      line["price"], line["line_type"], line["strength"],
-                                      cmd["direction"], cmd["entry_type"],
-                                      cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
-                                      fill_p, fill_t.isoformat(),
-                                      exit_r, exit_fp, pnl, ticks_ex))
+                        batch_all.append((date_str, sym, at, tp, sl_t, df_filt, sm,
+                                          line["price"], line["line_type"], line["strength"],
+                                          cmd["direction"], cmd["entry_type"],
+                                          cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
+                                          fill_p, fill_t.isoformat(),
+                                          exit_r, exit_fp, pnl, ticks_ex))
                     except Exception:
                         errors += 1
-                        batch.append((date_str, sym, at, tp, sl_t, df_filt, sm,
-                                      line["price"], line["line_type"], line["strength"],
-                                      cmd["direction"], cmd["entry_type"],
-                                      cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
-                                      fill_p, fill_t.isoformat(),
-                                      "ERROR", None, None, None))
+                        batch_all.append((date_str, sym, at, tp, sl_t, df_filt, sm,
+                                          line["price"], line["line_type"], line["strength"],
+                                          cmd["direction"], cmd["entry_type"],
+                                          cmd["entry_price"], cmd["tp_price"], cmd["sl_price"],
+                                          fill_p, fill_t.isoformat(),
+                                          "ERROR", None, None, None))
 
-            if batch:
-                with get_db(db_path) as con:
-                    con.executemany("""
-                        INSERT OR IGNORE INTO cl_algo_sim_results
-                            (date, symbol, algo_type, tp_ticks, sl_ticks,
-                             direction_filter, strength_max,
-                             line_price, line_type, line_strength,
-                             direction, entry_type,
-                             entry_price, tp_price, sl_price,
-                             entry_fill_price, entry_fill_time,
-                             exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit)
-                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-                    """, batch)
-                written += len(batch)
-                if verbose:
-                    print(f"  {sym} {date_str} {at} tp={tp} sl={sl_t}: {len(batch)} written")
+        # Flush entire day's batch at once (one DB write per day)
+        if batch_all:
+            with get_db(db_path) as con:
+                con.executemany("""
+                    INSERT OR IGNORE INTO cl_algo_sim_results
+                        (date, symbol, algo_type, tp_ticks, sl_ticks,
+                         direction_filter, strength_max,
+                         line_price, line_type, line_strength,
+                         direction, entry_type,
+                         entry_price, tp_price, sl_price,
+                         entry_fill_price, entry_fill_time,
+                         exit_reason, exit_fill_price, pnl_ticks, ticks_to_exit)
+                    VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """, batch_all)
+            written += len(batch_all)
+            if verbose:
+                print(f"  {sym} {date_str}: {len(batch_all)} rows written")
 
     elapsed = round(time.monotonic() - t0, 1)
     return {"ready_days": len(ready_days), "combos": len(all_combos),

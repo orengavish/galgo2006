@@ -1,0 +1,257 @@
+{% extends "base.html" %}
+{% block title %}Algo Results — Galao{% endblock %}
+
+{% block content %}
+<style>
+.metric{text-align:right;font-family:monospace}
+.rank-badge{display:inline-block;width:28px;text-align:center;
+            padding:1px 4px;border-radius:10px;font-size:10px;
+            background:#1a4731;color:#3fb950;font-weight:bold}
+.rank-badge.top3{background:#0d3a20;border:1px solid #3fb950}
+.converged{color:#3fb950;font-weight:bold}
+.exploring{color:#d29922}
+.narrowing{color:#58a6ff}
+.status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;margin-right:4px}
+.dot-ok{background:#3fb950}
+.dot-insuff{background:#d29922}
+.dot-nofill{background:#f85149}
+.heat-tp,.heat-sl{font-size:11px;color:#79c0ff;font-weight:bold}
+#top-summary{display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin-bottom:14px}
+.summary-card{background:#161b22;border:1px solid #30363d;border-radius:6px;
+              padding:8px 12px;text-align:center}
+.summary-card .val{font-size:22px;font-weight:bold;color:#3fb950;margin-top:4px}
+.summary-card .lbl{font-size:10px;color:#6e7681;text-transform:uppercase}
+.history-row{font-size:11px;padding:3px 8px}
+#run-pipeline-btn{
+  background:#1a4731;color:#3fb950;border:1px solid #2ea043;
+  padding:6px 20px;border-radius:4px;cursor:pointer;font-family:monospace;font-size:12px
+}
+#run-pipeline-btn:hover{background:#0d3a20}
+#run-pipeline-btn:disabled{opacity:0.5;cursor:default}
+</style>
+
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+  <div>
+    <h2 style="margin:0">CL Algo Results</h2>
+    <div style="font-size:11px;color:#6e7681;margin-top:2px">
+      Cartesian combo rankings — run pipeline to update
+    </div>
+  </div>
+  <div style="display:flex;align-items:center;gap:12px">
+    <label style="font-size:12px;color:#8b949e">Symbol:</label>
+    <select id="sym-sel" style="width:80px">
+      {% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+    </select>
+    <button id="run-pipeline-btn">Run Pipeline</button>
+    <span id="pipeline-msg" style="font-size:11px;color:#8b949e"></span>
+  </div>
+</div>
+
+<!-- Top 5 summary cards -->
+<div id="top-summary">
+  <div class="summary-card"><div class="lbl">Top Algo</div><div class="val" id="top-algo">—</div></div>
+  <div class="summary-card"><div class="lbl">Best TP/SL</div><div class="val" id="top-tpsl">—</div></div>
+  <div class="summary-card"><div class="lbl">Profit Factor</div><div class="val" id="top-pf">—</div></div>
+  <div class="summary-card"><div class="lbl">Expectancy</div><div class="val" id="top-exp">—</div></div>
+  <div class="summary-card"><div class="lbl">Status</div><div class="val" id="conv-status">—</div></div>
+</div>
+
+<div style="display:grid;grid-template-columns:1fr 280px;gap:14px;align-items:start">
+
+  <!-- Main results table -->
+  <div class="card" style="padding:10px">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+      <div style="font-size:12px;color:#8b949e;font-weight:bold">
+        Ranked Combos
+        <span id="n-combos" style="font-weight:normal;color:#6e7681;margin-left:6px">—</span>
+      </div>
+      <div style="font-size:11px;color:#6e7681" id="scored-at">—</div>
+    </div>
+    <div style="overflow-x:auto">
+      <table id="results-table">
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Algo</th>
+            <th>TP</th>
+            <th>SL</th>
+            <th>Dir</th>
+            <th>Str</th>
+            <th>Fills</th>
+            <th>WR%</th>
+            <th>PF</th>
+            <th>Exp (t)</th>
+            <th>SQN</th>
+            <th>Score</th>
+          </tr>
+        </thead>
+        <tbody id="results-body">
+          <tr><td colspan="12" style="text-align:center;color:#6e7681;padding:20px">
+            Select a symbol and load results.
+          </td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+  <!-- Right panel: convergence history + learner state -->
+  <div>
+    <div class="card" style="padding:10px;margin-bottom:10px">
+      <div style="font-size:12px;color:#8b949e;font-weight:bold;margin-bottom:8px">
+        Score History
+      </div>
+      <div id="history-wrap">
+        <div style="color:#6e7681;font-size:11px">—</div>
+      </div>
+    </div>
+
+    <div class="card" style="padding:10px">
+      <div style="font-size:12px;color:#8b949e;font-weight:bold;margin-bottom:6px">
+        Next Run Grid
+      </div>
+      <div id="next-grid" style="font-size:11px;color:#6e7681">
+        Run pipeline to generate recommendations.
+      </div>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+const sym = () => document.getElementById('sym-sel').value;
+
+function fmtPct(v){ return v == null ? '—' : (v*100).toFixed(1)+'%' }
+function fmt2(v){   return v == null ? '—' : parseFloat(v).toFixed(2) }
+function fmt4(v){   return v == null ? '—' : parseFloat(v).toFixed(4) }
+
+function loadResults(){
+  fetch(`/api/cl-algo-scores?symbol=${sym()}&limit=200`)
+    .then(r=>r.json())
+    .then(rows=>{
+      const tbody = document.getElementById('results-body');
+      const n = rows.length;
+      document.getElementById('n-combos').textContent = n ? `${n} combos` : 'no data';
+      if(!n){
+        tbody.innerHTML = '<tr><td colspan="12" style="text-align:center;color:#6e7681;padding:20px">No simulation results yet. Run pipeline to generate.</td></tr>';
+        return;
+      }
+
+      // Update summary cards
+      const ok = rows.filter(r=>r.data_status==='ok');
+      if(ok.length){
+        const top = ok[0];
+        document.getElementById('top-algo').textContent = top.algo_type;
+        document.getElementById('top-tpsl').textContent = `${top.tp_ticks}t/${top.sl_ticks}t`;
+        document.getElementById('top-pf').textContent   = fmt2(top.profit_factor);
+        document.getElementById('top-exp').textContent  = fmt2(top.expectancy)+'t';
+      }
+
+      tbody.innerHTML = rows.slice(0,100).map(r=>{
+        const isTop3 = r.rank <= 3 && r.data_status === 'ok';
+        const dotCls = r.data_status==='ok'?'dot-ok':r.data_status==='insufficient_data'?'dot-insuff':'dot-nofill';
+        return `<tr>
+          <td>${r.rank ? `<span class="rank-badge${isTop3?' top3':''}">
+            ${r.rank}</span>` : '<span style="color:#6e7681">—</span>'}</td>
+          <td style="color:#79c0ff;font-weight:bold">${r.algo_type}</td>
+          <td class="metric heat-tp">${r.tp_ticks}t</td>
+          <td class="metric heat-sl">${r.sl_ticks}t</td>
+          <td style="font-size:11px;color:#8b949e">${r.direction_filter.replace('_ONLY','')}</td>
+          <td style="text-align:center;color:#6e7681">${r.strength_max}</td>
+          <td class="metric"><span class="status-dot ${dotCls}"></span>${r.n_fills}</td>
+          <td class="metric">${fmtPct(r.win_rate)}</td>
+          <td class="metric" style="${r.profit_factor>1.5?'color:#3fb950':r.profit_factor<1?'color:#f85149':''}">
+            ${fmt2(r.profit_factor)}</td>
+          <td class="metric" style="${r.expectancy>0?'color:#3fb950':r.expectancy<0?'color:#f85149':''}">
+            ${fmt2(r.expectancy)}</td>
+          <td class="metric">${fmt2(r.sqn)}</td>
+          <td class="metric" style="color:#58a6ff;font-weight:bold">${fmt4(r.composite_score)}</td>
+        </tr>`;
+      }).join('');
+    }).catch(e=>{
+      document.getElementById('results-body').innerHTML =
+        `<tr><td colspan="12" style="color:#f85149;padding:10px">${e}</td></tr>`;
+    });
+}
+
+function loadHistory(){
+  fetch(`/api/cl-algo-score-history?symbol=${sym()}&limit=10`)
+    .then(r=>r.json())
+    .then(rows=>{
+      const el = document.getElementById('history-wrap');
+      const cs = document.getElementById('conv-status');
+      if(!rows.length){ el.innerHTML = '<div style="color:#6e7681;font-size:11px">—</div>'; return; }
+      const latest = rows[0];
+      const cls = latest.convergence_status || 'exploring';
+      cs.textContent = cls.toUpperCase();
+      cs.className = `val ${cls}`;
+
+      el.innerHTML = `<table style="width:100%;font-size:11px;border-collapse:collapse">
+        <thead><tr>
+          <th style="color:#6e7681;text-align:left;padding:2px 4px">Time</th>
+          <th style="color:#6e7681;padding:2px 4px">N</th>
+          <th style="color:#6e7681;padding:2px 4px">Top Algo</th>
+          <th style="color:#6e7681;padding:2px 4px">TP/SL</th>
+          <th style="color:#6e7681;padding:2px 4px">Score</th>
+        </tr></thead>
+        <tbody>${rows.map(r=>`<tr class="history-row">
+          <td style="color:#6e7681">${(r.scored_at||'').slice(11,16)}</td>
+          <td style="text-align:center">${r.n_combos_scored}</td>
+          <td style="color:#79c0ff">${r.top_algo_type||'—'}</td>
+          <td style="text-align:center">${r.top_tp_ticks||'—'}/${r.top_sl_ticks||'—'}</td>
+          <td style="text-align:center;color:#58a6ff">${r.top_composite_score?parseFloat(r.top_composite_score).toFixed(3):'—'}</td>
+        </tr>`).join('')}</tbody>
+      </table>`;
+
+      // Next grid from learner_state (read from latest learner run if available)
+      loadNextGrid();
+    }).catch(()=>{});
+}
+
+function loadNextGrid(){
+  // Show next recommended params from last learner run via a custom scan
+  fetch(`/api/cl-algo-scores?symbol=${sym()}&limit=1`)
+    .then(r=>r.json())
+    .then(rows=>{
+      const el = document.getElementById('next-grid');
+      if(!rows.length){ el.textContent = 'No learner data yet.'; return; }
+      el.innerHTML = `<div style="color:#8b949e">See <code>docs/learner_state.md</code> for next-run params.</div>
+        <div style="margin-top:6px;color:#6e7681">
+          Run pipeline again to iterate. Each run adds new parameter combinations.
+        </div>`;
+    }).catch(()=>{});
+}
+
+document.getElementById('sym-sel').addEventListener('change', ()=>{
+  loadResults(); loadHistory();
+});
+
+document.getElementById('run-pipeline-btn').addEventListener('click', ()=>{
+  const btn = document.getElementById('run-pipeline-btn');
+  const msg = document.getElementById('pipeline-msg');
+  btn.disabled = true;
+  msg.textContent = 'Starting pipeline...';
+  msg.style.color = '#8b949e';
+  fetch('/api/cl-algo-run-pipeline', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({symbol: sym()})
+  })
+  .then(r=>r.json())
+  .then(d=>{
+    if(d.error){ msg.textContent = 'Error: '+d.error; msg.style.color='#f85149'; }
+    else {
+      msg.textContent = `Running (pid=${d.pid})... refresh in ~30s`;
+      msg.style.color = '#3fb950';
+      setTimeout(()=>{ loadResults(); loadHistory(); btn.disabled=false; }, 35000);
+    }
+  })
+  .catch(e=>{ msg.textContent = String(e); msg.style.color='#f85149'; btn.disabled=false; });
+});
+
+// Auto-load
+loadResults();
+loadHistory();
+setInterval(()=>{ loadResults(); loadHistory(); }, 30000);
+</script>
+{% endblock %}

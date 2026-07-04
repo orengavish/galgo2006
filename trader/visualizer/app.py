@@ -2358,6 +2358,79 @@ def api_cl_algo_runs():
     return jsonify(rows)
 
 
+@app.route("/cl-algo-results")
+def cl_algo_results_page():
+    syms = _cfg.symbols if _cfg else ["MES", "MNQ", "MYM", "M2K"]
+    return render_template("cl_algo_results.html", active="cl_algo", symbols=syms)
+
+
+@app.route("/api/cl-algo-scores")
+def api_cl_algo_scores():
+    """GET /api/cl-algo-scores?symbol=MES&limit=100 → ranked combos from latest scoring run."""
+    sym   = request.args.get("symbol", "MES")
+    limit = min(int(request.args.get("limit", 100)), 2880)
+    db_path = _get_db_path()
+    with get_db(db_path) as con:
+        # Latest scored_at for this symbol
+        ts_row = con.execute(
+            "SELECT MAX(scored_at) FROM cl_algo_combo_scores WHERE symbol=?", (sym,)
+        ).fetchone()
+        if not ts_row or not ts_row[0]:
+            return jsonify([])
+        latest = ts_row[0]
+        rows = con.execute("""
+            SELECT algo_type, tp_ticks, sl_ticks, direction_filter, strength_max,
+                   n_sims, n_fills, n_tp, n_sl,
+                   win_rate, profit_factor, expectancy, sharpe, sqn,
+                   composite_score, rank, data_status
+            FROM cl_algo_combo_scores
+            WHERE symbol=? AND scored_at=?
+            ORDER BY rank ASC NULLS LAST, composite_score DESC NULLS LAST
+            LIMIT ?
+        """, (sym, latest, limit)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/cl-algo-score-history")
+def api_cl_algo_score_history():
+    """GET /api/cl-algo-score-history?symbol=MES → score_history rows newest first."""
+    sym   = request.args.get("symbol", "MES")
+    limit = min(int(request.args.get("limit", 20)), 100)
+    db_path = _get_db_path()
+    with get_db(db_path) as con:
+        rows = con.execute("""
+            SELECT scored_at, n_combos_scored,
+                   top_algo_type, top_tp_ticks, top_sl_ticks,
+                   top_direction_filter, top_strength_max,
+                   top_composite_score, convergence_status
+            FROM cl_algo_score_history
+            WHERE symbol=?
+            ORDER BY scored_at DESC LIMIT ?
+        """, (sym, limit)).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/cl-algo-run-pipeline", methods=["POST"])
+def api_cl_algo_run_pipeline():
+    """POST /api/cl-algo-run-pipeline — trigger one pipeline run in background."""
+    import subprocess, sys as _sys
+    body = request.get_json(silent=True) or {}
+    sym  = body.get("symbol", "MES")
+    db_path = _get_db_path()
+    pipeline = _ROOT / "back-trading" / "run_cl_algo_pipeline.py"
+    if not pipeline.exists():
+        return jsonify({"error": "pipeline script not found"}), 404
+    try:
+        proc = subprocess.Popen(
+            [_sys.executable, str(pipeline), "--symbol", sym],
+            cwd=str(_ROOT),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+        )
+        return jsonify({"status": "started", "pid": proc.pid, "symbol": sym})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 def _get_current_price():
     """Return (price, ts) from price feed, or (None, None)."""
     try:
