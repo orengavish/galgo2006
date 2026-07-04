@@ -240,6 +240,20 @@
         </div>
       </div>
 
+      <!-- Next full day ETA strip -->
+      <div style="display:flex;align-items:center;gap:8px;padding:4px 0;
+                  border-bottom:1px solid #21262d;margin-bottom:6px;flex-wrap:wrap">
+        <span style="font-size:9px;color:#6e7681;text-transform:uppercase;
+                     letter-spacing:.4px;white-space:nowrap">Next full day</span>
+        <span id="dash-eta-date"  style="font-size:12px;font-weight:700;
+                                          font-family:monospace;color:#3fb950">—</span>
+        <span id="dash-eta-human" style="font-size:11px;font-family:monospace;
+                                          color:#d29922"></span>
+        <span id="dash-eta-n"     style="font-size:9px;color:#6e7681;font-family:monospace"></span>
+        <a href="/fetch-status" style="margin-left:auto;font-size:9px;color:#6e7681;
+                                        text-decoration:none">details →</a>
+      </div>
+
       <div id="fetch-grid" style="flex:1;display:grid;grid-template-columns:1fr 1fr 1fr;grid-template-rows:1fr;gap:8px;min-height:0">
 
         <!-- MES -->
@@ -842,5 +856,23 @@ function afToggle() {
   fetch('/api/auto-fill').then(r=>r.json()).then(_afRender).catch(()=>{});
   setTimeout(pollAutoFill, 10000);
 })();
+
+// ── Next full day ETA (compact strip) ────────────────────────────────────────
+function loadDashETA(){
+  fetch('/api/fetch-eta').then(r=>r.json()).then(d=>{
+    if(d.error) return;
+    const dateEl  = document.getElementById('dash-eta-date');
+    const humanEl = document.getElementById('dash-eta-human');
+    const nEl     = document.getElementById('dash-eta-n');
+    if(!dateEl) return;
+    dateEl.textContent  = d.next_full_date || (d.n_complete > 0 ? '✓ done' : '—');
+    humanEl.textContent = d.eta_seconds > 0 ? d.eta_human : (d.n_complete > 0 ? '' : '');
+    nEl.textContent     = d.n_complete != null ? `(${d.n_complete} done)` : '';
+    if(d.n_complete > 0)
+      dateEl.style.color = d.eta_seconds <= 0 ? '#3fb950' : '#c9d1d9';
+  }).catch(()=>{});
+}
+loadDashETA();
+setInterval(loadDashETA, 60000);
 </script>
 {% endblock %}

@@ -26,6 +26,55 @@
   <span id="fetch-msg" style="font-size:11px;color:#8b949e"></span>
 </div>
 
+{# ── Next Full Day ETA ─────────────────────────────────────────────────────── #}
+<div id="eta-card" class="card" style="margin-bottom:12px;padding:10px 16px">
+  <div style="display:flex;align-items:center;gap:16px;flex-wrap:wrap">
+
+    <!-- Date + ETA -->
+    <div>
+      <div style="font-size:9px;color:#8b949e;text-transform:uppercase;
+                  letter-spacing:.08em;margin-bottom:4px">Next Full Day (T+B · all 3 syms)</div>
+      <div style="display:flex;align-items:baseline;gap:8px">
+        <span id="eta-date" style="font-size:22px;font-weight:700;
+                                   font-family:monospace;color:#3fb950">—</span>
+        <span id="eta-ready"  style="font-size:13px;color:#3fb950;display:none;font-weight:bold">✓ Ready!</span>
+        <span id="eta-human"  style="font-size:15px;font-family:monospace;color:#d29922"></span>
+        <span id="eta-rate"   style="font-size:10px;color:#6e7681;font-family:monospace"></span>
+      </div>
+    </div>
+
+    <!-- Divider -->
+    <div style="width:1px;height:44px;background:#21262d;flex-shrink:0"></div>
+
+    <!-- Current file bar -->
+    <div id="eta-cur-wrap" style="display:none;min-width:180px">
+      <div style="font-size:9px;color:#8b949e;text-transform:uppercase;
+                  letter-spacing:.08em;margin-bottom:3px">Now Fetching</div>
+      <div id="eta-cur-info" style="font-size:12px;font-family:monospace;color:#58a6ff"></div>
+      <div style="height:4px;background:#21262d;border-radius:2px;margin-top:5px">
+        <div id="eta-cur-bar" style="height:100%;border-radius:2px;
+                                     background:#58a6ff;transition:width .5s;width:0%"></div>
+      </div>
+    </div>
+
+    <!-- Pipeline chips -->
+    <div id="eta-pipeline" style="display:flex;gap:5px;align-items:center;
+                                   flex-wrap:wrap;flex:1;min-width:0"></div>
+
+    <!-- Divider -->
+    <div style="width:1px;height:44px;background:#21262d;flex-shrink:0"></div>
+
+    <!-- Complete count -->
+    <div style="text-align:right">
+      <div style="font-size:9px;color:#8b949e;text-transform:uppercase;
+                  letter-spacing:.08em;margin-bottom:4px">Full Days Done</div>
+      <div id="eta-n-complete"
+           style="font-size:22px;font-weight:700;font-family:monospace;color:#6e7681">—</div>
+    </div>
+
+  </div>
+</div>
+
 {# ── Split: Current File + Queue ───────────────────────────────────────────── #}
 <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px">
 
@@ -401,12 +450,85 @@ function doFetchStop(){
   }).catch(()=>{});
 }
 
+// ── ETA ───────────────────────────────────────────────────────────────────────
+function _fmtSec(sec){
+  if(sec<=0)     return 'now';
+  if(sec<60)     return `~${Math.round(sec)}s`;
+  if(sec<3600)   return `~${Math.round(sec/60)}min`;
+  if(sec<86400)  return `~${(sec/3600).toFixed(1)}h`;
+  return `~${(sec/86400).toFixed(1)}d`;
+}
+
+function loadETA(){
+  fetch('/api/fetch-eta').then(r=>r.json()).then(d=>{
+    if(d.error) return;
+
+    // Date
+    const dateEl = document.getElementById('eta-date');
+    dateEl.textContent = d.next_full_date || '—';
+
+    // ETA
+    const humanEl = document.getElementById('eta-human');
+    const readyEl = document.getElementById('eta-ready');
+    if(!d.next_full_date || d.eta_seconds <= 0){
+      humanEl.textContent = '';
+      readyEl.style.display = d.n_complete > 0 ? '' : 'none';
+    } else {
+      readyEl.style.display = 'none';
+      humanEl.textContent = d.eta_human;
+    }
+
+    // Rate
+    document.getElementById('eta-rate').textContent =
+      d.rate_recps ? `${d.rate_human}/min` : '';
+
+    // Current file bar
+    const curWrap = document.getElementById('eta-cur-wrap');
+    if(d.current){
+      curWrap.style.display = '';
+      document.getElementById('eta-cur-info').textContent =
+        `${d.current.sym} ${d.current.date} ${d.current.dtype} — ${d.current.pct||0}%`;
+      document.getElementById('eta-cur-bar').style.width = `${d.current.pct||0}%`;
+    } else {
+      curWrap.style.display = 'none';
+    }
+
+    // Pipeline chips
+    const pipe = document.getElementById('eta-pipeline');
+    if(d.files_before && d.files_before.length){
+      pipe.innerHTML = d.files_before.map(f => {
+        const color   = f.is_current ? '#58a6ff' : '#6e7681';
+        const border  = f.is_current ? '#1f6feb' : '#30363d';
+        const bg      = f.is_current ? '#0d1d33' : '#161b22';
+        const label   = f.dtype === 'BID_ASK' ? 'B' : 'T';
+        const timeStr = _fmtSec(f.est_sec);
+        return `<div title="${f.sym} ${f.date} ${f.dtype}"
+                     style="font-family:monospace;font-size:10px;
+                            padding:2px 6px;border-radius:3px;
+                            border:1px solid ${border};background:${bg};
+                            color:${color};white-space:nowrap">
+                  <b>${f.sym}</b>&nbsp;${f.date.slice(5)}&nbsp;${label}
+                  <span style="color:${color};opacity:.7">&nbsp;${timeStr}</span>
+                </div>`;
+      }).join('');
+    } else {
+      pipe.innerHTML = '<span style="font-size:11px;color:#3fb950">all done — full day ready!</span>';
+    }
+
+    // Complete count
+    document.getElementById('eta-n-complete').textContent =
+      d.n_complete != null ? d.n_complete : '—';
+  }).catch(()=>{});
+}
+
 // ── Polling ──────────────────────────────────────────────────────────────────
 updateQueue();
 loadGrid();
 loadProcStatus();
+loadETA();
 setInterval(updateQueue,    5000);
 setInterval(loadGrid,       8000);
 setInterval(loadProcStatus, 10000);
+setInterval(loadETA,        30000);
 </script>
 {% endblock %}
