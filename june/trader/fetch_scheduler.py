@@ -377,19 +377,24 @@ def run(specific_date: date = None, backfill: bool = False,
                                     progress_conn=progress_conn)
                 log.info("fetch_day results: %s", results)
 
-                # Another process is actively fetching this (sym, date).
-                # Put it in cooldown (120 s = grace_seconds in _is_actively_running) and
-                # move on to other targets rather than blocking the whole queue.
-                if results and all(v == "skipped_active" for v in results.values()):
+                # Any dtype came back as skipped_active → another fetch is in progress
+                # (or _mark_started just touched the timestamp on this process's first attempt).
+                # Put the whole (sym, date) into cooldown so we don't spin.
+                if results and any(v == "skipped_active" for v in results.values()):
                     key = (sym, str(target_day))
                     _active_cooldowns[key] = time.time() + 120
-                    log.warning("%s %s — active in another process; "
+                    log.warning("%s %s — skipped_active on ≥1 dtype; "
                                 "cooldown 120s, moving to next target", sym, target_day)
                     continue   # skip verification — nothing was written
 
             except Exception as e:
                 log.error("fetch_day %s %s failed: %s", sym, target_day, e)
                 all_ok = False
+                # Add a short cooldown so we don't immediately retry the same target.
+                # _mark_started may have refreshed updated_at which would otherwise cause
+                # an infinite skipped_active loop on the very next iteration.
+                key = (sym, str(target_day))
+                _active_cooldowns[key] = time.time() + 60
                 err_str = str(e).lower()
                 if "not connected" in err_str or "connection" in err_str or "disconnect" in err_str:
                     log.warning("IB disconnected — trying to reconnect in 60 s...")
