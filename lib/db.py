@@ -199,6 +199,88 @@ CREATE TABLE IF NOT EXISTS algo_runs (
     created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
 );
 
+CREATE TABLE IF NOT EXISTS cl_algo_sim_results (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    date                TEXT    NOT NULL,
+    symbol              TEXT    NOT NULL,
+    algo_type           TEXT    NOT NULL,
+    tp_ticks            INTEGER NOT NULL,
+    sl_ticks            INTEGER NOT NULL,
+    direction_filter    TEXT    NOT NULL DEFAULT 'ALL',
+    strength_max        INTEGER NOT NULL DEFAULT 3,
+    line_price          REAL    NOT NULL,
+    line_type           TEXT    NOT NULL,
+    line_strength       INTEGER NOT NULL,
+    direction           TEXT    NOT NULL,
+    entry_type          TEXT    NOT NULL,
+    entry_price         REAL    NOT NULL,
+    tp_price            REAL    NOT NULL,
+    sl_price            REAL    NOT NULL,
+    entry_fill_price    REAL,
+    entry_fill_time     TEXT,
+    exit_reason         TEXT,
+    exit_fill_price     REAL,
+    pnl_ticks           REAL,
+    ticks_to_exit       INTEGER,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+    UNIQUE(date, symbol, algo_type, tp_ticks, sl_ticks,
+           direction_filter, strength_max, line_price, direction)
+);
+
+CREATE TABLE IF NOT EXISTS cl_algo_combo_scores (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    scored_at           TEXT    NOT NULL,
+    symbol              TEXT    NOT NULL,
+    algo_type           TEXT    NOT NULL,
+    tp_ticks            INTEGER NOT NULL,
+    sl_ticks            INTEGER NOT NULL,
+    direction_filter    TEXT    NOT NULL DEFAULT 'ALL',
+    strength_max        INTEGER NOT NULL DEFAULT 3,
+    n_sims              INTEGER NOT NULL DEFAULT 0,
+    n_fills             INTEGER NOT NULL DEFAULT 0,
+    n_tp                INTEGER NOT NULL DEFAULT 0,
+    n_sl                INTEGER NOT NULL DEFAULT 0,
+    n_expired_exit      INTEGER NOT NULL DEFAULT 0,
+    win_rate            REAL,
+    profit_factor       REAL,
+    expectancy          REAL,
+    sharpe              REAL,
+    sqn                 REAL,
+    composite_score     REAL,
+    rank                INTEGER,
+    data_status         TEXT    NOT NULL DEFAULT 'ok',
+    UNIQUE(scored_at, symbol, algo_type, tp_ticks, sl_ticks, direction_filter, strength_max)
+);
+
+CREATE TABLE IF NOT EXISTS cl_algo_score_history (
+    id                      INTEGER PRIMARY KEY AUTOINCREMENT,
+    scored_at               TEXT    NOT NULL,
+    symbol                  TEXT    NOT NULL,
+    n_combos_scored         INTEGER NOT NULL DEFAULT 0,
+    top_algo_type           TEXT,
+    top_tp_ticks            INTEGER,
+    top_sl_ticks            INTEGER,
+    top_direction_filter    TEXT,
+    top_strength_max        INTEGER,
+    top_composite_score     REAL,
+    convergence_status      TEXT    NOT NULL DEFAULT 'exploring'
+);
+
+CREATE TABLE IF NOT EXISTS cl_algo_learner_runs (
+    id                          INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_at                      TEXT    NOT NULL,
+    symbol                      TEXT    NOT NULL,
+    iteration                   INTEGER NOT NULL DEFAULT 0,
+    recommended_tp_ticks        TEXT,
+    recommended_sl_ticks        TEXT,
+    all_algo_types              INTEGER NOT NULL DEFAULT 1,
+    all_direction_filters       INTEGER NOT NULL DEFAULT 1,
+    all_strength_max            INTEGER NOT NULL DEFAULT 1,
+    convergence_status          TEXT    NOT NULL DEFAULT 'exploring',
+    reasoning                   TEXT,
+    created_at                  TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_commands_status      ON commands(status);
 CREATE INDEX IF NOT EXISTS idx_commands_symbol      ON commands(symbol);
 CREATE INDEX IF NOT EXISTS idx_positions_status     ON positions(status);
@@ -207,6 +289,9 @@ CREATE INDEX IF NOT EXISTS idx_fetch_log_sd         ON fetch_log(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_completed_source     ON completed_trades(source);
 CREATE INDEX IF NOT EXISTS idx_completed_exit_time  ON completed_trades(exit_time);
 CREATE INDEX IF NOT EXISTS idx_algo_runs_sym_date   ON algo_runs(symbol, date);
+CREATE INDEX IF NOT EXISTS idx_cl_sim_sym_date      ON cl_algo_sim_results(symbol, date);
+CREATE INDEX IF NOT EXISTS idx_cl_sim_combo         ON cl_algo_sim_results(algo_type, tp_ticks, sl_ticks);
+CREATE INDEX IF NOT EXISTS idx_cl_scores_sym        ON cl_algo_combo_scores(symbol, scored_at);
 """
 
 
@@ -321,6 +406,55 @@ def _migrate(path: Path = None):
             created_at         TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
         )""",
         "CREATE INDEX IF NOT EXISTS idx_algo_runs_sym_date ON algo_runs(symbol, date)",
+        # CL algo tables
+        """CREATE TABLE IF NOT EXISTS cl_algo_sim_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT NOT NULL, symbol TEXT NOT NULL,
+            algo_type TEXT NOT NULL, tp_ticks INTEGER NOT NULL, sl_ticks INTEGER NOT NULL,
+            direction_filter TEXT NOT NULL DEFAULT 'ALL', strength_max INTEGER NOT NULL DEFAULT 3,
+            line_price REAL NOT NULL, line_type TEXT NOT NULL, line_strength INTEGER NOT NULL,
+            direction TEXT NOT NULL, entry_type TEXT NOT NULL,
+            entry_price REAL NOT NULL, tp_price REAL NOT NULL, sl_price REAL NOT NULL,
+            entry_fill_price REAL, entry_fill_time TEXT,
+            exit_reason TEXT, exit_fill_price REAL, pnl_ticks REAL, ticks_to_exit INTEGER,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now')),
+            UNIQUE(date,symbol,algo_type,tp_ticks,sl_ticks,direction_filter,strength_max,line_price,direction)
+        )""",
+        """CREATE TABLE IF NOT EXISTS cl_algo_combo_scores (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scored_at TEXT NOT NULL, symbol TEXT NOT NULL,
+            algo_type TEXT NOT NULL, tp_ticks INTEGER NOT NULL, sl_ticks INTEGER NOT NULL,
+            direction_filter TEXT NOT NULL DEFAULT 'ALL', strength_max INTEGER NOT NULL DEFAULT 3,
+            n_sims INTEGER NOT NULL DEFAULT 0, n_fills INTEGER NOT NULL DEFAULT 0,
+            n_tp INTEGER NOT NULL DEFAULT 0, n_sl INTEGER NOT NULL DEFAULT 0,
+            n_expired_exit INTEGER NOT NULL DEFAULT 0,
+            win_rate REAL, profit_factor REAL, expectancy REAL, sharpe REAL, sqn REAL,
+            composite_score REAL, rank INTEGER, data_status TEXT NOT NULL DEFAULT 'ok',
+            UNIQUE(scored_at,symbol,algo_type,tp_ticks,sl_ticks,direction_filter,strength_max)
+        )""",
+        """CREATE TABLE IF NOT EXISTS cl_algo_score_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scored_at TEXT NOT NULL, symbol TEXT NOT NULL,
+            n_combos_scored INTEGER NOT NULL DEFAULT 0,
+            top_algo_type TEXT, top_tp_ticks INTEGER, top_sl_ticks INTEGER,
+            top_direction_filter TEXT, top_strength_max INTEGER, top_composite_score REAL,
+            convergence_status TEXT NOT NULL DEFAULT 'exploring'
+        )""",
+        """CREATE TABLE IF NOT EXISTS cl_algo_learner_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            run_at TEXT NOT NULL, symbol TEXT NOT NULL,
+            iteration INTEGER NOT NULL DEFAULT 0,
+            recommended_tp_ticks TEXT, recommended_sl_ticks TEXT,
+            all_algo_types INTEGER NOT NULL DEFAULT 1,
+            all_direction_filters INTEGER NOT NULL DEFAULT 1,
+            all_strength_max INTEGER NOT NULL DEFAULT 1,
+            convergence_status TEXT NOT NULL DEFAULT 'exploring',
+            reasoning TEXT,
+            created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+        )""",
+        "CREATE INDEX IF NOT EXISTS idx_cl_sim_sym_date ON cl_algo_sim_results(symbol, date)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_sim_combo ON cl_algo_sim_results(algo_type, tp_ticks, sl_ticks)",
+        "CREATE INDEX IF NOT EXISTS idx_cl_scores_sym ON cl_algo_combo_scores(symbol, scored_at)",
     ]
     with get_db(path) as con:
         for stmt in alter_stmts:
@@ -531,7 +665,9 @@ def self_test() -> bool:
                     "SELECT name FROM sqlite_master WHERE type='table'"
                 ).fetchall()}
             expected = {"commands", "positions", "ib_events", "system_state",
-                        "critical_lines", "release_notes", "fetch_log", "completed_trades"}
+                        "critical_lines", "release_notes", "fetch_log", "completed_trades",
+                        "cl_algo_sim_results", "cl_algo_combo_scores",
+                        "cl_algo_score_history", "cl_algo_learner_runs"}
             assert expected <= tables, f"Missing tables: {expected - tables}"
 
             # 2. WAL mode is active
