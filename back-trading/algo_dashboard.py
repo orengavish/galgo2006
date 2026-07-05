@@ -467,9 +467,11 @@ def api_submit():
 
     db_path = _resolve_db()
     with get_db(db_path) as con:
+        # Only count algo_dashboard commands toward the cap — trader orders are separate
         active = con.execute(
             "SELECT COUNT(*) FROM commands"
-            " WHERE status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
+            " WHERE source='algo_dashboard'"
+            " AND status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
         ).fetchone()[0]
 
     n_orders = sum(2 if c["entry_type"] == "LMT+STP" else 1 for c in cands)
@@ -565,7 +567,8 @@ def api_algo_stats():
             GROUP BY symbol
         """).fetchall()
         total_active = con.execute(
-            "SELECT COUNT(*) FROM commands WHERE status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
+            "SELECT COUNT(*) FROM commands WHERE source='algo_dashboard'"
+            " AND status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
         ).fetchone()[0]
     by_sym = {r["symbol"]: dict(r) for r in rows}
     return jsonify({"by_symbol": by_sym, "total_active": total_active, "max": _MAX_CMDS})
