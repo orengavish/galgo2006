@@ -1,0 +1,236 @@
+{% extends "base.html" %}
+{% block title %}Trades — Algo{% endblock %}
+
+{% block content %}
+<style>
+#stats-bar{display:flex;align-items:center;gap:16px;margin-bottom:12px;flex-wrap:wrap}
+.sym-counter{font-size:13px;color:#8b949e}
+.sym-counter span{color:#c9d1d9;font-weight:bold}
+.sym-counter .z{color:#6e7681}
+#limit-bar{font-size:12px;color:#6e7681;margin-left:auto}
+#limit-bar b{color:#58a6ff}
+#filters{display:flex;gap:8px;align-items:center;margin-bottom:10px;flex-wrap:wrap}
+#filters label{font-size:11px;color:#6e7681}
+.pnl-pos{color:#3fb950}
+.pnl-neg{color:#f85149}
+.pnl-zero{color:#8b949e}
+</style>
+
+<!-- Stats bar -->
+<div id="stats-bar">
+  {% for s in symbols %}
+  <div class="sym-counter" id="cnt-{{ s }}">
+    {{ s }}:<span id="cnt-{{ s }}-n" class="z">0</span>
+  </div>
+  {% endfor %}
+  <span style="color:#30363d">/</span>
+  <div style="font-size:12px;color:#8b949e">
+    <span id="total-n">0</span>/<span id="total-max">400</span>
+  </div>
+  <div style="margin-left:auto;font-size:11px;color:#f85149;font-weight:bold">
+    Auto-Fill: <span style="text-decoration:line-through;opacity:0.5">OFF</span>
+    <span style="opacity:0.4;font-size:10px">(disabled in algo mode)</span>
+  </div>
+  <button class="btn-neutral" onclick="loadTrades()" style="font-size:11px;padding:3px 10px">
+    Refresh
+  </button>
+</div>
+
+<!-- Filters -->
+<div id="filters">
+  <label>Symbol:</label>
+  <select id="f-sym" onchange="loadTrades()">
+    <option value="">All</option>
+    {% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+  </select>
+  <label>Status:</label>
+  <select id="f-status" onchange="loadTrades()">
+    <option value="">All</option>
+    <option value="PENDING">PENDING</option>
+    <option value="SUBMITTED">SUBMITTED</option>
+    <option value="FILLED">FILLED</option>
+    <option value="CLOSED">CLOSED</option>
+    <option value="ERROR">ERROR</option>
+  </select>
+  <label>Algo:</label>
+  <select id="f-algo" onchange="filterByAlgo()">
+    <option value="">All</option>
+    <option value="FULL_DUPLEX">Full-Duplex</option>
+    <option value="BOUNCE">BOUNCE</option>
+    <option value="BREAKOUT">BREAKOUT</option>
+    <option value="DIRECTIONAL">DIRECTIONAL</option>
+    <option value="FADE">FADE</option>
+    <option value="BOTH">BOTH</option>
+  </select>
+  <label>Dir:</label>
+  <select id="f-dir" onchange="filterByAlgo()">
+    <option value="">Both</option>
+    <option value="BUY">BUY</option>
+    <option value="SELL">SELL</option>
+  </select>
+  <span id="filter-info" style="font-size:11px;color:#6e7681;margin-left:4px"></span>
+</div>
+
+<!-- Trades table -->
+<div class="card" style="padding:10px">
+  <div style="overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Sym</th><th>Class</th><th>Algo</th>
+          <th>Dir</th><th>Type</th>
+          <th>Entry</th><th>TP</th><th>SL</th><th>Bkt</th>
+          <th>Status</th><th>Fill</th><th>P&L</th><th>Updated</th>
+        </tr>
+      </thead>
+      <tbody id="trades-body">
+        <tr><td colspan="14" style="text-align:center;color:#6e7681;padding:20px">
+          Loading...
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let _allTrades = [];
+
+function statusClass(s){
+  return {PENDING:'s-pending',SUBMITTED:'s-submitted',FILLED:'s-filled',
+          CLOSED:'s-closed',ERROR:'s-error'}[s] || '';
+}
+
+function fmtPnl(pnl){
+  if(pnl==null) return '<span class="pnl-zero">—</span>';
+  const cls = pnl>0?'pnl-pos':pnl<0?'pnl-neg':'pnl-zero';
+  return `<span class="${cls}">${pnl>0?'+':''}${parseFloat(pnl).toFixed(2)}t</span>`;
+}
+
+function inferClass(row){
+  // If source is algo_dashboard we can't tell FD vs HD from commands table alone
+  // Use line_type heuristic: FD entry = line_price ± 0.25
+  const diff = Math.abs(row.entry_price - row.line_price);
+  return diff <= 0.26 ? 'FD' : 'HD';
+}
+
+function renderTrades(rows){
+  const tbody = document.getElementById('trades-body');
+  if(!rows.length){
+    tbody.innerHTML = '<tr><td colspan="14" style="text-align:center;color:#6e7681;padding:20px">No trades found</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r=>{
+    const cls   = inferClass(r);
+    const badge = cls==='FD'?'<span class="class-fd">FD</span>':'<span class="class-hd">HD</span>';
+    const dir   = r.direction==='BUY'
+      ? '<span class="dir-buy">BUY</span>'
+      : '<span class="dir-sell">SELL</span>';
+    const fill  = r.fill_price ? r.fill_price.toFixed(2) : '—';
+    const pnl   = fmtPnl(r.pnl_points);
+    const upd   = (r.updated_at||'').slice(11,16);
+    const scls  = statusClass(r.status);
+    return `<tr onclick="showDetail(${r.id})" title="Click for detail">
+      <td style="color:#6e7681">${r.id}</td>
+      <td>${r.symbol}</td>
+      <td>${badge}</td>
+      <td style="color:#79c0ff;font-size:11px">${r.line_type||'—'}</td>
+      <td>${dir}</td>
+      <td style="color:#8b949e">${r.entry_type}</td>
+      <td style="font-weight:bold">${r.entry_price.toFixed(2)}</td>
+      <td style="color:#3fb950">${r.tp_price.toFixed(2)}</td>
+      <td style="color:#f85149">${r.sl_price.toFixed(2)}</td>
+      <td style="color:#6e7681">${r.bracket_size.toFixed(2)}</td>
+      <td class="${scls}">${r.status}</td>
+      <td style="color:#8b949e">${fill}</td>
+      <td>${pnl}</td>
+      <td style="color:#6e7681;font-size:11px">${upd}</td>
+    </tr>`;
+  }).join('');
+}
+
+function filterByAlgo(){
+  const algo = document.getElementById('f-algo').value;
+  const dir  = document.getElementById('f-dir').value;
+  let rows = _allTrades;
+  if(dir)  rows = rows.filter(r=>r.direction===dir);
+  if(algo){
+    if(algo==='FULL_DUPLEX'){
+      rows = rows.filter(r=>inferClass(r)==='FD');
+    } else {
+      rows = rows.filter(r=>r.line_type===algo); // best approximation from commands table
+    }
+  }
+  document.getElementById('filter-info').textContent =
+    rows.length < _allTrades.length ? `(${rows.length} of ${_allTrades.length} shown)` : '';
+  renderTrades(rows);
+}
+
+async function loadTrades(){
+  const sym    = document.getElementById('f-sym').value;
+  const status = document.getElementById('f-status').value;
+  let url = '/api/algo/trades?limit=500';
+  if(sym)    url += `&symbol=${sym}`;
+  if(status) url += `&status=${status}`;
+  try {
+    const r = await fetch(url);
+    _allTrades = await r.json();
+    filterByAlgo();
+  } catch(e){ console.error(e); }
+}
+
+async function loadStats(){
+  try {
+    const r = await fetch('/api/algo/stats');
+    const d = await r.json();
+    document.getElementById('total-n').textContent   = d.total_active;
+    document.getElementById('total-max').textContent = d.max;
+    for(const [sym, info] of Object.entries(d.by_symbol||{})){
+      const el = document.getElementById(`cnt-${sym}-n`);
+      if(el){
+        el.textContent = info.active||0;
+        el.className = (info.active||0)>0 ? '' : 'z';
+      }
+    }
+  } catch(e){}
+}
+
+async function showDetail(id){
+  try {
+    const r = await fetch(`/api/algo/trade/${id}`);
+    const d = await r.json();
+    const kv = (k,v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v??'—'}</div></div>`;
+    const line = d.critical_line;
+    document.getElementById('modal-title').textContent =
+      `#${d.id} | ${d.symbol} ${d.direction} @ ${(d.entry_price||0).toFixed(2)}`;
+    document.getElementById('modal-body').innerHTML = `
+      ${kv('Status', `<span class="${statusClass(d.status)}">${d.status}</span>`)}
+      ${kv('Symbol', d.symbol)}
+      ${kv('Direction', d.direction)}
+      ${kv('Entry Type / Price', `${d.entry_type} @ ${(d.entry_price||0).toFixed(2)}`)}
+      ${kv('TP / SL', `${(d.tp_price||0).toFixed(2)} / ${(d.sl_price||0).toFixed(2)}`)}
+      ${kv('Bracket', `${(d.bracket_size||0).toFixed(2)} pts`)}
+      ${kv('Fill Price', d.fill_price ? d.fill_price.toFixed(2) : '—')}
+      ${kv('Fill Time', d.fill_time || '—')}
+      ${kv('Exit Price', d.exit_price ? d.exit_price.toFixed(2) : '—')}
+      ${kv('Exit Reason', d.exit_reason || '—')}
+      ${kv('P&L', d.pnl_points != null ? (d.pnl_points>0?'+':'')+d.pnl_points.toFixed(2)+' pts' : '—')}
+      <hr style="border-color:#30363d;margin:8px 0">
+      ${line ? kv('Origin Line', `${line.line_type} @ ${line.price} (str ${line.strength})`) : ''}
+      ${kv('Line Price (cmd)', `${(d.line_price||0).toFixed(2)}`)}
+      ${kv('Line Type (cmd)', d.line_type||'—')}
+      ${kv('Source', d.source||'—')}
+      ${kv('IB Order ID', d.ib_order_id||'—')}
+      ${kv('Created', d.created_at||'—')}
+      ${kv('Updated', d.updated_at||'—')}
+    `;
+    document.getElementById('modal-overlay').classList.add('open');
+  } catch(e){ console.error(e); }
+}
+
+loadTrades();
+loadStats();
+setInterval(()=>{ loadTrades(); loadStats(); }, 10000);
+</script>
+{% endblock %}

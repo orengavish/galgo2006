@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8">
+  <title>{% block title %}Algo Dashboard{% endblock %}</title>
+  <style>
+    *{box-sizing:border-box;margin:0;padding:0}
+    body{font-family:monospace;background:#0d1117;color:#c9d1d9;font-size:13px}
+    a{color:#58a6ff;text-decoration:none}
+    a:hover{text-decoration:underline}
+    button{font-family:monospace;cursor:pointer;border:none;padding:5px 14px;
+           border-radius:4px;font-size:12px}
+    button:disabled{opacity:0.4;cursor:not-allowed}
+    select,input[type=text]{font-family:monospace;font-size:12px;
+           background:#161b22;color:#c9d1d9;border:1px solid #30363d;
+           border-radius:3px;padding:3px 6px}
+
+    /* ── Nav ── */
+    #topbar{background:#161b22;border-bottom:1px solid #30363d;
+            display:flex;align-items:center;padding:0 16px;height:44px;gap:0}
+    #topbar .logo{color:#58a6ff;font-weight:bold;font-size:15px;margin-right:24px;
+                  white-space:nowrap}
+    #topbar a{color:#8b949e;padding:0 12px;height:44px;display:flex;align-items:center;
+              border-bottom:2px solid transparent;font-size:12px}
+    #topbar a:hover{color:#c9d1d9;text-decoration:none}
+    #topbar a.active{color:#f0f6fc;border-bottom-color:#58a6ff}
+    #price-widget{margin-left:auto;display:flex;align-items:center;gap:10px}
+    #price-val{font-size:18px;font-weight:bold;color:#3fb950}
+    #price-val.stale{color:#8b949e}
+    #price-age{font-size:11px;color:#8b949e}
+    .price-badge{padding:2px 8px;border-radius:10px;font-size:10px;font-weight:bold}
+    .price-badge.live{background:#1a4731;color:#3fb950}
+    .price-badge.delayed{background:#3d2f00;color:#d29922}
+    .price-badge.unavailable{background:#4a1a1a;color:#f85149}
+
+    /* ── Layout ── */
+    #main{padding:16px 20px}
+    h2{color:#79c0ff;margin:14px 0 8px 0;font-size:14px}
+    h3{color:#8b949e;font-size:12px;margin:10px 0 6px 0}
+
+    /* ── Cards ── */
+    .card{background:#161b22;border:1px solid #30363d;border-radius:6px;padding:12px}
+
+    /* ── Tables ── */
+    table{border-collapse:collapse;width:100%}
+    th{background:#161b22;color:#8b949e;padding:5px 8px;text-align:left;
+       font-size:11px;border-bottom:1px solid #30363d}
+    td{padding:4px 8px;border-bottom:1px solid #161b22;font-size:12px;
+       white-space:nowrap}
+    tr:hover td{background:#1c2128;cursor:pointer}
+
+    /* ── Status colors ── */
+    .s-pending{color:#d29922}
+    .s-submitted{color:#58a6ff}
+    .s-filled{color:#3fb950}
+    .s-closed{color:#8b949e}
+    .s-error{color:#f85149}
+    .dir-buy{color:#3fb950;font-weight:bold}
+    .dir-sell{color:#f85149;font-weight:bold}
+    .class-fd{color:#79c0ff;font-size:10px;background:#0d2240;
+              padding:1px 5px;border-radius:8px}
+    .class-hd{color:#d29922;font-size:10px;background:#2d2000;
+              padding:1px 5px;border-radius:8px}
+    .src-cl{color:#3fb950;font-size:10px}
+    .src-avg{color:#d29922;font-size:10px}
+    .src-bkt{color:#8b949e;font-size:10px}
+
+    /* ── Buttons ── */
+    .btn-primary{background:#1a4731;color:#3fb950;border:1px solid #2ea043}
+    .btn-primary:hover:not(:disabled){background:#0d3a20}
+    .btn-danger{background:#4a1a1a;color:#f85149;border:1px solid #f85149}
+    .btn-neutral{background:#21262d;color:#c9d1d9;border:1px solid #30363d}
+    .btn-neutral:hover:not(:disabled){background:#30363d}
+    .btn-blue{background:#0d2240;color:#58a6ff;border:1px solid #1f6feb}
+    .btn-blue:hover:not(:disabled){background:#1f6feb22}
+
+    /* ── Modal ── */
+    #modal-overlay{display:none;position:fixed;top:0;left:0;width:100%;height:100%;
+                   background:rgba(0,0,0,0.7);z-index:100;align-items:center;justify-content:center}
+    #modal-overlay.open{display:flex}
+    #modal{background:#161b22;border:1px solid #30363d;border-radius:8px;
+           padding:20px;min-width:480px;max-width:600px;max-height:80vh;overflow-y:auto}
+    #modal h3{color:#79c0ff;font-size:14px;margin-bottom:12px}
+    .modal-close{float:right;color:#8b949e;font-size:18px;cursor:pointer;line-height:1}
+    .modal-close:hover{color:#f85149}
+    .kv{display:grid;grid-template-columns:160px 1fr;gap:3px 10px;font-size:12px;margin-bottom:4px}
+    .kv .k{color:#6e7681}
+    .kv .v{color:#c9d1d9;font-weight:bold}
+
+    /* ── Misc ── */
+    .msg{font-size:11px;color:#8b949e;margin-left:10px}
+    .msg.ok{color:#3fb950}
+    .msg.err{color:#f85149}
+    .sep{width:1px;height:20px;background:#30363d;margin:0 8px}
+  </style>
+</head>
+<body>
+<div id="topbar">
+  <div class="logo">Algo Dashboard</div>
+  <a href="/" class="{% if active=='dashboard' %}active{% endif %}">Dashboard</a>
+  <a href="/trades" class="{% if active=='trades' %}active{% endif %}">Trades</a>
+  <div class="sep"></div>
+  <a href="http://127.0.0.1:5001" target="_blank" style="font-size:11px;color:#6e7681">
+    Trader &rarr;
+  </a>
+  <div id="price-widget">
+    <div>
+      <div id="price-val">--</div>
+      <div id="price-age">connecting...</div>
+    </div>
+    <span id="price-badge" class="price-badge unavailable">--</span>
+  </div>
+</div>
+
+<div id="main">
+  {% block content %}{% endblock %}
+</div>
+
+<div id="modal-overlay">
+  <div id="modal">
+    <span class="modal-close" onclick="closeModal()">&times;</span>
+    <h3 id="modal-title">Trade Detail</h3>
+    <div id="modal-body"></div>
+  </div>
+</div>
+
+<script>
+function closeModal(){ document.getElementById('modal-overlay').classList.remove('open') }
+document.getElementById('modal-overlay').addEventListener('click', e=>{
+  if(e.target===document.getElementById('modal-overlay')) closeModal();
+});
+
+// Price polling
+let _priceSymbol = 'MES';
+function pollPrice(){
+  fetch(`/api/price?symbol=${_priceSymbol}`)
+    .then(r=>r.json())
+    .then(d=>{
+      const el = document.getElementById('price-val');
+      const badge = document.getElementById('price-badge');
+      const age = document.getElementById('price-age');
+      if(d.price){
+        el.textContent = d.price.toFixed(2);
+        el.className = '';
+        badge.textContent = d.source.toUpperCase();
+        badge.className = `price-badge ${d.source}`;
+        age.textContent = d.age_s != null ? `${d.age_s.toFixed(0)}s ago` : 'cached';
+      } else {
+        el.textContent = '--'; el.className = 'stale';
+        badge.textContent = 'NO PRICE'; badge.className = 'price-badge unavailable';
+        age.textContent = 'no data';
+      }
+    }).catch(()=>{});
+}
+pollPrice();
+setInterval(pollPrice, 5000);
+</script>
+{% block scripts %}{% endblock %}
+</body>
+</html>

@@ -1,0 +1,248 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Algo{% endblock %}
+
+{% block content %}
+<style>
+#controls{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+#sym-checks label{display:inline-flex;align-items:center;gap:4px;
+                  margin-right:12px;cursor:pointer;font-size:12px;color:#c9d1d9}
+#sym-checks input[type=checkbox]{accent-color:#58a6ff}
+#stats-bar{display:flex;gap:20px;margin-bottom:12px}
+.stat-card{background:#161b22;border:1px solid #30363d;border-radius:5px;
+           padding:6px 14px;text-align:center;min-width:80px}
+.stat-card .sv{font-size:18px;font-weight:bold;color:#58a6ff}
+.stat-card .sl{font-size:10px;color:#6e7681;text-transform:uppercase}
+#cands-header{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px}
+#cands-info{font-size:11px;color:#6e7681}
+#submit-row{display:flex;align-items:center;gap:12px;margin-top:12px;padding-top:12px;
+            border-top:1px solid #30363d}
+.score-bar{display:inline-block;height:6px;background:#1f6feb;border-radius:3px;vertical-align:middle;margin-right:4px}
+.score-prox{display:inline-block;height:6px;background:#2ea043;border-radius:3px;vertical-align:middle}
+</style>
+
+<!-- Controls row -->
+<div id="controls">
+  <div id="sym-checks">
+    {% for s in symbols %}
+    <label>
+      <input type="checkbox" name="sym" value="{{ s }}" {% if s == 'MES' %}checked{% endif %}>
+      {{ s }}
+    </label>
+    {% endfor %}
+  </div>
+  <button class="btn-blue" id="btn-create" onclick="createTrades()">Create Trades</button>
+  <span class="msg" id="create-msg"></span>
+</div>
+
+<!-- Stats bar -->
+<div id="stats-bar">
+  <div class="stat-card"><div class="sv" id="n-generated">—</div><div class="sl">Generated</div></div>
+  <div class="stat-card"><div class="sv" id="n-shown">—</div><div class="sl">Shown (top)</div></div>
+  <div class="stat-card"><div class="sv" id="n-fd">—</div><div class="sl">Full-Duplex</div></div>
+  <div class="stat-card"><div class="sv" id="n-hd">—</div><div class="sl">Half-Duplex</div></div>
+  <div class="stat-card"><div class="sv" id="stat-date">—</div><div class="sl">Lines Date</div></div>
+</div>
+
+<!-- Candidates table -->
+<div class="card">
+  <div id="cands-header">
+    <div style="font-size:12px;color:#8b949e;font-weight:bold">Candidates</div>
+    <div id="cands-info">Run Create Trades to populate</div>
+  </div>
+  <div style="overflow-x:auto">
+    <table id="cands-table">
+      <thead>
+        <tr>
+          <th>#</th><th>Type</th><th>Sym</th><th>Algo</th>
+          <th>Dir</th><th>ET</th>
+          <th>Entry</th><th>TP</th><th>SL</th><th>Bkt</th>
+          <th>TP-src</th><th>SL-src</th>
+          <th>Score</th><th>Prox</th>
+        </tr>
+      </thead>
+      <tbody id="cands-body">
+        <tr><td colspan="14" style="text-align:center;color:#6e7681;padding:20px">
+          Select symbols and click Create Trades
+        </td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Submit row -->
+  <div id="submit-row">
+    <button class="btn-primary" id="btn-submit" onclick="submitTrades()" disabled>
+      Submit All
+    </button>
+    <span style="font-size:11px;color:#6e7681" id="limit-info">—/400 active</span>
+    <span class="msg" id="submit-msg"></span>
+    <div style="margin-left:auto;font-size:11px;color:#6e7681">
+      Auto-Fill: <span style="color:#f85149;font-weight:bold">OFF (disabled)</span>
+    </div>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+let _candidates = [];
+
+function getSelectedSymbols(){
+  return [...document.querySelectorAll('#sym-checks input:checked')].map(i=>i.value);
+}
+
+async function createTrades(){
+  const syms = getSelectedSymbols();
+  if(!syms.length){ alert('Select at least one symbol'); return; }
+
+  const btn = document.getElementById('btn-create');
+  const msg = document.getElementById('create-msg');
+  btn.disabled = true;
+  msg.textContent = 'Generating...'; msg.className = 'msg';
+
+  try {
+    const r = await fetch('/api/algo/create', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({symbols: syms})
+    });
+    const d = await r.json();
+    if(!r.ok){ throw new Error(d.error || 'Server error'); }
+
+    _candidates = d.candidates;
+    renderCandidates(d.candidates, d.meta);
+    msg.textContent = `${d.meta.n_returned} candidates ready`;
+    msg.className = 'msg ok';
+    document.getElementById('btn-submit').disabled = false;
+
+    // Update price symbol to first selected
+    _priceSymbol = syms[0];
+    pollPrice();
+    loadStats();
+  } catch(e){
+    msg.textContent = e.message; msg.className = 'msg err';
+  }
+  btn.disabled = false;
+}
+
+function srcBadge(src){
+  if(src==='critical_line') return '<span class="src-cl">CL</span>';
+  if(src==='2hr_avg_fallback') return '<span class="src-avg">AVG</span>';
+  return '<span class="src-bkt">BKT</span>';
+}
+
+function renderCandidates(cands, meta){
+  const tbody = document.getElementById('cands-body');
+  if(!cands.length){
+    tbody.innerHTML = '<tr><td colspan="14" style="color:#6e7681;text-align:center;padding:16px">No candidates</td></tr>';
+    return;
+  }
+
+  document.getElementById('n-generated').textContent = meta.n_generated || cands.length;
+  document.getElementById('n-shown').textContent     = cands.length;
+  document.getElementById('n-fd').textContent        = cands.filter(c=>c.command_class==='FD').length;
+  document.getElementById('n-hd').textContent        = cands.filter(c=>c.command_class==='HD').length;
+  document.getElementById('stat-date').textContent   = (meta.date||'—').slice(5); // MM-DD
+
+  tbody.innerHTML = cands.map(c => {
+    const cls  = c.command_class==='FD'
+      ? '<span class="class-fd">FD</span>'
+      : '<span class="class-hd">HD</span>';
+    const dir  = c.direction==='BUY'
+      ? '<span class="dir-buy">BUY</span>'
+      : '<span class="dir-sell">SELL</span>';
+    const algo = c.algo_type==='FULL_DUPLEX'
+      ? '<span style="color:#6e7681">full-duplex</span>'
+      : `<span style="color:#79c0ff">${c.algo_type}</span>`;
+    const bw   = Math.round((c.combined_score||0)*60);
+    const pw   = Math.round((c.proximity||0)*40);
+    return `<tr onclick="showDetail(${c.rank-1})">
+      <td style="color:#6e7681">${c.rank}</td>
+      <td>${cls}</td>
+      <td>${c.symbol}</td>
+      <td>${algo}</td>
+      <td>${dir}</td>
+      <td style="color:#8b949e">${c.entry_type}</td>
+      <td style="color:#c9d1d9;font-weight:bold">${c.entry_price.toFixed(2)}</td>
+      <td style="color:#3fb950">${c.tp_price.toFixed(2)}</td>
+      <td style="color:#f85149">${c.sl_price.toFixed(2)}</td>
+      <td style="color:#8b949e">${c.bracket.toFixed(2)}</td>
+      <td>${srcBadge(c.tp_source)}</td>
+      <td>${srcBadge(c.sl_source)}</td>
+      <td>
+        <span class="score-bar" style="width:${bw}px"></span>
+        <span class="score-prox" style="width:${pw}px"></span>
+        <span style="color:#58a6ff;margin-left:4px">${(c.combined_score||0).toFixed(3)}</span>
+      </td>
+      <td style="color:#2ea043">${((c.proximity||0)*100).toFixed(0)}%</td>
+    </tr>`;
+  }).join('');
+
+  // Update info bar
+  document.getElementById('cands-info').textContent =
+    `${cands.length} candidates | ${meta.n_lines||'?'} armed lines | ${meta.date||'?'}`;
+}
+
+function showDetail(idx){
+  const c = _candidates[idx];
+  if(!c) return;
+  const kv = (k,v) => `<div class="kv"><div class="k">${k}</div><div class="v">${v??'—'}</div></div>`;
+  document.getElementById('modal-title').textContent =
+    `${c.command_class} | ${c.symbol} ${c.direction} @ ${c.entry_price.toFixed(2)}`;
+  document.getElementById('modal-body').innerHTML = `
+    ${kv('Rank', c.rank)}
+    ${kv('Class', c.command_class === 'FD' ? 'Full-Duplex (structural exit)' : 'Half-Duplex (combo matrix)')}
+    ${kv('Symbol / Date', `${c.symbol} / ${c.date}`)}
+    ${kv('Algo Type', c.algo_type)}
+    ${c.tp_ticks  ? kv('TP / SL ticks', `${c.tp_ticks}t / ${c.sl_ticks}t`) : ''}
+    ${c.direction_filter ? kv('Dir filter / Strength', `${c.direction_filter} / ${c.strength_max}`) : ''}
+    <hr style="border-color:#30363d;margin:8px 0">
+    ${kv('Entry Line', `${c.entry_line_type} @ ${c.entry_line_price} (str ${c.entry_line_strength})`)}
+    ${kv('Entry Type / Price', `${c.entry_type} @ ${c.entry_price.toFixed(2)}`)}
+    ${kv('TP Price', `${c.tp_price.toFixed(2)} [${c.tp_source}${c.tp_line_price ? ' line @ '+c.tp_line_price.toFixed(2) : ''}]`)}
+    ${kv('SL Price', `${c.sl_price.toFixed(2)} [${c.sl_source}${c.sl_line_price ? ' line @ '+c.sl_line_price.toFixed(2) : ''}]`)}
+    ${kv('Bracket', `${c.bracket.toFixed(2)} pts`)}
+    ${kv('2hr Avg Move', `${(c.avg_move||0).toFixed(2)} pts`)}
+    <hr style="border-color:#30363d;margin:8px 0">
+    ${kv('Combined Score', (c.combined_score||0).toFixed(4))}
+    ${kv('Hist Score (60%)', (c.hist_score||0).toFixed(4))}
+    ${kv('Proximity (40%)', ((c.proximity||0)*100).toFixed(1)+'%')}
+    ${kv('Historical N', c.hist_n||0)}
+    ${kv('Hist P&L (avg)', c.hist_n ? (c.hist_raw||0).toFixed(2)+'t' : 'no data')}
+  `;
+  document.getElementById('modal-overlay').classList.add('open');
+}
+
+async function submitTrades(){
+  const btn = document.getElementById('btn-submit');
+  const msg = document.getElementById('submit-msg');
+  btn.disabled = true;
+  msg.textContent = 'Submitting...'; msg.className = 'msg';
+  try {
+    const r = await fetch('/api/algo/submit', {method:'POST'});
+    const d = await r.json();
+    if(!r.ok){ throw new Error(d.error || 'Submit failed'); }
+    msg.textContent = `${d.submitted} commands submitted. Go to Trades tab.`;
+    msg.className = 'msg ok';
+    _candidates = [];
+    document.getElementById('cands-body').innerHTML =
+      '<tr><td colspan="14" style="text-align:center;color:#3fb950;padding:20px">'
+      +`Submitted ${d.submitted} commands — view in Trades tab</td></tr>`;
+    loadStats();
+  } catch(e){
+    msg.textContent = e.message; msg.className = 'msg err';
+    btn.disabled = false;
+  }
+}
+
+async function loadStats(){
+  try {
+    const r = await fetch('/api/algo/stats');
+    const d = await r.json();
+    document.getElementById('limit-info').textContent =
+      `${d.total_active}/${d.max} active`;
+  } catch(e){}
+}
+
+loadStats();
+setInterval(loadStats, 15000);
+</script>
+{% endblock %}
