@@ -40,8 +40,8 @@ _EMAIL_SCRIPT = _ROOT.parent / "send_email.py"
 _EMAIL_TO     = "gavish.oren@gmail.com"
 
 CHECK_INTERVAL      = 60    # seconds between checks
-STALE_THRESHOLD     = 300   # seconds with no DB update → log warning
-STALE_KILL_THRESHOLD = 300   # seconds (5 min) → kill & restart stuck scheduler
+STALE_THRESHOLD     = 600   # seconds with no DB update → log warning (10 min)
+STALE_KILL_THRESHOLD = 1200  # seconds (20 min) → kill & restart stuck scheduler
 RESTART_COOLDOWN    = 180   # seconds to wait before restarting scheduler again
 
 _last_restart_ts: float = 0.0
@@ -86,11 +86,17 @@ def _scheduler_pids() -> list[int]:
 
 
 def _progress_age_seconds() -> float | None:
-    """Return seconds since last fetch_progress update, or None if no active row."""
+    """Return seconds since last fetch_progress update, or None if table is empty.
+
+    Intentionally queries ALL rows (not just finished=0). When a file completes,
+    _mark_finished sets updated_at=now on the finished row. Filtering to finished=0
+    would then pick the next queued target whose updated_at is hours old — causing
+    a false stale detection and killing a healthy scheduler mid-transition.
+    """
     try:
         con = sqlite3.connect(str(_PROGRESS_DB), timeout=5)
         row = con.execute(
-            "SELECT updated_at FROM fetch_progress WHERE finished=0 ORDER BY updated_at DESC LIMIT 1"
+            "SELECT updated_at FROM fetch_progress ORDER BY updated_at DESC LIMIT 1"
         ).fetchone()
         con.close()
         if not row:
@@ -245,7 +251,7 @@ def check_and_heal(cfg) -> list[str]:
         actions.append(f"STALE:{age:.0f}s")
 
         if age > STALE_KILL_THRESHOLD and gw_up:
-            # Gateway is up but no progress for 30+ min → scheduler is hung in reconnect
+            # Gateway is up but no progress for 20+ min → scheduler is hung in reconnect
             # loop or IB pacing deadlock. Kill it and restart so the next file can proceed.
             log.warning("Stale for %.0f min with gateway up — killing hung scheduler pid=%s",
                         age / 60, pids[0] if pids else "none")

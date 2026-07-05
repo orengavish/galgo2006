@@ -181,6 +181,41 @@ the scheduler continues without the partial-file list (P2 priority). **Known, no
 
 ---
 
+## G14 — Watchdog false-kills healthy scheduler after file transition
+
+**Symptom:** Scheduler finishes a large BID_ASK file (e.g., MNQ May 6 done at 07:33 UTC),
+immediately watchdog fires "stale 643 min" and kills it — even though the scheduler was fine
+and was about to begin the next target.
+
+**Cause:** `_progress_age_seconds()` queried `WHERE finished=0 ORDER BY updated_at DESC LIMIT 1`.
+When MNQ May 6 finishes (`finished=1`), the query now returns the NEXT queued target (MYM May 6),
+which had `updated_at` from hours ago (never started yet). The watchdog read this as "fetcher
+stuck 643 min" and killed the scheduler mid-transition.
+
+**Fix:** Remove `WHERE finished=0`. Query ALL rows. `_mark_finished` always sets `updated_at=now`,
+so the just-completed file row is the freshest and keeps the age low during transitions.
+**Deployed 2026-07-05.**
+
+---
+
+## G15 — Watchdog kills healthy scheduler on restart (STALE_KILL_THRESHOLD too short)
+
+**Symptom:** After watchdog restarts, it immediately kills the scheduler. Scheduler was running
+fine (e.g., MNQ May 7 BID_ASK W0 in progress, started 14 min ago). No records logged yet
+because W0 takes 32 min. Watchdog sees age=840s > STALE_KILL_THRESHOLD=300s → kill.
+
+**Cause:** 5-min kill threshold is shorter than a single IB window request for large BID_ASK
+files. W0 for MNQ takes 32 min; W2 can take 2-4 hours. The reporter updates DB every 15s
+WHILE INSIDE `paginate_ticks`, but `_mark_started` only writes once at the start — so the
+gap between `_mark_started` and first reporter heartbeat can be > 5 min if IB is slow.
+
+**Fix:** Increased STALE_KILL_THRESHOLD from 300s to 1200s (20 min). IB's slowest legitimate
+response is < 15 min. Any 20-min silence is a true hang. Combined with G14 fix (all-rows
+query), false kills from file transitions are also eliminated.
+**Deployed 2026-07-05.**
+
+---
+
 ## G13 — Duplicate schedulers accumulate after dashboard restarts
 
 **Symptom:** Multiple `fetch_scheduler.py --backfill` processes running simultaneously.
