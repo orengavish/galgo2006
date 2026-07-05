@@ -557,21 +557,48 @@ def api_algo_trades():
 def api_algo_stats():
     db_path = _resolve_db()
     with get_db(db_path) as con:
-        rows = con.execute("""
+        by_sym_rows = con.execute("""
             SELECT symbol,
                    SUM(CASE WHEN status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED') THEN 1 ELSE 0 END) as active,
-                   SUM(CASE WHEN status='FILLED' THEN 1 ELSE 0 END) as filled,
-                   SUM(CASE WHEN status='CLOSED' THEN 1 ELSE 0 END) as closed
-            FROM commands
-            WHERE source='algo_dashboard'
+                   SUM(CASE WHEN status='FILLED'    THEN 1 ELSE 0 END) as filled,
+                   SUM(CASE WHEN status='CLOSED'    THEN 1 ELSE 0 END) as closed
+            FROM commands WHERE source='algo_dashboard'
             GROUP BY symbol
         """).fetchall()
-        total_active = con.execute(
-            "SELECT COUNT(*) FROM commands WHERE source='algo_dashboard'"
-            " AND status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
-        ).fetchone()[0]
-    by_sym = {r["symbol"]: dict(r) for r in rows}
-    return jsonify({"by_symbol": by_sym, "total_active": total_active, "max": _MAX_CMDS})
+
+        sc = con.execute("""
+            SELECT status, COUNT(*) as n FROM commands
+            WHERE source='algo_dashboard'
+            GROUP BY status
+        """).fetchall()
+        status_counts = {r["status"]: r["n"] for r in sc}
+
+        total_active = (status_counts.get("PENDING",0) + status_counts.get("SUBMITTING",0)
+                        + status_counts.get("SUBMITTED",0) + status_counts.get("FILLED",0))
+
+        # P&L from closed algo_dashboard trades today
+        pnl_row = con.execute("""
+            SELECT
+                SUM(CASE WHEN pnl_points > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN pnl_points < 0 THEN 1 ELSE 0 END) as losses,
+                SUM(CASE WHEN pnl_points > 0 THEN pnl_points ELSE 0 END) as gains,
+                SUM(CASE WHEN pnl_points < 0 THEN pnl_points ELSE 0 END) as loss_total,
+                SUM(pnl_points) as net
+            FROM commands
+            WHERE source='algo_dashboard' AND status='CLOSED'
+              AND date(updated_at) = date('now')
+        """).fetchone()
+
+    by_sym = {r["symbol"]: dict(r) for r in by_sym_rows}
+    pnl = dict(pnl_row) if pnl_row else {}
+
+    return jsonify({
+        "by_symbol":     by_sym,
+        "total_active":  total_active,
+        "max":           _MAX_CMDS,
+        "status_counts": status_counts,
+        "pnl_today":     pnl,
+    })
 
 
 @app.route("/api/algo/trade/<int:cmd_id>")

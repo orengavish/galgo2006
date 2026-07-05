@@ -69,6 +69,28 @@
     </table>
   </div>
 
+  <!-- Submitted-from-here summary (always visible) -->
+  <div id="submitted-summary" style="border-top:1px solid #30363d;padding-top:10px;margin-top:4px;
+       display:flex;gap:16px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+    <span style="font-size:11px;color:#8b949e;font-weight:bold">Submitted from here:</span>
+    <span style="font-size:12px">
+      PENDING: <b id="ss-pending" style="color:#d29922">—</b>
+    </span>
+    <span style="font-size:12px">
+      SUBMITTED: <b id="ss-submitted" style="color:#58a6ff">—</b>
+    </span>
+    <span style="font-size:12px">
+      FILLED: <b id="ss-filled" style="color:#3fb950">—</b>
+    </span>
+    <span style="font-size:12px">
+      CLOSED: <b id="ss-closed" style="color:#6e7681">—</b>
+    </span>
+    <span style="font-size:12px">
+      NET P&L: <b id="ss-pnl" style="color:#8b949e">—</b>
+    </span>
+    <a href="/trades" style="font-size:11px;margin-left:auto">View Trades tab →</a>
+  </div>
+
   <!-- Submit row -->
   <div id="submit-row">
     <button class="btn-primary" id="btn-submit" onclick="submitTrades()" disabled>
@@ -253,14 +275,25 @@ async function loadStats(){
   try {
     const r = await fetch('/api/algo/stats');
     const d = await r.json();
+
+    // Limit info
     const el = document.getElementById('limit-info');
-    el.textContent = `${d.total_active}/${d.max} active`;
+    el.textContent = `${d.total_active}/${d.max} active (algo)`;
     el.style.color = d.total_active > d.max ? '#f85149' : '#6e7681';
-    // Disable submit if over limit
-    if(d.total_active >= d.max && _candidates.length){
-      document.getElementById('btn-submit').title =
-        'Cancel PENDING orders in the Trades tab first';
-    }
+    if(d.total_active >= d.max && _candidates.length)
+      document.getElementById('btn-submit').title = 'Cancel PENDING in Trades tab first';
+
+    // Submitted-from-here summary
+    const sc  = d.status_counts || {};
+    const pts = v => v != null ? (v>=0?'+':'')+parseFloat(v).toFixed(2)+' pts' : '—';
+    document.getElementById('ss-pending').textContent   = sc.PENDING   ?? '—';
+    document.getElementById('ss-submitted').textContent = (sc.SUBMITTED||0)+(sc.SUBMITTING||0)||'—';
+    document.getElementById('ss-filled').textContent    = sc.FILLED    ?? '—';
+    document.getElementById('ss-closed').textContent    = sc.CLOSED    ?? '—';
+    const pnl = d.pnl_today || {};
+    const pnlEl = document.getElementById('ss-pnl');
+    pnlEl.textContent = pts(pnl.net);
+    pnlEl.style.color = pnl.net>0?'#3fb950':pnl.net<0?'#f85149':'#8b949e';
   } catch(e){}
 }
 
