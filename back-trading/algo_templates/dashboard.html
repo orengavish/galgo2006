@@ -109,9 +109,16 @@ async function createTrades(){
 
     _candidates = d.candidates;
     renderCandidates(d.candidates, d.meta);
-    msg.textContent = `${d.meta.n_returned} candidates ready`;
-    msg.className = 'msg ok';
-    document.getElementById('btn-submit').disabled = false;
+    const n = d.meta.n_returned ?? d.candidates.length;
+    if(n > 0){
+      msg.textContent = `${n} candidates ready (${d.meta.date||'?'})`;
+      msg.className = 'msg ok';
+      document.getElementById('btn-submit').disabled = false;
+    } else {
+      msg.textContent = d.meta.error || `0 candidates — ${d.meta.date||'no lines found'}`;
+      msg.className = 'msg err';
+      document.getElementById('btn-submit').disabled = true;
+    }
 
     // Update price symbol to first selected
     _priceSymbol = syms[0];
@@ -131,16 +138,23 @@ function srcBadge(src){
 
 function renderCandidates(cands, meta){
   const tbody = document.getElementById('cands-body');
-  if(!cands.length){
-    tbody.innerHTML = '<tr><td colspan="14" style="color:#6e7681;text-align:center;padding:16px">No candidates</td></tr>';
-    return;
-  }
 
-  document.getElementById('n-generated').textContent = meta.n_generated || cands.length;
+  // Always update stats from meta (shows what was found even when empty)
+  document.getElementById('n-generated').textContent = meta.n_generated ?? cands.length;
   document.getElementById('n-shown').textContent     = cands.length;
   document.getElementById('n-fd').textContent        = cands.filter(c=>c.command_class==='FD').length;
   document.getElementById('n-hd').textContent        = cands.filter(c=>c.command_class==='HD').length;
-  document.getElementById('stat-date').textContent   = (meta.date||'—').slice(5); // MM-DD
+  document.getElementById('stat-date').textContent   = (meta.date||'—').slice(5);
+  document.getElementById('cands-info').textContent  =
+    `${meta.n_lines||0} armed lines | ${meta.date||'?'} | ${cands.length} candidates`;
+
+  if(!cands.length){
+    const errMsg = meta.error
+      ? `<div style="color:#d29922;font-size:11px;margin-top:6px">${meta.error}</div>` : '';
+    tbody.innerHTML = `<tr><td colspan="14" style="text-align:center;color:#6e7681;padding:20px">
+      No candidates for ${meta.date||'?'}${errMsg}</td></tr>`;
+    return;
+  }
 
   tbody.innerHTML = cands.map(c => {
     const cls  = c.command_class==='FD'

@@ -61,16 +61,18 @@ _HIST_PATH_OVERRIDE: Path | None = None
 def _resolve_db() -> Path:
     if _DB_PATH_OVERRIDE:
         return _DB_PATH_OVERRIDE
-    try:
-        import yaml
-        cfg_path = _ROOT / "trader" / "config.yaml"
-        if cfg_path.exists():
+    # Try trader/config.yaml — resolve db path relative to the config file's directory
+    cfg_path = _ROOT / "trader" / "config.yaml"
+    if cfg_path.exists():
+        try:
+            import yaml
             with open(cfg_path) as f:
                 cfg = yaml.safe_load(f)
-            return _ROOT / cfg["paths"]["db"]
-    except Exception:
-        pass
-    return _ROOT / "trader" / "data" / "galao.db"
+            db_rel = cfg.get("paths", {}).get("db", "data/galao.db")
+            return (cfg_path.parent / db_rel).resolve()
+        except Exception:
+            pass
+    return (_ROOT / "trader" / "data" / "galao.db").resolve()
 
 
 def _resolve_history() -> Path:
@@ -154,7 +156,8 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
         ).fetchone()
         date_str = date_row[0] if date_row and date_row[0] else None
         if not date_str:
-            return [], {"error": "No armed critical lines found"}
+            return [], {"error": "No armed critical lines found",
+                        "n_returned": 0, "n_generated": 0, "n_lines": 0}
 
         # All armed lines for that date + symbols
         lines_all = [dict(r) for r in con.execute(
@@ -316,7 +319,11 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
                     })
 
     if not candidates:
-        return [], {"date": date_str, "n_lines": len(lines_all), "n_candidates": 0}
+        return [], {"date": date_str, "n_lines": len(lines_all),
+                    "n_generated": 0, "n_returned": 0,
+                    "error": f"Lines found ({len(lines_all)}) but no candidates generated — "
+                             "need at least 2 lines (one support + one resistance) for FD, "
+                             "or backtest combo scores for HD."}
 
     # Normalize hist_raw across all candidates → [0,1]
     hist_vals = [c["hist_raw"] for c in candidates]
