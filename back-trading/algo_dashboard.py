@@ -40,6 +40,19 @@ _TICK      = 0.25
 _MAX_CMDS  = 400
 _TOP_N     = 100
 _HD_TOP_N  = 5           # top N combos from scorer to apply as HD candidates
+
+# Default HD combo grid — full Cartesian product used when no backtest scores exist.
+# Intentionally broad ("thousands in memory, top 100 shown"); pruned at scoring stage.
+_HD_DEFAULT_COMBOS = [
+    {"algo_type": at, "tp_ticks": tp, "sl_ticks": sl,
+     "direction_filter": df, "strength_max": st,
+     "composite_score": 0.0, "n_fills": 0}
+    for at in ["BOUNCE", "BREAKOUT", "FADE", "DIRECTIONAL", "BOTH"]
+    for tp in [4, 8, 16, 32]
+    for sl in [2, 4, 8]
+    for df in ["BUY", "SELL", "BOTH"]
+    for st in [1, 2, 3]
+]
 _TRADER_URL = "http://127.0.0.1:5001"
 
 ALL_SYMBOLS = ["MES", "MNQ", "MYM", "M2K"]
@@ -244,34 +257,38 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
             if cur_price is not None:
                 prox = max(0.0, 1.0 - abs(cur_price - entry_p) / max(avg_move, 1.0))
 
-            for etype in ["LMT", "STP"]:
-                candidates.append({
-                    "symbol":             sym,
-                    "date":               date_str,
-                    "command_class":      "FD",
-                    "algo_type":          "FULL_DUPLEX",
-                    "entry_line_price":   lp,
-                    "entry_line_type":    ltype,
-                    "entry_line_strength": line["strength"],
-                    "entry_line_id":      line.get("id"),
-                    "direction":          direction,
-                    "entry_type":         etype,
-                    "entry_price":        entry_p,
-                    "tp_price":           tp_price,
-                    "tp_source":          tp_source,
-                    "tp_line_price":      tp_line_p,
-                    "sl_price":           sl_price,
-                    "sl_source":          sl_source,
-                    "sl_line_price":      sl_line_p,
-                    "bracket":            round(abs(tp_price - entry_p), 4),
-                    "avg_move":           avg_move,
-                    "hist_raw":           hist_raw,
-                    "hist_n":             hist.get("n", 0),
-                    "proximity":          round(prox, 4),
-                })
+            # One candidate per line-direction; submit will create both LMT and STP orders
+            candidates.append({
+                "symbol":             sym,
+                "date":               date_str,
+                "command_class":      "FD",
+                "algo_type":          "FULL_DUPLEX",
+                "entry_line_price":   lp,
+                "entry_line_type":    ltype,
+                "entry_line_strength": line["strength"],
+                "entry_line_id":      line.get("id"),
+                "direction":          direction,
+                "entry_type":         "LMT+STP",  # both orders created on submit
+                "entry_price":        entry_p,
+                "tp_price":           tp_price,
+                "tp_source":          tp_source,
+                "tp_line_price":      tp_line_p,
+                "sl_price":           sl_price,
+                "sl_source":          sl_source,
+                "sl_line_price":      sl_line_p,
+                "bracket":            round(abs(tp_price - entry_p), 4),
+                "avg_move":           avg_move,
+                "hist_raw":           hist_raw,
+                "hist_n":             hist.get("n", 0),
+                "proximity":          round(prox, 4),
+            })
 
         # ── Half-duplex candidates ─────────────────────────────────────────────
-        for combo in hd_combos.get(sym, []):
+        # Fall back to default grid when no backtest scores exist yet
+        active_combos = hd_combos.get(sym) or [
+            {**d, "composite_score": 0.0, "n_fills": 0} for d in _HD_DEFAULT_COMBOS
+        ]
+        for combo in active_combos:
             ap = AlgoParams(
                 algo_type=combo["algo_type"],
                 tp_ticks=combo["tp_ticks"],
@@ -328,16 +345,46 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
     # Normalize hist_raw across all candidates → [0,1]
     hist_vals = [c["hist_raw"] for c in candidates]
     mn, mx    = min(hist_vals), max(hist_vals)
-    rng       = mx - mn if mx != mn else 1.0
+    hist_rng  = mx - mn if mx != mn else 1.0
     for c in candidates:
-        c["hist_score"] = round((c["hist_raw"] - mn) / rng, 4)
+        c["hist_score"] = round((c["hist_raw"] - mn) / hist_rng, 4)
         c["combined_score"] = round(0.6 * c["hist_score"] + 0.4 * c["proximity"], 4)
 
-    candidates.sort(key=lambda c: c["combined_score"], reverse=True)
-    for i, c in enumerate(candidates):
-        c["rank"] = i + 1
+    # When all scores are flat (no history, price far from lines), do a round-robin
+    # interleave across algo_types so top-100 has algo diversity rather than just
+    # the first algo_type alphabetically from a stable sort.
+    score_spread = max(c["combined_score"] for c in candidates) - \
+                   min(c["combined_score"] for c in candidates)
+    if score_spread < 0.001:
+        # Sort within each algo_type by secondary keys (strength DESC, tp_ticks, sl_ticks)
+        import collections
+        groups: dict = collections.defaultdict(list)
+        for c in candidates:
+            groups[c["algo_type"]].append(c)
+        for g in groups.values():
+            g.sort(key=lambda c: (-c.get("entry_line_strength", 0),
+                                  c.get("tp_ticks", 0), c.get("sl_ticks", 0)))
+        # Round-robin across algo_type groups to build top
+        from itertools import zip_longest
+        top = []
+        algo_order = sorted(groups.keys())  # deterministic order
+        for batch in zip_longest(*[groups[a] for a in algo_order]):
+            for c in batch:
+                if c is not None:
+                    top.append(c)
+                    if len(top) == _TOP_N:
+                        break
+            if len(top) == _TOP_N:
+                break
+        # Re-sort the selected top-100 by (entry_line_strength DESC, algo_type) for display
+        top.sort(key=lambda c: (-c.get("entry_line_strength", 0), c["algo_type"],
+                                c.get("tp_ticks", 0), c.get("sl_ticks", 0)))
+    else:
+        candidates.sort(key=lambda c: c["combined_score"], reverse=True)
+        top = candidates[:_TOP_N]
 
-    top = candidates[:_TOP_N]
+    for i, c in enumerate(top):
+        c["rank"] = i + 1
     meta = {
         "date":         date_str,
         "n_lines":      len(lines_all),
@@ -425,24 +472,29 @@ def api_submit():
             " WHERE status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
         ).fetchone()[0]
 
-    if active + len(cands) > _MAX_CMDS:
+    n_orders = sum(2 if c["entry_type"] == "LMT+STP" else 1 for c in cands)
+    if active + n_orders > _MAX_CMDS:
         return jsonify({
             "error": f"Would exceed {_MAX_CMDS}-command limit. "
-                     f"Currently {active} active. Can submit at most {_MAX_CMDS - active}."
+                     f"Currently {active} active, would add {n_orders} orders. "
+                     f"Can submit at most {_MAX_CMDS - active}."
         }), 400
 
     rows = []
     for c in cands:
         bracket = round(abs(c["tp_price"] - c["entry_price"]), 4)
-        rows.append((
-            c["symbol"],
-            c["entry_line_price"], c["entry_line_type"], c["entry_line_strength"],
-            c["direction"], c["entry_type"],
-            c["entry_price"], c["tp_price"], c["sl_price"],
-            bracket, "algo_dashboard",
-            c.get("entry_line_id"),
-            1,  # quantity
-        ))
+        # FD candidates carry entry_type="LMT+STP" → expand into two separate orders
+        etypes = ["LMT", "STP"] if c["entry_type"] == "LMT+STP" else [c["entry_type"]]
+        for etype in etypes:
+            rows.append((
+                c["symbol"],
+                c["entry_line_price"], c["entry_line_type"], c["entry_line_strength"],
+                c["direction"], etype,
+                c["entry_price"], c["tp_price"], c["sl_price"],
+                bracket, "algo_dashboard",
+                c.get("entry_line_id"),
+                1,  # quantity
+            ))
 
     with get_db(db_path) as con:
         con.executemany("""
