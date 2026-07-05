@@ -34,6 +34,10 @@
   <button class="btn-neutral" onclick="loadTrades()" style="font-size:11px;padding:3px 10px">
     Refresh
   </button>
+  <button class="btn-danger" id="btn-purge" onclick="purgePending()" style="font-size:11px;padding:3px 10px">
+    Cancel PENDING
+  </button>
+  <span class="msg" id="purge-msg"></span>
 </div>
 
 <!-- Filters -->
@@ -184,7 +188,9 @@ async function loadStats(){
   try {
     const r = await fetch('/api/algo/stats');
     const d = await r.json();
-    document.getElementById('total-n').textContent   = d.total_active;
+    const nEl = document.getElementById('total-n');
+    nEl.textContent = d.total_active;
+    nEl.style.color = d.total_active > d.max ? '#f85149' : '#c9d1d9';
     document.getElementById('total-max').textContent = d.max;
     for(const [sym, info] of Object.entries(d.by_symbol||{})){
       const el = document.getElementById(`cnt-${sym}-n`);
@@ -194,6 +200,24 @@ async function loadStats(){
       }
     }
   } catch(e){}
+}
+
+async function purgePending(){
+  if(!confirm('Cancel all PENDING algo_dashboard commands?')) return;
+  const btn = document.getElementById('btn-purge');
+  const msg = document.getElementById('purge-msg');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/api/algo/purge', {method:'POST'});
+    const d = await r.json();
+    msg.textContent = `${d.cancelled} commands cancelled.`;
+    msg.className = 'msg ok';
+    loadTrades();
+    loadStats();
+  } catch(e){
+    msg.textContent = e.message; msg.className = 'msg err';
+  }
+  btn.disabled = false;
 }
 
 async function showDetail(id){

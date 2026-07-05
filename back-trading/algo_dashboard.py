@@ -474,11 +474,13 @@ def api_submit():
 
     n_orders = sum(2 if c["entry_type"] == "LMT+STP" else 1 for c in cands)
     if active + n_orders > _MAX_CMDS:
-        return jsonify({
-            "error": f"Would exceed {_MAX_CMDS}-command limit. "
-                     f"Currently {active} active, would add {n_orders} orders. "
-                     f"Can submit at most {_MAX_CMDS - active}."
-        }), 400
+        headroom = max(0, _MAX_CMDS - active)
+        msg = (f"Limit already exceeded ({active}/{_MAX_CMDS} active)."
+               if headroom == 0 else
+               f"Would exceed {_MAX_CMDS}-command limit. "
+               f"{active} active + {n_orders} new = {active+n_orders}. "
+               f"Can submit at most {headroom} more — cancel some PENDING orders first.")
+        return jsonify({"error": msg}), 400
 
     rows = []
     for c in cands:
@@ -510,6 +512,19 @@ def api_submit():
         _candidates.clear()
 
     return jsonify({"submitted": len(rows), "active_after": active + len(rows)})
+
+
+@app.route("/api/algo/purge", methods=["POST"])
+def api_purge():
+    """Cancel (set CANCELLED) all PENDING commands from source='algo_dashboard'."""
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        cur = con.execute(
+            "UPDATE commands SET status='CANCELLED', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+            " WHERE source='algo_dashboard' AND status='PENDING'"
+        )
+        n = cur.rowcount
+    return jsonify({"cancelled": n})
 
 
 @app.route("/api/algo/trades")

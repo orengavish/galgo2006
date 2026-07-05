@@ -253,8 +253,14 @@ async function loadStats(){
   try {
     const r = await fetch('/api/algo/stats');
     const d = await r.json();
-    document.getElementById('limit-info').textContent =
-      `${d.total_active}/${d.max} active`;
+    const el = document.getElementById('limit-info');
+    el.textContent = `${d.total_active}/${d.max} active`;
+    el.style.color = d.total_active > d.max ? '#f85149' : '#6e7681';
+    // Disable submit if over limit
+    if(d.total_active >= d.max && _candidates.length){
+      document.getElementById('btn-submit').title =
+        'Cancel PENDING orders in the Trades tab first';
+    }
   } catch(e){}
 }
 
