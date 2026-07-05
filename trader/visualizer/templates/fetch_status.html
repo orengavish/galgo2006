@@ -142,17 +142,18 @@
   #fetch-grid td{padding:3px 6px;text-align:center;white-space:nowrap;font-size:11px;
                  vertical-align:middle;line-height:1.4}
 
-  /* ── Three core cell states ── */
-  .cell-ok      {background:#0a1f10;color:#3fb950}
+  /* ── Cell states ── */
+  .cell-ok      {background:#0a1f10;color:#3fb950}   /* both T+B done → green */
+  .cell-half    {background:#1e1000;color:#d08030}   /* one done, one empty → orange */
   .cell-active  {background:#0d1117;color:#39d0ff;
                  outline:1px solid #58a6ff;outline-offset:-1px;
                  animation:cell-pulse 0.7s ease-in-out infinite}
   .cell-recover {background:#201800;color:#d29922}
   .cell-pending {background:#0d1117;color:#30363d}
 
-  /* partial = one type done, other missing */
-  .cell-partial-t {background:#0a1f10;color:#3fb950}
-  .cell-partial-b {background:#0d1117;color:#484f58}
+  /* sub-label colors for half state */
+  .cell-half .cell-t {color:#3fb950}   /* T done → green label */
+  .cell-half .cell-b {color:#5a3000}   /* B missing → dim brown */
 
   @keyframes cell-pulse{
     0%,100%{background:#0d1117;outline-color:#1f6feb}
@@ -332,16 +333,19 @@ function updateQueueList(queue){
 function _cellState(t, b){
   const tSt = t ? t.status : null;
   const bSt = b ? b.status : null;
-  if(!t && !b)                             return 'pending';
-  if(tSt==='active' || bSt==='active')     return 'active';
-  if(tSt==='stale'  || bSt==='stale')      return 'recover';
-  if(tSt==='ok')                           return 'ok';
-  if(bSt==='ok' && !t)                     return 'ok';   // bidask only (unlikely)
+  if(!t && !b)                          return 'pending';
+  if(tSt==='active' || bSt==='active')  return 'active';
+  if(tSt==='stale'  || bSt==='stale')   return 'recover';
+  const tDone = tSt === 'ok';
+  const bDone = bSt === 'ok';
+  if(tDone && bDone)  return 'ok';    // both done → green
+  if(tDone || bDone)  return 'half';  // one done, one empty/partial → orange
   return 'pending';
 }
 
 const _CLS = {
   ok:      'cell-ok',
+  half:    'cell-half',
   active:  'cell-active',
   recover: 'cell-recover',
   pending: 'cell-pending',

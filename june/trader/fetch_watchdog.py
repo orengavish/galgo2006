@@ -41,7 +41,7 @@ _EMAIL_TO     = "gavish.oren@gmail.com"
 
 CHECK_INTERVAL      = 60    # seconds between checks
 STALE_THRESHOLD     = 300   # seconds with no DB update → log warning
-STALE_KILL_THRESHOLD = 1800  # seconds (30 min) → kill & restart stuck scheduler
+STALE_KILL_THRESHOLD = 300   # seconds (5 min) → kill & restart stuck scheduler
 RESTART_COOLDOWN    = 180   # seconds to wait before restarting scheduler again
 
 _last_restart_ts: float = 0.0
