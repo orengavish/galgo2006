@@ -203,18 +203,19 @@ def _get_priority_dates(cfg, symbols: list) -> list:
         return False
 
     # ── P1: CRITICAL — verified trade dates, all symbols ─────────────────────
-    # Key insight: MNQ/MYM have no verified trades themselves but we need their
-    # tick data on the same dates as MES verified trades for correlation backtests.
-    # Query dates only (not date+symbol), then add ALL symbols for each date.
+    # Ordered by verified trade count DESC so high-value dates are fetched first.
+    # P1a: TRADES already done, only BID_ASK missing — cheap, complete these first.
+    # P1b: TRADES missing — full fetch needed, ordered by count DESC within tier.
     vt_dates = []
     try:
         from lib.db import get_db
         db_path = P(cfg.paths.db)
         with get_db(db_path) as con:
             rows = con.execute(
-                "SELECT DISTINCT DATE(fill_time) AS d FROM verified_trades ORDER BY d ASC"
+                "SELECT DATE(fill_time) AS d, COUNT(*) AS n "
+                "FROM verified_trades GROUP BY DATE(fill_time) ORDER BY n DESC"
             ).fetchall()
-        vt_dates = [r["d"] for r in rows]
+        vt_dates = [(r["d"], r["n"]) for r in rows]
     except Exception as e:
         log.warning("Could not query verified_trades: %s", e)
 
@@ -234,7 +235,9 @@ def _get_priority_dates(cfg, symbols: list) -> list:
     except Exception as e:
         log.warning("Could not query partial files: %s", e)
 
-    for d_str in vt_dates:
+    p1a = []  # tier 1: TRADES done, only BID_ASK missing
+    p1b = []  # tier 2: TRADES missing, full fetch needed
+    for d_str, _count in vt_dates:
         for sym in symbols:
             # CRITICAL if CSV missing -OR- CSV exists but fetch is unfinished
             is_unfinished = (sym, d_str) in partial_keys
@@ -242,7 +245,12 @@ def _get_priority_dates(cfg, symbols: list) -> list:
                 key = (sym, d_str)
                 if key not in seen:
                     seen.add(key)
-                    pairs.append((sym, date.fromisoformat(d_str)))
+                    if (sym, d_str, "trades") in present:
+                        p1a.append((sym, date.fromisoformat(d_str)))
+                    else:
+                        p1b.append((sym, date.fromisoformat(d_str)))
+    pairs.extend(p1a)
+    pairs.extend(p1b)
 
     # ── P2: RESUME — partial files not already covered by P1 ─────────────────
     for sym, d_str in sorted(partial_keys):
