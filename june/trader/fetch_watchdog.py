@@ -46,6 +46,8 @@ RESTART_COOLDOWN    = 180   # seconds to wait before restarting scheduler again
 
 _last_restart_ts: float = 0.0
 _consecutive_failures: int = 0
+_last_records_total: int | None = None   # for heartbeat-mask detection
+_last_records_ts: float = 0.0            # when we last saw records change
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -86,24 +88,45 @@ def _scheduler_pids() -> list[int]:
 
 
 def _progress_age_seconds() -> float | None:
-    """Return seconds since last fetch_progress update, or None if table is empty.
+    """Return seconds since records_fetched last changed on the active (finished=0) file.
 
-    Intentionally queries ALL rows (not just finished=0). When a file completes,
-    _mark_finished sets updated_at=now on the finished row. Filtering to finished=0
-    would then pick the next queued target whose updated_at is hours old — causing
-    a false stale detection and killing a healthy scheduler mid-transition.
+    Uses record-count delta rather than updated_at, so a heartbeat that refreshes
+    updated_at without delivering new ticks does NOT mask a real stall.
+
+    Falls back to updated_at age for finished rows (file transitions) to preserve
+    the G14 fix: when an active file completes and the next target hasn't started,
+    the just-finished row's updated_at keeps the age low.
     """
+    global _last_records_total, _last_records_ts
     try:
         con = sqlite3.connect(str(_PROGRESS_DB), timeout=5)
-        row = con.execute(
+
+        # Prefer the active (unfinished) row — that's where stalls happen
+        active = con.execute(
+            "SELECT records_fetched FROM fetch_progress WHERE finished=0 "
+            "ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+
+        if active is not None:
+            total = active[0]
+            now   = time.time()
+            if _last_records_total is None or total != _last_records_total:
+                _last_records_total = total
+                _last_records_ts    = now
+            con.close()
+            return now - _last_records_ts
+
+        # No active row → check updated_at of most-recent finished row (G14 safety)
+        finished = con.execute(
             "SELECT updated_at FROM fetch_progress ORDER BY updated_at DESC LIMIT 1"
         ).fetchone()
         con.close()
-        if not row:
+        if not finished:
             return None
-        ts = datetime.fromisoformat(row[0].replace("Z", "+00:00"))
+        ts = datetime.fromisoformat(finished[0].replace("Z", "+00:00"))
         if ts.tzinfo is None:
             ts = ts.replace(tzinfo=timezone.utc)
+        _last_records_total = None   # reset for next active file
         return (datetime.now(timezone.utc) - ts).total_seconds()
     except Exception:
         return None

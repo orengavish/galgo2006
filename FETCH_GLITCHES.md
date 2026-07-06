@@ -257,6 +257,24 @@ The **fetch_watchdog** is the most important for overnight reliability:
 
 ---
 
+## G16 — Heartbeat masks IB stall from watchdog
+
+**Symptom:** Dashboard shows 0 records/min and 0 records/hour. DB `updated_at` refreshes
+every ~15s but `records_fetched` is frozen. Watchdog sees age < 20s and does nothing.
+Scheduler process is alive at 0% CPU — stuck waiting for IB to return ticks.
+
+**Cause:** The fetcher's reporter thread updates `updated_at` every 15 seconds regardless
+of whether new ticks arrived. The watchdog's `_progress_age_seconds()` checked `updated_at`
+freshness, so a live heartbeat masked a completely stalled fetch from the kill logic.
+
+**Fix:** Changed `_progress_age_seconds()` to track `records_fetched` delta on the active
+(finished=0) row. If record count doesn't change, the "age" grows until it hits
+STALE_KILL_THRESHOLD (20 min) and the watchdog kills and restarts the scheduler.
+Falls back to `updated_at` when no active row exists (G14 safety for file transitions).
+**Deployed 2026-07-06.**
+
+---
+
 ## Rate & Time Estimates
 
 | Symbol | TRADES records (typical) | BID_ASK records | BID_ASK time @ 24k/min |
