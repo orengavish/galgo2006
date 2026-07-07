@@ -79,7 +79,13 @@ def _scheduler_pids() -> list[int]:
     pids = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
-            cmdline = " ".join(proc.info.get("cmdline") or [])
+            cmd_list = proc.info.get("cmdline") or []
+            if not cmd_list:
+                continue
+            exe = cmd_list[0].lower()
+            if "python" not in exe:
+                continue  # skip powershell/other processes that mention fetch_scheduler in -Command
+            cmdline = " ".join(cmd_list)
             if "fetch_scheduler" in cmdline and "fetch_watchdog" not in cmdline:
                 pids.append(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -332,14 +338,25 @@ def check_and_heal(cfg) -> list[str]:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def _watchdog_already_running() -> bool:
-    """Return True if another fetch_watchdog process is already running."""
+    """Return True if another fetch_watchdog process is already running.
+
+    Check exe name first to avoid false positives from PowerShell -Command strings
+    that happen to contain 'fetch_watchdog' and 'python' in their script body.
+    """
     my_pid = os.getpid()
     for proc in psutil.process_iter(["pid", "cmdline"]):
         if proc.info["pid"] == my_pid:
             continue
         try:
-            cmd = " ".join(proc.info.get("cmdline") or [])
-            if "fetch_watchdog" in cmd and "python" in cmd.lower():
+            cmd_list = proc.info.get("cmdline") or []
+            if not cmd_list:
+                continue
+            # The first element must be the python executable itself
+            exe = cmd_list[0].lower()
+            if "python" not in exe:
+                continue
+            cmd = " ".join(cmd_list)
+            if "fetch_watchdog" in cmd:
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
