@@ -63,12 +63,15 @@ def _acquire_lock() -> bool:
         try:
             pid = int(_LOCK_FILE.read_text().strip())
             import psutil
-            if psutil.pid_exists(pid):
+            try:
                 proc = psutil.Process(pid)
-                if any("fetch_scheduler" in " ".join(p) for p in [proc.cmdline()]):
+                if proc.status() not in ("zombie", "dead") and \
+                   "fetch_scheduler" in " ".join(proc.cmdline()):
                     log.warning("Another fetch_scheduler is already running (pid=%d) — exiting", pid)
                     return False
-            # Stale lock (process dead or not fetch_scheduler) — remove it
+            except (psutil.NoSuchProcess, psutil.ZombieProcess, psutil.AccessDenied):
+                pass
+            # Stale lock (process dead, zombie, or not fetch_scheduler) — remove it
             _LOCK_FILE.unlink(missing_ok=True)
         except Exception:
             _LOCK_FILE.unlink(missing_ok=True)

@@ -132,12 +132,26 @@ def _progress_age_seconds() -> float | None:
         return None
 
 
+def _pid_is_scheduler(pid: int) -> bool:
+    """Return True only if pid exists AND is actually a running fetch_scheduler process.
+    psutil.pid_exists() can return True for Windows zombie processes, so we also
+    check the cmdline to confirm the process is the right one and still alive."""
+    try:
+        proc = psutil.Process(pid)
+        if proc.status() in (psutil.STATUS_ZOMBIE, psutil.STATUS_DEAD):
+            return False
+        cmd = " ".join(proc.cmdline())
+        return "fetch_scheduler" in cmd
+    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        return False
+
+
 def _clean_stale_lock():
     if not _LOCK_FILE.exists():
         return False
     try:
         pid = int(_LOCK_FILE.read_text().strip())
-        if not psutil.pid_exists(pid):
+        if not _pid_is_scheduler(pid):
             _LOCK_FILE.unlink(missing_ok=True)
             log.info("Cleaned stale lock (dead pid=%d)", pid)
             return True
