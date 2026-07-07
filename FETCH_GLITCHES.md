@@ -303,6 +303,37 @@ OS-level signal, the watchdog dies. With no watchdog, a stuck or dead scheduler 
 
 ---
 
+## G18 — Zombie PID blocks scheduler restart after watchdog kill
+
+**Symptom:** Watchdog kills stuck scheduler. New scheduler never starts. System stays dark
+indefinitely. Watchdog log shows no SCHEDULER_RESTARTED after the kill.
+
+**Cause (two bugs, both needed):**
+
+**Bug 1 — Zombie PID in lock file (`psutil.pid_exists` false positive):**
+After killing a Python process on Windows, `psutil.pid_exists(killed_pid)` may return True
+for several seconds while the OS reaps the zombie. `_clean_stale_lock()` called
+`psutil.pid_exists()` and concluded the old scheduler was still alive — lock not cleaned.
+The new scheduler saw the lock, checked `pid_exists` → True → exited immediately.
+The watchdog thought it had restarted the scheduler; in fact the new process exited in <1s.
+
+**Bug 2 — PowerShell cmdline false-positive in single-instance guard:**
+`_watchdog_already_running()` searched for any process with "fetch_watchdog" AND "python"
+anywhere in its cmdline string. PowerShell `-Command` invocations embed the entire script body
+as a single string — a PowerShell that ran `Get-WmiObject | Where { $_.CommandLine -match
+'fetch_watchdog|fetch_scheduler' -and 'python' }` matched both patterns. Every new watchdog
+start saw the PowerShell process as a "running watchdog" and exited immediately.
+
+**Fix:**
+- `_clean_stale_lock()` and `_acquire_lock()`: use `psutil.Process(pid).status()` to confirm
+  process is not zombie/dead before treating the lock as valid.
+- `_watchdog_already_running()` and `_scheduler_pids()`: check `cmd_list[0]` (the executable)
+  contains "python" before scanning the joined cmdline. Filters out PowerShell processes.
+
+**Deployed 2026-07-07.**
+
+---
+
 ## Rate & Time Estimates
 
 | Symbol | TRADES records (typical) | BID_ASK records | BID_ASK time @ 24k/min |
