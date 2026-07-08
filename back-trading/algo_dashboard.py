@@ -255,33 +255,39 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
 
         date_str = max(sym_dates.values())
 
-        # HD: top combos per symbol
+        # HD: top combos per symbol (table may not exist on fresh DB)
         hd_combos: dict[str, list] = {}
         for sym in symbols:
-            ts_row = con.execute(
-                "SELECT MAX(scored_at) FROM cl_algo_combo_scores WHERE symbol=?", (sym,)
-            ).fetchone()
-            if ts_row and ts_row[0]:
-                rows = con.execute("""
-                    SELECT * FROM cl_algo_combo_scores
-                    WHERE symbol=? AND scored_at=? AND data_status='ok'
-                    ORDER BY rank ASC LIMIT ?
-                """, (sym, ts_row[0], _HD_TOP_N)).fetchall()
-                hd_combos[sym] = [dict(r) for r in rows]
-            else:
+            try:
+                ts_row = con.execute(
+                    "SELECT MAX(scored_at) FROM cl_algo_combo_scores WHERE symbol=?", (sym,)
+                ).fetchone()
+                if ts_row and ts_row[0]:
+                    rows = con.execute("""
+                        SELECT * FROM cl_algo_combo_scores
+                        WHERE symbol=? AND scored_at=? AND data_status='ok'
+                        ORDER BY rank ASC LIMIT ?
+                    """, (sym, ts_row[0], _HD_TOP_N)).fetchall()
+                    hd_combos[sym] = [dict(r) for r in rows]
+                else:
+                    hd_combos[sym] = []
+            except Exception:
                 hd_combos[sym] = []
 
-        # FD historical P&L: avg by (symbol, entry_line_type, direction, tp_source)
+        # FD historical P&L (table may not exist on fresh DB)
         fd_hist: dict = {}
-        rows = con.execute("""
-            SELECT symbol, entry_line_type, direction, tp_source,
-                   AVG(pnl_ticks) as avg_pnl, COUNT(*) as n
-            FROM cl_algo_fd_results
-            WHERE entry_fill_price IS NOT NULL
-            GROUP BY symbol, entry_line_type, direction, tp_source
-        """).fetchall()
-        for r in rows:
-            fd_hist[(r[0], r[1], r[2], r[3])] = {"avg_pnl": r[4] or 0.0, "n": r[5]}
+        try:
+            rows = con.execute("""
+                SELECT symbol, entry_line_type, direction, tp_source,
+                       AVG(pnl_ticks) as avg_pnl, COUNT(*) as n
+                FROM cl_algo_fd_results
+                WHERE entry_fill_price IS NOT NULL
+                GROUP BY symbol, entry_line_type, direction, tp_source
+            """).fetchall()
+            for r in rows:
+                fd_hist[(r[0], r[1], r[2], r[3])] = {"avg_pnl": r[4] or 0.0, "n": r[5]}
+        except Exception:
+            pass
 
     candidates = []
 
