@@ -21,6 +21,7 @@ Self-test:
 
 import sys
 import time
+import threading
 import argparse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -32,11 +33,18 @@ from lib.config_loader import get_config
 from lib.logger import get_logger
 from lib.db import get_db, init_db, get_pending_commands, update_command_status, get_system_state, record_completed_trade, spawn_replenishment
 from lib.ib_client import IBClient
-from lib.order_builder import build_bracket, place_bracket
+from lib.order_builder import build_bracket, place_bracket, round_tick
 
 log = get_logger("broker")
 
 _MAX_RECONNECT_ATTEMPTS = 5
+
+# Per-symbol minimum tick for TP/SL rebase rounding
+_TICK_BY_SYMBOL = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
+
+# Thread-safe queue: (cmd_id, fill_price) items pending TP/SL rebase
+_rebase_queue: list = []
+_rebase_lock  = threading.Lock()
 
 # IB error codes that are purely informational (data-farm connection status etc.)
 _IB_INFO_CODES = {
@@ -79,6 +87,9 @@ def _handle_exec_fill(order_id: int, fill_price: float, db_path):
                     f"[event] Command {row['id']} FILLED "
                     f"(execDetails orderId={order_id} price={fill_price})"
                 )
+                # Queue TP/SL rebase — actual IB modify runs in main loop (not event thread)
+                with _rebase_lock:
+                    _rebase_queue.append((row["id"], fill_price))
     except Exception as e:
         log.warning(f"Event fill handler error: {e}")
 
@@ -294,6 +305,10 @@ def poll_fills(ibc: IBClient, db_path) -> int:
         ).fetchall()
 
     fills = 0
+    queued_ids = set()
+    with _rebase_lock:
+        queued_ids = {item[0] for item in _rebase_queue}
+
     for cmd in submitted:
         entry_oid = cmd["ib_order_id"]
         if entry_oid in filled_ids:
@@ -307,6 +322,10 @@ def poll_fills(ibc: IBClient, db_path) -> int:
                     fill_price = fill_price,
                     fill_time  = now,
                 )
+            # Queue TP/SL rebase if not already queued by event handler
+            if cmd["id"] not in queued_ids:
+                with _rebase_lock:
+                    _rebase_queue.append((cmd["id"], fill_price))
             fills += 1
 
     return fills
@@ -392,6 +411,123 @@ def poll_tp_sl_fills(ibc: IBClient, db_path) -> int:
     return closed
 
 
+def _drain_rebase_queue(ibc: IBClient, db_path) -> int:
+    """
+    For each recently-filled command queued by _handle_exec_fill / poll_fills,
+    modify the IB TP and SL child orders so they are relative to the actual fill
+    price rather than the planned entry price.  Runs in the main broker loop
+    (not the ib_insync event thread) so IB API calls are safe.
+    Returns the number of commands whose brackets were adjusted.
+    """
+    with _rebase_lock:
+        if not _rebase_queue:
+            return 0
+        items = list(_rebase_queue)
+        _rebase_queue.clear()
+
+    if not ibc.is_paper_connected():
+        with _rebase_lock:
+            _rebase_queue.extend(items)
+        return 0
+
+    try:
+        trades = ibc.paper.trades()
+    except Exception as e:
+        log.warning(f"rebase: could not fetch IB trades: {e}")
+        with _rebase_lock:
+            _rebase_queue.extend(items)
+        return 0
+
+    trades_by_oid = {t.order.orderId: t for t in trades}
+    rebased = 0
+
+    for cmd_id, fill_price in items:
+        with get_db(db_path) as con:
+            cmd = con.execute("SELECT * FROM commands WHERE id=?", (cmd_id,)).fetchone()
+        if not cmd:
+            continue
+
+        entry_price = cmd["entry_price"]
+        tick        = _TICK_BY_SYMBOL.get(cmd["symbol"], 0.25)
+        slippage    = abs(fill_price - entry_price)
+
+        if slippage < tick:
+            continue  # no meaningful slippage — leave bracket as-is
+
+        direction  = cmd["direction"]
+        tp_bracket = abs(cmd["tp_price"] - entry_price)
+        sl_bracket = abs(cmd["sl_price"] - entry_price)
+
+        if direction == "BUY":
+            new_tp = round_tick(fill_price + tp_bracket, tick)
+            new_sl = round_tick(fill_price - sl_bracket, tick)
+        else:
+            new_tp = round_tick(fill_price - tp_bracket, tick)
+            new_sl = round_tick(fill_price + sl_bracket, tick)
+
+        tp_oid = cmd["ib_tp_order_id"]
+        sl_oid = cmd["ib_sl_order_id"]
+
+        # Find contract from either child order
+        contract = None
+        for oid in (tp_oid, sl_oid):
+            if oid and oid in trades_by_oid:
+                contract = trades_by_oid[oid].contract
+                break
+
+        if not contract:
+            log.warning(f"Cmd {cmd_id}: child orders not found in IB trades — rebase skipped")
+            continue
+
+        _DONE = ("Filled", "Cancelled", "Inactive")
+        modified = 0
+
+        # Modify TP
+        if tp_oid and tp_oid in trades_by_oid:
+            tp_trade = trades_by_oid[tp_oid]
+            if tp_trade.orderStatus.status not in _DONE:
+                tp_order = tp_trade.order
+                old_tp = tp_order.lmtPrice if tp_order.orderType == "LMT" else tp_order.auxPrice
+                if tp_order.orderType == "LMT":
+                    tp_order.lmtPrice = new_tp
+                else:
+                    tp_order.auxPrice = new_tp
+                try:
+                    ibc.paper.modifyOrder(contract, tp_order)
+                    log.info(f"Cmd {cmd_id}: TP {old_tp} → {new_tp} (fill={fill_price} slip={slippage:+.2f})")
+                    modified += 1
+                except Exception as e:
+                    log.warning(f"Cmd {cmd_id}: TP modify failed: {e}")
+
+        # Modify SL
+        if sl_oid and sl_oid in trades_by_oid:
+            sl_trade = trades_by_oid[sl_oid]
+            if sl_trade.orderStatus.status not in _DONE:
+                sl_order = sl_trade.order
+                old_sl = sl_order.auxPrice if sl_order.orderType == "STP" else sl_order.lmtPrice
+                if sl_order.orderType == "STP":
+                    sl_order.auxPrice = new_sl
+                else:
+                    sl_order.lmtPrice = new_sl
+                try:
+                    ibc.paper.modifyOrder(contract, sl_order)
+                    log.info(f"Cmd {cmd_id}: SL {old_sl} → {new_sl} (fill={fill_price} slip={slippage:+.2f})")
+                    modified += 1
+                except Exception as e:
+                    log.warning(f"Cmd {cmd_id}: SL modify failed: {e}")
+
+        if modified > 0:
+            with get_db(db_path) as con:
+                con.execute(
+                    "UPDATE commands SET tp_price=?, sl_price=?,"
+                    " updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE id=?",
+                    (new_tp, new_sl, cmd_id)
+                )
+            rebased += 1
+
+    return rebased
+
+
 def replenish_if_enabled(ibc: IBClient, db_path, cfg) -> int:
     """
     If REPLENISH_ENABLED=1 in system_state, find CLOSED commands that have
@@ -457,6 +593,15 @@ def run_broker(db_path=None, dry_run: bool = False):
 
     log.info(f"Broker starting — DB={db_path}")
 
+    # Reset any commands stuck in SUBMITTING from a previous interrupted run
+    with get_db(db_path) as con:
+        n = con.execute(
+            "UPDATE commands SET status='PENDING', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
+            " WHERE status='SUBMITTING'"
+        ).rowcount
+    if n:
+        log.warning(f"Reset {n} SUBMITTING command(s) to PENDING")
+
     ibc = IBClient(cfg)
     try:
         ibc.connect(live=True, paper=True)
@@ -510,6 +655,12 @@ def run_broker(db_path=None, dry_run: bool = False):
                         log.info(f"Detected {f} entry fill(s)")
                 except Exception as e:
                     log.error(f"Error in poll_fills: {e}")
+                try:
+                    rb = _drain_rebase_queue(ibc, db_path)
+                    if rb:
+                        log.info(f"Rebased TP/SL brackets for {rb} command(s)")
+                except Exception as e:
+                    log.error(f"Error in _drain_rebase_queue: {e}")
                 try:
                     c = poll_tp_sl_fills(ibc, db_path)
                     if c:

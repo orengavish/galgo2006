@@ -21,12 +21,15 @@
 .et-both{color:#d29922;font-size:10px;background:#2d2000;padding:1px 5px;border-radius:8px}
 </style>
 
+<!-- Version -->
+<div style="font-size:10px;color:#6e7681;margin-bottom:8px">v2.3 — sanity gate</div>
+
 <!-- Controls row -->
 <div id="controls">
   <div id="sym-checks">
     {% for s in symbols %}
     <label>
-      <input type="checkbox" name="sym" value="{{ s }}" {% if s != 'M2K' %}checked{% endif %}>
+      <input type="checkbox" name="sym" value="{{ s }}" checked>
       {{ s }}
     </label>
     {% endfor %}
@@ -91,12 +94,23 @@
     <a href="/trades" style="font-size:11px;margin-left:auto">View Trades tab →</a>
   </div>
 
+  <!-- Queue bar -->
+  <div id="queue-bar" style="background:#0d1117;border:1px solid #30363d;border-radius:4px;
+       padding:7px 14px;margin-bottom:10px;font-size:11px;color:#8b949e;
+       display:none;align-items:center;gap:18px;flex-wrap:wrap">
+    <span style="font-weight:bold;color:#c9d1d9">Queue</span>
+    <span>Queued: <b id="q-queued" style="color:#d29922">—</b></span>
+    <span>Submitted: <b id="q-submitted" style="color:#58a6ff">—</b></span>
+    <span>Total: <b id="q-total" style="color:#8b949e">—</b></span>
+    <span style="margin-left:auto">Active cmds: <b id="q-active" style="color:#c9d1d9">—</b> / 150</span>
+  </div>
+
   <!-- Submit row -->
   <div id="submit-row">
     <button class="btn-primary" id="btn-submit" onclick="submitTrades()" disabled>
-      Submit All
+      Submit Batch
     </button>
-    <span style="font-size:11px;color:#6e7681" id="limit-info">—/400 active</span>
+    <span style="font-size:11px;color:#6e7681" id="limit-info"></span>
     <span class="msg" id="submit-msg"></span>
     <div style="margin-left:auto;font-size:11px;color:#6e7681">
       Auto-Fill: <span style="color:#f85149;font-weight:bold">OFF (disabled)</span>
@@ -120,7 +134,7 @@ async function createTrades(){
   const btn = document.getElementById('btn-create');
   const msg = document.getElementById('create-msg');
   btn.disabled = true;
-  msg.textContent = 'Generating...'; msg.className = 'msg';
+  msg.textContent = 'Auto-generating lines & candidates...'; msg.className = 'msg';
 
   try {
     const r = await fetch('/api/algo/create', {
@@ -132,16 +146,16 @@ async function createTrades(){
 
     _candidates = d.candidates;
     renderCandidates(d.candidates, d.meta);
-    const n = d.meta.n_returned ?? d.candidates.length;
-    if(n > 0){
-      msg.textContent = `${n} candidates ready (${d.meta.date||'?'})`;
+    const total = d.total_queued ?? d.candidates.length;
+    const linesNote = d.meta.lines_created ? ` | ${d.meta.lines_created} lines auto-created` : '';
+    if(total > 0){
+      msg.textContent = `${total} queued${linesNote} — submit in batches of 200`;
       msg.className = 'msg ok';
-      document.getElementById('btn-submit').disabled = false;
     } else {
-      msg.textContent = d.meta.error || `0 candidates — ${d.meta.date||'no lines found'}`;
+      msg.textContent = (d.meta.error || `0 candidates`) + linesNote;
       msg.className = 'msg err';
-      document.getElementById('btn-submit').disabled = true;
     }
+    loadQueueStatus();
 
     // Update price symbol to first selected
     _priceSymbol = syms[0];
@@ -249,26 +263,60 @@ function showDetail(idx){
   document.getElementById('modal-overlay').classList.add('open');
 }
 
+async function loadQueueStatus(){
+  try {
+    const r = await fetch('/api/algo/queue');
+    const d = await r.json();
+    const bar  = document.getElementById('queue-bar');
+    const btn  = document.getElementById('btn-submit');
+    const info = document.getElementById('limit-info');
+    if(!d.session_id || d.total === 0){ bar.style.display='none'; btn.disabled=true; btn.textContent='Submit Batch'; return; }
+    bar.style.display = 'flex';
+    document.getElementById('q-queued').textContent    = d.queued;
+    document.getElementById('q-submitted').textContent = d.submitted_cands;
+    document.getElementById('q-total').textContent     = d.total;
+    document.getElementById('q-active').textContent    = d.active_commands;
+    if(d.queued > 0 && d.active_commands < d.max_active){
+      btn.disabled = false;
+      btn.textContent = `Submit Next 200 (rank ${d.next_batch_start}–${d.next_batch_end})`;
+      info.textContent = `${d.batches_remaining} batch${d.batches_remaining!==1?'es':''} remaining`;
+      info.style.color = '#6e7681';
+    } else if(d.active_commands >= d.max_active){
+      btn.disabled = true;
+      btn.textContent = `Blocked — ${d.active_commands} active`;
+      info.textContent = `Cancel some trades first`;
+      info.style.color = '#f85149';
+    } else {
+      btn.disabled = true;
+      btn.textContent = 'Queue empty';
+      info.textContent = 'Run Create Trades to refill';
+      info.style.color = '#6e7681';
+    }
+  } catch(e){}
+}
+
 async function submitTrades(){
   const btn = document.getElementById('btn-submit');
   const msg = document.getElementById('submit-msg');
   btn.disabled = true;
-  msg.textContent = 'Submitting...'; msg.className = 'msg';
+  msg.textContent = 'Checking sanity + submitting...'; msg.className = 'msg';
   try {
     const r = await fetch('/api/algo/submit', {method:'POST'});
     const d = await r.json();
-    if(!r.ok){ throw new Error(d.error || 'Submit failed'); }
-    msg.textContent = `${d.submitted} commands submitted. Go to Trades tab.`;
-    msg.className = 'msg ok';
-    _candidates = [];
-    document.getElementById('cands-body').innerHTML =
-      '<tr><td colspan="14" style="text-align:center;color:#3fb950;padding:20px">'
-      +`Submitted ${d.submitted} commands — view in Trades tab</td></tr>`;
+    if(d.submitted === 0 && d.error){
+      msg.textContent = d.error + (d.reasons ? ' (' + d.reasons.slice(0,2).join('; ') + ')' : '');
+      msg.className = 'msg err';
+    } else {
+      const demotedPart = d.demoted ? ` | ${d.demoted} demoted (out of range)` : '';
+      msg.textContent = `${d.submitted} submitted | ${d.remaining_queued} queued${demotedPart}`;
+      msg.className = d.demoted > d.submitted ? 'msg' : 'msg ok';
+    }
     loadStats();
+    loadQueueStatus();
   } catch(e){
     msg.textContent = e.message; msg.className = 'msg err';
-    btn.disabled = false;
   }
+  btn.disabled = false;
 }
 
 async function loadStats(){
@@ -298,6 +346,7 @@ async function loadStats(){
 }
 
 loadStats();
-setInterval(loadStats, 15000);
+loadQueueStatus();
+setInterval(()=>{ loadStats(); loadQueueStatus(); }, 15000);
 </script>
 {% endblock %}

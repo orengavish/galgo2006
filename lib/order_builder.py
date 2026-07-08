@@ -124,6 +124,8 @@ def build_bracket(ib: IB, contract, direction: str, entry_type: str,
             takeProfitPrice = tp_price,
             stopLossPrice   = sl_price,
         )
+        for o in bracket:
+            o.tif = 'GTC'
         return {"entry": bracket[0], "tp": bracket[1], "sl": bracket[2]}
 
     # bracketOrder only supports LMT entry; build manually for STP and MKT
@@ -141,6 +143,9 @@ def build_bracket(ib: IB, contract, direction: str, entry_type: str,
     tp_order.transmit = False
     sl_order.transmit = True   # transmit=True on last child submits the group
     entry_order.transmit = False
+
+    for o in (entry_order, tp_order, sl_order):
+        o.tif = 'GTC'
 
     return {"entry": entry_order, "tp": tp_order, "sl": sl_order}
 
@@ -175,9 +180,11 @@ def place_bracket(ib: IB, contract, orders: dict) -> dict:
         tp_trade    = ib.placeOrder(contract, tp_order)
         sl_trade    = ib.placeOrder(contract, sl_order)
 
+    entry_px = (entry_order.auxPrice if entry_order.orderType == 'STP'
+                else getattr(entry_order, 'lmtPrice', None))
     log.info(
         f"Bracket placed: {entry_order.action} {entry_order.orderType} "
-        f"entry={getattr(entry_order,'lmtPrice',None) or getattr(entry_order,'auxPrice',None)} "
+        f"entry={entry_px} "
         f"tp={tp_order.lmtPrice} sl={getattr(sl_order,'auxPrice',sl_order.lmtPrice if hasattr(sl_order,'lmtPrice') else None)} "
         f"entry_id={entry_trade.order.orderId}"
     )

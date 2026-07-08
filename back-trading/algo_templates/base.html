@@ -3,6 +3,7 @@
 <head>
   <meta charset="utf-8">
   <title>{% block title %}Algo Dashboard{% endblock %}</title>
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='4' fill='%230d2240'/%3E%3Ctext x='16' y='23' text-anchor='middle' font-family='monospace' font-size='20' font-weight='bold' fill='%2358a6ff'%3EA%3C/text%3E%3C/svg%3E">
   <style>
     *{box-sizing:border-box;margin:0;padding:0}
     body{font-family:monospace;background:#0d1117;color:#c9d1d9;font-size:13px}
@@ -99,6 +100,7 @@
   <div class="logo">Algo Dashboard</div>
   <a href="/" class="{% if active=='dashboard' %}active{% endif %}">Dashboard</a>
   <a href="/trades" class="{% if active=='trades' %}active{% endif %}">Trades</a>
+  <a href="/lines" class="{% if active=='lines' %}active{% endif %}">Lines</a>
   <div class="sep"></div>
   <a href="http://127.0.0.1:5001" target="_blank" style="font-size:11px;color:#6e7681">
     Trader &rarr;

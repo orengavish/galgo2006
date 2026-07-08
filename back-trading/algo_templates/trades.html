@@ -17,7 +17,10 @@
 <div id="top-actions">
   <button class="btn-neutral" onclick="loadAll()" style="font-size:11px;padding:3px 12px">Refresh</button>
   <button class="btn-danger"  id="btn-purge" onclick="purgePending()" style="font-size:11px;padding:3px 12px">
-    Cancel PENDING
+    Cancel All
+  </button>
+  <button class="btn-neutral" id="btn-clear-err" onclick="clearErrors()" style="font-size:11px;padding:3px 12px;color:#f85149;border-color:#f85149">
+    Clear Errors
   </button>
   <span class="msg" id="purge-msg"></span>
   <div style="margin-left:auto;font-size:11px;color:#f85149;font-weight:bold">
@@ -69,6 +72,11 @@
     <option value="">All</option>
     {% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
   </select>
+  <label style="font-size:11px;color:#8b949e;display:flex;align-items:center;gap:4px;cursor:pointer;margin-left:8px">
+    <input type="checkbox" id="hide-cancelled" checked onchange="loadTrades()"
+           style="accent-color:#58a6ff">
+    Hide CANCELLED
+  </label>
   <span id="filter-label" style="font-size:11px;color:#58a6ff;margin-left:4px"></span>
   <span id="filter-clear" onclick="setFilter(null)"
     style="display:none;font-size:11px;color:#8b949e;cursor:pointer">✕ clear</span>
@@ -171,7 +179,9 @@ function tradeRow(r){
 
 async function loadTrades(){
   const sym = document.getElementById('f-sym').value;
-  const qs  = (_filterUrls[_activeFilter] || '') + (sym ? `&symbol=${sym}` : '');
+  const hideCancelled = document.getElementById('hide-cancelled').checked;
+  let qs = (_filterUrls[_activeFilter] || '') + (sym ? `&symbol=${sym}` : '');
+  if(hideCancelled && !_activeFilter) qs += '&exclude_status=CANCELLED';
   try {
     const r = await fetch('/api/algo/trades' + qs);
     _allTrades = await r.json();
@@ -240,16 +250,38 @@ async function showDetail(id){
   } catch(e){ console.error(e); }
 }
 
+async function clearErrors(){
+  const btn = document.getElementById('btn-clear-err');
+  const msg = document.getElementById('purge-msg');
+  btn.disabled = true;
+  msg.textContent = 'Clearing errors…'; msg.className = 'msg';
+  try {
+    const r = await fetch('/api/algo/clear-errors', {method:'POST'});
+    const d = await r.json();
+    msg.textContent = `${d.cleared} ERROR commands cleared.`;
+    msg.className = 'msg ok';
+    loadAll();
+  } catch(e){ msg.textContent = e.message; msg.className = 'msg err'; }
+  btn.disabled = false;
+}
+
 async function purgePending(){
-  if(!confirm('Cancel all PENDING algo_dashboard commands?')) return;
+  if(!confirm('Cancel ALL open algo commands (PENDING + SUBMITTED)? IB orders will be cancelled.')) return;
   const btn = document.getElementById('btn-purge');
   const msg = document.getElementById('purge-msg');
   btn.disabled = true;
+  msg.textContent = 'Cancelling…';
+  msg.className = 'msg';
   try {
     const r = await fetch('/api/algo/purge', {method:'POST'});
     const d = await r.json();
-    msg.textContent = `${d.cancelled} commands cancelled.`;
-    msg.className = 'msg ok';
+    const detail = d.ib_errors ? ` (${d.ib_errors} IB cancel errors)` : '';
+    const parts = [];
+    if(d.db_only)   parts.push(`${d.db_only} pending/closed`);
+    if(d.submitted) parts.push(`${d.submitted} submitted`);
+    if(d.filled)    parts.push(`${d.filled} filled`);
+    msg.textContent = `${d.cancelled} cleared (${parts.join(', ')})${detail}.`;
+    msg.className = d.ib_errors ? 'msg err' : 'msg ok';
     loadAll();
   } catch(e){ msg.textContent = e.message; msg.className = 'msg err'; }
   btn.disabled = false;

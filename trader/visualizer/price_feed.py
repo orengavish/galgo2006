@@ -1,8 +1,7 @@
 """
 visualizer/price_feed.py
-Background thread that polls IB LIVE for current MES price every N seconds.
-Stores latest price in memory for the Flask routes to read.
-Uses dedicated visualizer_client_ids from config (falls back to live_client_ids).
+Background thread that polls IB LIVE for current prices for all tracked symbols.
+Stores latest prices in memory (per symbol) for the Flask routes to read.
 """
 
 import threading
@@ -10,24 +9,25 @@ import time
 from datetime import datetime, timezone
 from pathlib import Path
 
-_price: float | None = None
-_price_time: datetime | None = None
-_symbol: str = "MES"
+_prices: dict = {}
+_price_times: dict = {}
 _lock = threading.Lock()
 _thread: threading.Thread | None = None
 _ibc = None
 
+_ALL_SYMBOLS = ["MES", "MNQ", "MYM", "M2K"]
 
-def get_latest() -> tuple[float | None, datetime | None]:
+
+def get_latest(symbol: str = "MES") -> tuple:
     with _lock:
-        return _price, _price_time
+        return _prices.get(symbol), _price_times.get(symbol)
 
 
-def _poll_loop(cfg, symbol: str, interval: int):
-    global _price, _price_time, _ibc
+def _poll_loop(cfg, symbols: list, interval: int):
+    global _ibc
     import sys
     import asyncio
-    _HERE = Path(__file__).parent.parent.parent   # trader/visualizer -> trader -> galgo2026
+    _HERE = Path(__file__).parent.parent.parent
     if str(_HERE) not in sys.path:
         sys.path.insert(0, str(_HERE))
 
@@ -47,21 +47,28 @@ def _poll_loop(cfg, symbol: str, interval: int):
         try:
             if not ibc.is_live_connected():
                 ibc.connect(live=True, paper=False)
-            price = ibc.get_price(symbol)
-            if price and price == price:  # not nan
-                with _lock:
-                    _price = price
-                    _price_time = datetime.now(timezone.utc)
+            for sym in symbols:
+                try:
+                    price = ibc.get_price(sym)
+                    if price and price == price:  # not nan
+                        with _lock:
+                            _prices[sym] = price
+                            _price_times[sym] = datetime.now(timezone.utc)
+                except Exception as e:
+                    log.debug(f"Price poll error ({sym}): {e}")
         except Exception as e:
-            log.debug(f"Price poll error: {e}")
+            log.debug(f"Price feed connection error: {e}")
         time.sleep(interval)
 
 
-def start(cfg, symbol: str = "MES", interval: int = 5):
-    global _thread, _symbol
-    _symbol = symbol
+def start(cfg, symbols=None, interval: int = 5):
+    global _thread
+    if symbols is None:
+        symbols = _ALL_SYMBOLS
+    if isinstance(symbols, str):
+        symbols = [symbols]
     _thread = threading.Thread(
-        target=_poll_loop, args=(cfg, symbol, interval), daemon=True
+        target=_poll_loop, args=(cfg, symbols, interval), daemon=True
     )
     _thread.start()
 

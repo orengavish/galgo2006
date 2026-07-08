@@ -334,6 +334,30 @@ CREATE TABLE IF NOT EXISTS cl_algo_fd_results (
 
 CREATE INDEX IF NOT EXISTS idx_cl_fd_sym_date  ON cl_algo_fd_results(symbol, date);
 CREATE INDEX IF NOT EXISTS idx_cl_fd_direction ON cl_algo_fd_results(direction, entry_type);
+
+CREATE TABLE IF NOT EXISTS algo_candidates (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id          TEXT    NOT NULL,
+    rank                INTEGER NOT NULL,
+    symbol              TEXT    NOT NULL,
+    command_class       TEXT    NOT NULL,
+    algo_type           TEXT    NOT NULL,
+    direction           TEXT    NOT NULL,
+    entry_type          TEXT    NOT NULL,
+    entry_price         REAL    NOT NULL,
+    tp_price            REAL    NOT NULL,
+    sl_price            REAL    NOT NULL,
+    bracket             REAL    NOT NULL,
+    entry_line_price    REAL,
+    entry_line_type     TEXT,
+    entry_line_strength INTEGER,
+    entry_line_id       INTEGER,
+    combined_score      REAL,
+    queued_status       TEXT    NOT NULL DEFAULT 'QUEUED',
+    command_ids         TEXT,
+    created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_algo_cand_sess ON algo_candidates(session_id, queued_status, rank);
 """
 
 

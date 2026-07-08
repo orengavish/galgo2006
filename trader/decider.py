@@ -246,6 +246,22 @@ def run_replenishment_loop(ibc, cfg, db_path, date_str: str = None):
             log.info("SESSION=SHUTDOWN — replenishment loop exiting")
             break
 
+        # Reconnect if IB went down (e.g. IBC watchdog restart)
+        if ibc and not ibc.is_live_connected():
+            log.warning("LIVE connection lost — attempting reconnect")
+            try:
+                ok = ibc.reconnect(live=True, paper=False, max_attempts=3)
+                if ok:
+                    log.info("Reconnected to LIVE")
+                else:
+                    log.warning("Reconnect failed — will retry next poll")
+                    time.sleep(poll_seconds)
+                    continue
+            except Exception as e:
+                log.warning(f"Reconnect error: {e} — will retry next poll")
+                time.sleep(poll_seconds)
+                continue
+
         for symbol in cfg.symbols:
             price = get_current_price(symbol, ibc)
             if price is None:

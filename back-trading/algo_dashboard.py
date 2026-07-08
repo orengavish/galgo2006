@@ -17,6 +17,7 @@ Usage:
 
 import sys
 import json
+import uuid
 import argparse
 import threading
 import time
@@ -36,10 +37,33 @@ from lib.db          import get_db, init_db
 from lib.day_params  import get_day_params, _MIN_EXIT_TICKS, _TICK as _DAY_TICK
 from lib.algo_engine import AlgoParams, _build_cmds
 
-_TICK      = 0.25
-_MAX_CMDS  = 400
-_TOP_N     = 100
-_HD_TOP_N  = 5           # top N combos from scorer to apply as HD candidates
+_TICK       = 0.25
+_MAX_CMDS   = 400
+_TOP_N      = 100        # candidates shown in UI
+_BATCH_SIZE = 200        # commands submitted per button press
+_MAX_ACTIVE = 500        # gate: refuse submit if PENDING+SUBMITTING+SUBMITTED >= this
+_HD_TOP_N   = 5          # top N combos from scorer to apply as HD candidates
+
+# Round-number interval (pts) used when auto-generating lines from current price
+_AUTO_LINE_INTERVALS = {"MES": 10, "MNQ": 50, "MYM": 250, "M2K": 10}
+
+
+def _auto_generate_lines(symbol: str, price: float, date_str: str) -> list[dict]:
+    """Generate 2 SUPPORT + 2 RESISTANCE lines at round-number intervals near price."""
+    interval = _AUTO_LINE_INTERVALS.get(symbol, 10)
+    base = round(price / interval) * interval
+    lines = []
+    for i in (2, 1):  # resistance: closer = stronger
+        lines.append({"symbol": symbol, "date": date_str,
+                      "line_type": "RESISTANCE",
+                      "price": float(base + interval * i),
+                      "strength": 3 if i == 1 else 2})
+    for i in (1, 2):  # support: closer = stronger
+        lines.append({"symbol": symbol, "date": date_str,
+                      "line_type": "SUPPORT",
+                      "price": float(base - interval * i),
+                      "strength": 3 if i == 1 else 2})
+    return lines
 
 # Default HD combo grid — full Cartesian product used when no backtest scores exist.
 # Intentionally broad ("thousands in memory, top 100 shown"); pruned at scoring stage.
@@ -56,6 +80,9 @@ _HD_DEFAULT_COMBOS = [
 _TRADER_URL = "http://127.0.0.1:5001"
 
 ALL_SYMBOLS = ["MES", "MNQ", "MYM", "M2K"]
+
+# Minimum bracket (TP distance in points) — filters out too-tight combos that stop out immediately
+_MIN_BRACKET = {"MES": 4.0, "MNQ": 4.0, "MYM": 4.0, "M2K": 2.0}
 
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -74,7 +101,6 @@ _HIST_PATH_OVERRIDE: Path | None = None
 def _resolve_db() -> Path:
     if _DB_PATH_OVERRIDE:
         return _DB_PATH_OVERRIDE
-    # Try trader/config.yaml — resolve db path relative to the config file's directory
     cfg_path = _ROOT / "trader" / "config.yaml"
     if cfg_path.exists():
         try:
@@ -88,6 +114,39 @@ def _resolve_db() -> Path:
     return (_ROOT / "trader" / "data" / "galao.db").resolve()
 
 
+def _ensure_tables(db_path: Path) -> None:
+    """Create algo_candidates table if it doesn't exist (safe on existing DBs)."""
+    with get_db(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS algo_candidates (
+                id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id          TEXT    NOT NULL,
+                rank                INTEGER NOT NULL,
+                symbol              TEXT    NOT NULL,
+                command_class       TEXT    NOT NULL,
+                algo_type           TEXT    NOT NULL,
+                direction           TEXT    NOT NULL,
+                entry_type          TEXT    NOT NULL,
+                entry_price         REAL    NOT NULL,
+                tp_price            REAL    NOT NULL,
+                sl_price            REAL    NOT NULL,
+                bracket             REAL    NOT NULL,
+                entry_line_price    REAL,
+                entry_line_type     TEXT,
+                entry_line_strength INTEGER,
+                entry_line_id       INTEGER,
+                combined_score      REAL,
+                queued_status       TEXT    NOT NULL DEFAULT 'QUEUED',
+                command_ids         TEXT,
+                created_at          TEXT    NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+            )
+        """)
+        con.execute(
+            "CREATE INDEX IF NOT EXISTS idx_algo_cand_sess"
+            " ON algo_candidates(session_id, queued_status, rank)"
+        )
+
+
 def _resolve_history() -> Path:
     if _HIST_PATH_OVERRIDE:
         return _HIST_PATH_OVERRIDE
@@ -99,7 +158,7 @@ def _resolve_history() -> Path:
 def _fetch_price(symbol: str = "MES") -> dict:
     """Try live price from port 5001; fall back to price_cache in DB."""
     try:
-        r = requests.get(f"{_TRADER_URL}/api/price", timeout=1.5)
+        r = requests.get(f"{_TRADER_URL}/api/price", params={"symbol": symbol}, timeout=1.5)
         if r.ok:
             data = r.json()
             if data.get("price"):
@@ -152,6 +211,18 @@ def _find_sl_line(line_price: float, direction: str, lines: list[dict]) -> dict 
         return min(cands, key=lambda l: l["price"]) if cands else None
 
 
+def _get_armed_symbols(db_path: Path) -> list[str]:
+    """Return symbols that have at least one armed critical line, ordered."""
+    try:
+        with get_db(db_path) as con:
+            rows = con.execute(
+                "SELECT DISTINCT symbol FROM critical_lines WHERE armed=1 ORDER BY symbol"
+            ).fetchall()
+        return [r[0] for r in rows]
+    except Exception:
+        return []
+
+
 def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list[dict], dict]:
     """
     Build and score trade candidates in memory.
@@ -161,22 +232,28 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
     hist_dir   = _resolve_history()
 
     with get_db(db_path) as con:
-        # Most recent date with armed lines for these symbols
-        ph = ",".join("?" * len(symbols))
-        date_row = con.execute(
-            f"SELECT MAX(date) FROM critical_lines WHERE armed=1 AND symbol IN ({ph})",
-            symbols
-        ).fetchone()
-        date_str = date_row[0] if date_row and date_row[0] else None
-        if not date_str:
-            return [], {"error": "No armed critical lines found",
+        # Most recent armed date per symbol independently
+        sym_dates: dict[str, str] = {}
+        for sym in symbols:
+            row = con.execute(
+                "SELECT MAX(date) FROM critical_lines WHERE armed=1 AND symbol=?", (sym,)
+            ).fetchone()
+            if row and row[0]:
+                sym_dates[sym] = row[0]
+
+        if not sym_dates:
+            return [], {"error": "No armed critical lines found for selected symbols",
                         "n_returned": 0, "n_generated": 0, "n_lines": 0}
 
-        # All armed lines for that date + symbols
-        lines_all = [dict(r) for r in con.execute(
-            f"SELECT * FROM critical_lines WHERE armed=1 AND date=? AND symbol IN ({ph})",
-            [date_str] + list(symbols)
-        ).fetchall()]
+        # Armed lines — each symbol at its own most-recent date
+        lines_all = []
+        for sym, d in sym_dates.items():
+            rows = con.execute(
+                "SELECT * FROM critical_lines WHERE armed=1 AND date=? AND symbol=?", (d, sym)
+            ).fetchall()
+            lines_all.extend(dict(r) for r in rows)
+
+        date_str = max(sym_dates.values())
 
         # HD: top combos per symbol
         hd_combos: dict[str, list] = {}
@@ -209,6 +286,8 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
     candidates = []
 
     for sym in symbols:
+        if sym not in current_prices:
+            continue  # no live price — skip entirely to avoid stale-level trades
         sym_lines = [l for l in lines_all if l["symbol"] == sym]
         if not sym_lines:
             continue
@@ -350,38 +429,44 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
         c["hist_score"] = round((c["hist_raw"] - mn) / hist_rng, 4)
         c["combined_score"] = round(0.6 * c["hist_score"] + 0.4 * c["proximity"], 4)
 
-    # When all scores are flat (no history, price far from lines), do a round-robin
-    # interleave across algo_types so top-100 has algo diversity rather than just
-    # the first algo_type alphabetically from a stable sort.
+    # Round-robin across symbols first, then algo_types within each symbol —
+    # ensures no single symbol dominates the top-N when scores are flat or scored.
+    import collections
+    from itertools import zip_longest
+
+    def _interleave_by_symbol(cands: list) -> list:
+        sym_groups: dict = collections.defaultdict(list)
+        for c in cands:
+            sym_groups[c["symbol"]].append(c)
+        # Within each symbol, round-robin across algo_types
+        sym_tops: dict = {}
+        for sym, sc in sym_groups.items():
+            at_groups: dict = collections.defaultdict(list)
+            for c in sc:
+                at_groups[c["algo_type"]].append(c)
+            for g in at_groups.values():
+                g.sort(key=lambda c: (-c.get("entry_line_strength", 0),
+                                      c.get("tp_ticks", 0), c.get("sl_ticks", 0)))
+            sym_tops[sym] = []
+            for batch in zip_longest(*[at_groups[a] for a in sorted(at_groups)]):
+                for c in batch:
+                    if c is not None:
+                        sym_tops[sym].append(c)
+        # Round-robin across symbols
+        result = []
+        for batch in zip_longest(*[sym_tops[s] for s in sorted(sym_tops)]):
+            for c in batch:
+                if c is not None:
+                    result.append(c)
+        return result
+
     score_spread = max(c["combined_score"] for c in candidates) - \
                    min(c["combined_score"] for c in candidates)
     if score_spread < 0.001:
-        # Sort within each algo_type by secondary keys (strength DESC, tp_ticks, sl_ticks)
-        import collections
-        groups: dict = collections.defaultdict(list)
-        for c in candidates:
-            groups[c["algo_type"]].append(c)
-        for g in groups.values():
-            g.sort(key=lambda c: (-c.get("entry_line_strength", 0),
-                                  c.get("tp_ticks", 0), c.get("sl_ticks", 0)))
-        # Round-robin across algo_type groups to build top
-        from itertools import zip_longest
-        top = []
-        algo_order = sorted(groups.keys())  # deterministic order
-        for batch in zip_longest(*[groups[a] for a in algo_order]):
-            for c in batch:
-                if c is not None:
-                    top.append(c)
-                    if len(top) == _TOP_N:
-                        break
-            if len(top) == _TOP_N:
-                break
-        # Re-sort the selected top-100 by (entry_line_strength DESC, algo_type) for display
-        top.sort(key=lambda c: (-c.get("entry_line_strength", 0), c["algo_type"],
-                                c.get("tp_ticks", 0), c.get("sl_ticks", 0)))
+        top = _interleave_by_symbol(candidates)
     else:
         candidates.sort(key=lambda c: c["combined_score"], reverse=True)
-        top = candidates[:_TOP_N]
+        top = _interleave_by_symbol(candidates)
 
     for i, c in enumerate(top):
         c["rank"] = i + 1
@@ -408,6 +493,11 @@ def trades_page():
     return render_template("trades.html", active="trades", symbols=ALL_SYMBOLS)
 
 
+@app.route("/lines")
+def lines_page():
+    return render_template("lines.html", active="lines", symbols=ALL_SYMBOLS)
+
+
 # ── Routes: API ───────────────────────────────────────────────────────────────
 
 @app.route("/api/price")
@@ -429,18 +519,82 @@ def api_create():
         if info["price"] is not None:
             prices[sym] = info["price"]
 
+    today   = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    db_path = _resolve_db()
+    _ensure_tables(db_path)
+
+    # Auto-generate lines at current price, replacing stale armed lines.
+    # Disarm lines for any checked symbol that has no live price (stale/wrong levels).
+    lines_created = []
+    with get_db(db_path) as con:
+        for sym in symbols:
+            px = prices.get(sym)
+            if px is None:
+                # No current price — disarm any leftover lines to avoid stale trades
+                con.execute("UPDATE critical_lines SET armed=0 WHERE symbol=? AND armed=1", (sym,))
+                continue
+            con.execute("UPDATE critical_lines SET armed=0 WHERE symbol=? AND armed=1", (sym,))
+            for ln in _auto_generate_lines(sym, px, today):
+                con.execute(
+                    "INSERT INTO critical_lines(symbol,date,line_type,price,strength,armed)"
+                    " VALUES(?,?,?,?,?,1)",
+                    (ln["symbol"], ln["date"], ln["line_type"], ln["price"], ln["strength"])
+                )
+                lines_created.append(ln)
+
+    # Generate ALL candidates (no display cap)
     cands, meta = _generate_candidates(symbols, prices)
 
+    # Drop candidates with too-tight brackets (stop out on first tick)
+    cands = [c for c in cands if c["bracket"] >= _MIN_BRACKET.get(c["symbol"], 4.0)]
+
+    # Persist to algo_candidates queue
+    session_id = str(uuid.uuid4())
+    if cands:
+        with get_db(db_path) as con:
+            con.execute(
+                "UPDATE algo_candidates SET queued_status='SKIPPED'"
+                " WHERE queued_status='QUEUED'"
+            )
+            con.executemany(
+                "INSERT INTO algo_candidates"
+                "(session_id,rank,symbol,command_class,algo_type,direction,entry_type,"
+                " entry_price,tp_price,sl_price,bracket,"
+                " entry_line_price,entry_line_type,entry_line_strength,entry_line_id,combined_score)"
+                " VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [(session_id, c["rank"], c["symbol"], c["command_class"], c["algo_type"],
+                  c["direction"], c["entry_type"],
+                  c["entry_price"], c["tp_price"], c["sl_price"], c["bracket"],
+                  c.get("entry_line_price"), c.get("entry_line_type"),
+                  c.get("entry_line_strength"), c.get("entry_line_id"),
+                  c.get("combined_score"))
+                 for c in cands]
+            )
+            con.execute(
+                "INSERT OR REPLACE INTO system_state(key,value,updated_at)"
+                " VALUES('ALGO_SESSION_ID',?,strftime('%Y-%m-%dT%H:%M:%SZ','now'))",
+                (session_id,)
+            )
+
+    # Store top 100 for UI display only
+    display = cands[:_TOP_N]
     with _candidates_lock:
         _candidates.clear()
-        _candidates.extend(cands)
+        _candidates.extend(display)
         _candidates_meta.clear()
         _candidates_meta.update(meta)
 
+    meta["lines_created"]      = len(lines_created)
+    meta["total_queued"]       = len(cands)
     meta["price_source_label"] = (
         "live" if any(_fetch_price(s)["source"] == "live" for s in symbols) else "delayed"
     )
-    return jsonify({"candidates": cands, "meta": meta})
+    return jsonify({
+        "candidates":   display,
+        "meta":         meta,
+        "session_id":   session_id,
+        "total_queued": len(cands),
+    })
 
 
 @app.route("/api/algo/candidates")
@@ -449,56 +603,174 @@ def api_candidates():
         return jsonify({"candidates": _candidates, "meta": _candidates_meta})
 
 
+@app.route("/api/algo/queue")
+def api_queue_status():
+    db_path = _resolve_db()
+    try:
+        _ensure_tables(db_path)
+        with get_db(db_path) as con:
+            sess = con.execute(
+                "SELECT value FROM system_state WHERE key='ALGO_SESSION_ID'"
+            ).fetchone()
+            if not sess:
+                return jsonify({"session_id": None, "queued": 0, "submitted_cands": 0,
+                                "total": 0, "active_commands": 0,
+                                "max_active": _MAX_ACTIVE, "batch_size": _BATCH_SIZE,
+                                "batches_remaining": 0, "next_batch_start": 0, "next_batch_end": 0})
+            session_id = sess["value"]
+            rows = con.execute(
+                "SELECT queued_status, COUNT(*) n FROM algo_candidates WHERE session_id=?"
+                " GROUP BY queued_status",
+                (session_id,)
+            ).fetchall()
+            counts = {r["queued_status"]: r["n"] for r in rows}
+            active = con.execute(
+                "SELECT COUNT(*) FROM commands WHERE source='algo_dashboard'"
+                " AND status IN ('PENDING','SUBMITTING','SUBMITTED')"
+            ).fetchone()[0]
+        queued     = counts.get("QUEUED", 0)
+        submitted  = counts.get("SUBMITTED", 0)
+        total      = queued + submitted + counts.get("SKIPPED", 0)
+        n_batches  = (queued + _BATCH_SIZE - 1) // _BATCH_SIZE if queued else 0
+        next_start = submitted + 1
+        next_end   = submitted + min(_BATCH_SIZE, queued)
+        return jsonify({
+            "session_id":       session_id,
+            "queued":           queued,
+            "submitted_cands":  submitted,
+            "total":            total,
+            "active_commands":  active,
+            "max_active":       _MAX_ACTIVE,
+            "batch_size":       _BATCH_SIZE,
+            "batches_remaining":n_batches,
+            "next_batch_start": next_start,
+            "next_batch_end":   next_end,
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+def _sanity_check(cand: dict, current_prices: dict) -> tuple[bool, str]:
+    """Return (ok, reason). Fails if order would fill immediately or entry is unreachable."""
+    sym   = cand["symbol"]
+    price = current_prices.get(sym)
+    if price is None:
+        return False, "no live price"
+
+    entry      = cand["entry_price"]
+    direction  = cand["direction"]
+    entry_type = cand["entry_type"]
+    avg_move   = cand.get("avg_move") or 16.0
+
+    # Distance gate: entry must be within 2 avg_moves of current price
+    if abs(price - entry) > 2.0 * avg_move:
+        return False, f"entry {entry} too far from market {price:.2f} (>{2*avg_move:.1f})"
+
+    # Direction-type check: will this fill immediately or is it pending correctly?
+    if entry_type in ("LMT", "LMT+STP"):
+        if direction == "BUY" and price <= entry:
+            return False, f"BUY LMT {entry} but market {price:.2f} already at/below entry"
+        if direction == "SELL" and price >= entry:
+            return False, f"SELL LMT {entry} but market {price:.2f} already at/above entry"
+    elif entry_type == "STP":
+        if direction == "BUY" and price >= entry:
+            return False, f"BUY STP {entry} but market {price:.2f} already at/above stop"
+        if direction == "SELL" and price <= entry:
+            return False, f"SELL STP {entry} but market {price:.2f} already at/below stop"
+
+    return True, "ok"
+
+
 @app.route("/api/algo/submit", methods=["POST"])
 def api_submit():
-    with _candidates_lock:
-        cands = list(_candidates)
-
-    if not cands:
-        return jsonify({"error": "No candidates — run Create Trades first."}), 400
-
-    # Require price (any symbol)
-    has_price = any(
-        _fetch_price(s)["price"] is not None
-        for s in {c["symbol"] for c in cands}
-    )
-    if not has_price:
-        return jsonify({"error": "No price available. Start IBC Gateway or wait for delayed feed."}), 400
-
     db_path = _resolve_db()
+
     with get_db(db_path) as con:
-        # Only count algo_dashboard commands toward the cap — trader orders are separate
+        sess = con.execute(
+            "SELECT value FROM system_state WHERE key='ALGO_SESSION_ID'"
+        ).fetchone()
+    if not sess:
+        return jsonify({"error": "No active queue — run Create Trades first."}), 400
+    session_id = sess["value"]
+
+    with get_db(db_path) as con:
         active = con.execute(
-            "SELECT COUNT(*) FROM commands"
-            " WHERE source='algo_dashboard'"
-            " AND status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
+            "SELECT COUNT(*) FROM commands WHERE source='algo_dashboard'"
+            " AND status IN ('PENDING','SUBMITTING','SUBMITTED')"
         ).fetchone()[0]
+    if active >= _MAX_ACTIVE:
+        return jsonify({
+            "error": f"Too many active orders ({active}/{_MAX_ACTIVE}). Cancel some first."
+        }), 400
 
-    n_orders = sum(2 if c["entry_type"] == "LMT+STP" else 1 for c in cands)
-    if active + n_orders > _MAX_CMDS:
-        headroom = max(0, _MAX_CMDS - active)
-        msg = (f"Limit already exceeded ({active}/{_MAX_CMDS} active)."
-               if headroom == 0 else
-               f"Would exceed {_MAX_CMDS}-command limit. "
-               f"{active} active + {n_orders} new = {active+n_orders}. "
-               f"Can submit at most {headroom} more — cancel some PENDING orders first.")
-        return jsonify({"error": msg}), 400
+    slots = min(_BATCH_SIZE, _MAX_ACTIVE - active)
 
+    # Fetch more than slots to have candidates to scan through after demotions
+    with get_db(db_path) as con:
+        scan_pool = [dict(r) for r in con.execute(
+            "SELECT * FROM algo_candidates WHERE session_id=? AND queued_status='QUEUED'"
+            " ORDER BY rank ASC LIMIT ?",
+            (session_id, slots * 5)
+        ).fetchall()]
+        max_rank = con.execute(
+            "SELECT MAX(rank) FROM algo_candidates WHERE session_id=?", (session_id,)
+        ).fetchone()[0] or 0
+
+    if not scan_pool:
+        return jsonify({"error": "Queue empty — run Create Trades to generate a new queue."}), 400
+
+    # Fetch live prices once
+    current_prices = {}
+    for sym in ALL_SYMBOLS:
+        info = _fetch_price(sym)
+        if info["price"] is not None:
+            current_prices[sym] = info["price"]
+
+    # Walk ranked candidates: pass → submit, fail → demote to bottom
+    to_submit  = []
+    to_demote  = []
+    demote_ctr = 0
+    for c in scan_pool:
+        if len(to_submit) >= slots:
+            break
+        ok, reason = _sanity_check(c, current_prices)
+        if ok:
+            to_submit.append(c)
+        else:
+            demote_ctr += 1
+            to_demote.append((c["id"], max_rank + demote_ctr, reason))
+
+    if not to_submit:
+        reasons = list({r for _, _, r in to_demote[:5]})
+        with get_db(db_path) as con:
+            for (cid, new_rank, _) in to_demote:
+                con.execute("UPDATE algo_candidates SET rank=? WHERE id=?", (new_rank, cid))
+        return jsonify({
+            "submitted": 0,
+            "demoted":   len(to_demote),
+            "reasons":   reasons,
+            "error":     f"All {len(to_demote)} candidates failed sanity. Demoted to end of queue.",
+        }), 200
+
+    # Build command rows for passing candidates
     rows = []
-    for c in cands:
-        bracket = round(abs(c["tp_price"] - c["entry_price"]), 4)
-        # FD candidates carry entry_type="LMT+STP" → expand into two separate orders
+    for c in to_submit:
         etypes = ["LMT", "STP"] if c["entry_type"] == "LMT+STP" else [c["entry_type"]]
         for etype in etypes:
             rows.append((
                 c["symbol"],
-                c["entry_line_price"], c["entry_line_type"], c["entry_line_strength"],
+                c.get("entry_line_price") or 0,
+                c.get("entry_line_type") or "",
+                c.get("entry_line_strength") or 1,
                 c["direction"], etype,
                 c["entry_price"], c["tp_price"], c["sl_price"],
-                bracket, "algo_dashboard",
+                c["bracket"], "algo_dashboard",
                 c.get("entry_line_id"),
-                1,  # quantity
+                1,
             ))
+
+    submit_ids = [c["id"] for c in to_submit]
+    demote_ids = [(cid, new_rank) for cid, new_rank, _ in to_demote]
 
     with get_db(db_path) as con:
         con.executemany("""
@@ -508,33 +780,127 @@ def api_submit():
                  bracket_size, source, critical_line_id, quantity, status)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,'PENDING')
         """, rows)
+        con.execute(
+            f"UPDATE algo_candidates SET queued_status='SUBMITTED'"
+            f" WHERE id IN ({','.join('?'*len(submit_ids))})",
+            submit_ids
+        )
+        for (cid, new_rank) in demote_ids:
+            con.execute("UPDATE algo_candidates SET rank=? WHERE id=?", (new_rank, cid))
 
-    # Clear candidates so double-submit is blocked
-    with _candidates_lock:
-        _candidates.clear()
+    with get_db(db_path) as con:
+        remaining = con.execute(
+            "SELECT COUNT(*) FROM algo_candidates WHERE session_id=? AND queued_status='QUEUED'",
+            (session_id,)
+        ).fetchone()[0]
 
-    return jsonify({"submitted": len(rows), "active_after": active + len(rows)})
+    return jsonify({
+        "submitted":           len(rows),
+        "candidates_consumed": len(to_submit),
+        "demoted":             len(to_demote),
+        "active_after":        active + len(rows),
+        "remaining_queued":    remaining,
+    })
+
+
+@app.route("/api/algo/clear-errors", methods=["POST"])
+def api_clear_errors():
+    """Flip all ERROR algo_dashboard commands to CANCELLED and remove from display."""
+    db_path = _resolve_db()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with get_db(db_path) as con:
+        n = con.execute(
+            "UPDATE commands SET status='CANCELLED', updated_at=?"
+            " WHERE source='algo_dashboard' AND status='ERROR'",
+            (now_str,)
+        ).rowcount
+    return jsonify({"cleared": n})
 
 
 @app.route("/api/algo/purge", methods=["POST"])
 def api_purge():
-    """Cancel (set CANCELLED) all PENDING commands from source='algo_dashboard'."""
+    """Cancel all open algo_dashboard commands (PENDING/SUBMITTED/FILLED/CLOSED/ERROR).
+
+    PENDING/CLOSED/ERROR: pure DB flip, no open IB orders.
+    SUBMITTED: cancel all 3 bracket legs in IB, then flip DB.
+    FILLED: cancel TP+SL child orders in IB (entry already done), then flip DB.
+    """
     db_path = _resolve_db()
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    # 0 — DB-only statuses: PENDING, CLOSED, ERROR
     with get_db(db_path) as con:
-        cur = con.execute(
-            "UPDATE commands SET status='CANCELLED', updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')"
-            " WHERE source='algo_dashboard' AND status='PENDING'"
-        )
-        n = cur.rowcount
-    return jsonify({"cancelled": n})
+        n_db_only = con.execute(
+            "UPDATE commands SET status='CANCELLED', updated_at=?"
+            " WHERE source='algo_dashboard' AND status IN ('PENDING','CLOSED','ERROR')",
+            (now_str,)
+        ).rowcount
+
+    # Fetch SUBMITTED and FILLED rows — both need IB cancels
+    with get_db(db_path) as con:
+        sub_rows = [dict(r) for r in con.execute(
+            "SELECT id, status, ib_order_id, ib_tp_order_id, ib_sl_order_id"
+            " FROM commands WHERE source='algo_dashboard' AND status='SUBMITTED'"
+        ).fetchall()]
+        fil_rows = [dict(r) for r in con.execute(
+            "SELECT id, status, ib_order_id, ib_tp_order_id, ib_sl_order_id"
+            " FROM commands WHERE source='algo_dashboard' AND status='FILLED'"
+        ).fetchall()]
+
+    n_submitted = len(sub_rows)
+    n_filled    = len(fil_rows)
+    n_ib_errors = 0
+
+    ib_rows = sub_rows + fil_rows
+    if ib_rows:
+        try:
+            from lib.ib_client import IBClient
+            from lib.config_loader import get_config
+            from ib_insync import Order as IBOrder
+            cfg    = get_config(_ROOT / "trader" / "config.yaml")
+            client = IBClient(cfg)
+            client.connect(live=False, paper=True)
+            try:
+                for row in ib_rows:
+                    # SUBMITTED: cancel entry + TP + SL
+                    # FILLED: entry is done — cancel TP + SL only (entry cancel would error harmlessly)
+                    for oid in (row["ib_order_id"], row["ib_tp_order_id"], row["ib_sl_order_id"]):
+                        if oid is None:
+                            continue
+                        try:
+                            o = IBOrder()
+                            o.orderId = int(oid)
+                            client.cancel_order(o)
+                        except Exception:
+                            n_ib_errors += 1
+                import time; time.sleep(1)
+            finally:
+                client.disconnect()
+        except Exception as e:
+            n_ib_errors += len(ib_rows)
+
+        # Always flip DB regardless of IB result
+        cmd_ids = [r["id"] for r in ib_rows]
+        with get_db(db_path) as con:
+            con.execute(
+                f"UPDATE commands SET status='CANCELLED', updated_at=?"
+                f" WHERE id IN ({','.join('?'*len(cmd_ids))})",
+                [now_str] + cmd_ids
+            )
+
+    total = n_db_only + n_submitted + n_filled
+    return jsonify({"cancelled": total, "db_only": n_db_only,
+                    "submitted": n_submitted, "filled": n_filled,
+                    "ib_errors": n_ib_errors})
 
 
 @app.route("/api/algo/trades")
 def api_algo_trades():
-    sym    = request.args.get("symbol")
-    status = request.args.get("status")
-    algo   = request.args.get("algo_type")
-    limit  = min(int(request.args.get("limit", 500)), 2000)
+    sym            = request.args.get("symbol")
+    status         = request.args.get("status")
+    exclude_status = request.args.get("exclude_status", "")
+    algo           = request.args.get("algo_type")
+    limit          = min(int(request.args.get("limit", 500)), 2000)
 
     db_path = _resolve_db()
     filters = ["source='algo_dashboard'"]
@@ -543,6 +909,11 @@ def api_algo_trades():
         filters.append("symbol=?"); params.append(sym)
     if status:
         filters.append("status=?"); params.append(status)
+    if exclude_status and not status:
+        ex_list = [s.strip() for s in exclude_status.split(",") if s.strip()]
+        if ex_list:
+            filters.append(f"status NOT IN ({','.join('?'*len(ex_list))})")
+            params.extend(ex_list)
 
     where = " AND ".join(filters)
     with get_db(db_path) as con:
@@ -559,7 +930,7 @@ def api_algo_stats():
     with get_db(db_path) as con:
         by_sym_rows = con.execute("""
             SELECT symbol,
-                   SUM(CASE WHEN status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED') THEN 1 ELSE 0 END) as active,
+                   SUM(CASE WHEN status IN ('PENDING','SUBMITTING','SUBMITTED') THEN 1 ELSE 0 END) as active,
                    SUM(CASE WHEN status='FILLED'    THEN 1 ELSE 0 END) as filled,
                    SUM(CASE WHEN status='CLOSED'    THEN 1 ELSE 0 END) as closed
             FROM commands WHERE source='algo_dashboard'
@@ -617,6 +988,75 @@ def api_algo_trade_detail(cmd_id):
     if line:
         result["critical_line"] = dict(line)
     return jsonify(result)
+
+
+@app.route("/api/algo/lines", methods=["GET"])
+def api_algo_lines_list():
+    db_path = _resolve_db()
+    symbol  = request.args.get("symbol")
+    armed   = request.args.get("armed")
+    filters = []
+    params  = []
+    if symbol:
+        filters.append("symbol=?"); params.append(symbol)
+    if armed is not None:
+        filters.append("armed=?"); params.append(1 if armed == "1" else 0)
+    where = ("WHERE " + " AND ".join(filters)) if filters else ""
+    with get_db(db_path) as con:
+        rows = con.execute(
+            f"SELECT * FROM critical_lines {where} ORDER BY date DESC, symbol, price",
+            params
+        ).fetchall()
+    return jsonify([dict(r) for r in rows])
+
+
+@app.route("/api/algo/lines", methods=["POST"])
+def api_algo_lines_add():
+    body     = request.get_json(silent=True) or {}
+    symbol   = body.get("symbol", "").upper().strip()
+    date_str = body.get("date", "").strip()
+    line_type= body.get("line_type", "").upper().strip()
+    price    = body.get("price")
+    strength = int(body.get("strength", 2))
+
+    if symbol not in ALL_SYMBOLS:
+        return jsonify({"error": f"Unknown symbol: {symbol}"}), 400
+    if line_type not in ("SUPPORT", "RESISTANCE"):
+        return jsonify({"error": "line_type must be SUPPORT or RESISTANCE"}), 400
+    if price is None:
+        return jsonify({"error": "price required"}), 400
+    if not date_str:
+        return jsonify({"error": "date required"}), 400
+    if strength not in (1, 2, 3):
+        strength = 2
+
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        cur = con.execute(
+            "INSERT INTO critical_lines(symbol,date,line_type,price,strength,armed)"
+            " VALUES(?,?,?,?,?,1)",
+            (symbol, date_str, line_type, float(price), strength)
+        )
+        new_id = cur.lastrowid
+    return jsonify({"ok": True, "id": new_id})
+
+
+@app.route("/api/algo/lines/<int:line_id>", methods=["DELETE"])
+def api_algo_lines_delete(line_id: int):
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        n = con.execute("DELETE FROM critical_lines WHERE id=?", (line_id,)).rowcount
+    return jsonify({"ok": True, "deleted": n})
+
+
+@app.route("/api/algo/lines/<int:line_id>/arm", methods=["POST"])
+def api_algo_lines_arm(line_id: int):
+    body    = request.get_json(silent=True) or {}
+    armed   = 1 if body.get("armed", True) else 0
+    db_path = _resolve_db()
+    with get_db(db_path) as con:
+        n = con.execute("UPDATE critical_lines SET armed=? WHERE id=?", (armed, line_id)).rowcount
+    return jsonify({"ok": True, "updated": n})
 
 
 # ── Self-test ─────────────────────────────────────────────────────────────────
@@ -711,6 +1151,7 @@ if __name__ == "__main__":
 
     db_path = _resolve_db()
     init_db(db_path)
+    _ensure_tables(db_path)
     print(f"Algo Dashboard starting on http://{args.host}:{args.port}")
     print(f"DB: {db_path}")
     app.run(host=args.host, port=args.port, debug=False)
