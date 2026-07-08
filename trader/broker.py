@@ -286,17 +286,13 @@ def poll_fills(ibc: IBClient, db_path) -> int:
         log.error(f"Error fetching trades: {e}")
         return 0
 
-    # Build lookup: ib_order_id → fill status
-    filled_ids = {}
+    # Build lookup: ib_order_id → (status, fill_price)
+    ib_status_by_oid = {}
     for trade in trades:
         oid = trade.order.orderId
         status = trade.orderStatus.status
         fill_price = trade.orderStatus.avgFillPrice
-        if status in ("Filled", "PartiallyFilled"):
-            filled_ids[oid] = (status, fill_price)
-
-    if not filled_ids:
-        return 0
+        ib_status_by_oid[oid] = (status, fill_price)
 
     # Find SUBMITTED commands whose entry order was filled
     with get_db(db_path) as con:
@@ -311,8 +307,16 @@ def poll_fills(ibc: IBClient, db_path) -> int:
 
     for cmd in submitted:
         entry_oid = cmd["ib_order_id"]
-        if entry_oid in filled_ids:
-            status, fill_price = filled_ids[entry_oid]
+        ib_info = ib_status_by_oid.get(entry_oid)
+
+        if ib_info is None:
+            # Order not in IB's trade list at all — may have been silently dropped.
+            # Don't flip status here; wait for an explicit cancel event.
+            continue
+
+        ib_status, fill_price = ib_info
+
+        if ib_status in ("Filled", "PartiallyFilled"):
             # R-ORD-13: treat all fills as complete (partial fills ignored in V1)
             now = _now_utc()
             log.info(f"Command {cmd['id']} FILLED — price={fill_price}")
@@ -327,6 +331,17 @@ def poll_fills(ibc: IBClient, db_path) -> int:
                 with _rebase_lock:
                     _rebase_queue.append((cmd["id"], fill_price))
             fills += 1
+
+        elif ib_status in ("Cancelled", "Inactive", "ApiCancelled"):
+            # IB cancelled the order (day-order expiry, margin violation, manual cancel,
+            # connectivity gap). Flip DB to CANCELLED so the slot is freed and
+            # the candidate can be resubmitted if needed.
+            log.warning(
+                f"Command {cmd['id']} IB order {entry_oid} is {ib_status} — "
+                "marking CANCELLED in DB"
+            )
+            with get_db(db_path) as con:
+                update_command_status(con, cmd["id"], "CANCELLED")
 
     return fills
 

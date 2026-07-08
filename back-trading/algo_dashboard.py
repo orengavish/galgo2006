@@ -21,6 +21,8 @@ import uuid
 import argparse
 import threading
 import time
+import collections
+from itertools import zip_longest
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -83,6 +85,14 @@ ALL_SYMBOLS = ["MES", "MNQ", "MYM", "M2K"]
 
 # Minimum bracket (TP distance in points) — filters out too-tight combos that stop out immediately
 _MIN_BRACKET = {"MES": 4.0, "MNQ": 4.0, "MYM": 4.0, "M2K": 2.0}
+
+# Per-symbol minimum SL distance in points — prevents near-zero stops that guarantee immediate exit
+_MIN_SL_PTS = {"MES": 1.0, "MNQ": 4.0, "MYM": 10.0, "M2K": 0.5}
+
+# Per-symbol minimum avg_move used for distance gate and FD TP/SL/proximity scaling.
+# day_params computes from prior-day CSV but may return a small default (10.0) when no data.
+# These floors ensure reasonable behaviour even with missing history.
+_MIN_AVG_MOVE = {"MES": 16.0, "MNQ": 150.0, "M2K": 20.0, "MYM": 200.0}
 
 
 # ── App setup ─────────────────────────────────────────────────────────────────
@@ -300,7 +310,7 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
         cur_price = current_prices.get(sym)
 
         params = get_day_params(db_path, sym, date_str, hist_dir)
-        avg_move  = params["two_hour_avg_move"]
+        avg_move  = max(params["two_hour_avg_move"], _MIN_AVG_MOVE.get(sym, 16.0))
         tick_buf  = params["tick_buffer"]
         buf_price = _rt(tick_buf * _TICK)
 
@@ -437,9 +447,6 @@ def _generate_candidates(symbols: list[str], current_prices: dict) -> tuple[list
 
     # Round-robin across symbols first, then algo_types within each symbol —
     # ensures no single symbol dominates the top-N when scores are flat or scored.
-    import collections
-    from itertools import zip_longest
-
     def _interleave_by_symbol(cands: list) -> list:
         sym_groups: dict = collections.defaultdict(list)
         for c in cands:
@@ -551,8 +558,10 @@ def api_create():
     # Generate ALL candidates (no display cap)
     cands, meta = _generate_candidates(symbols, prices)
 
-    # Drop candidates with too-tight brackets (stop out on first tick)
+    # Drop candidates with too-tight TP bracket or too-tight SL (near-instant stop-out)
     cands = [c for c in cands if c["bracket"] >= _MIN_BRACKET.get(c["symbol"], 4.0)]
+    cands = [c for c in cands
+             if abs(c["sl_price"] - c["entry_price"]) >= _MIN_SL_PTS.get(c["symbol"], 1.0)]
 
     # Deduplicate: one entry per (symbol, direction, entry_type, entry_price, bracket)
     # Multiple lines can produce identical candidates — keep highest-ranked (first in list)
@@ -678,7 +687,6 @@ def _sanity_check(cand: dict, current_prices: dict) -> tuple[bool, str]:
     entry      = cand["entry_price"]
     direction  = cand["direction"]
     entry_type = cand["entry_type"]
-    _MIN_AVG_MOVE = {"MES": 16.0, "MNQ": 150.0, "M2K": 20.0, "MYM": 200.0}
     avg_move   = max(cand.get("avg_move") or 0, _MIN_AVG_MOVE.get(sym, 16.0))
 
     # Distance gate: entry must be within 2 avg_moves of current price
@@ -758,9 +766,10 @@ def api_submit():
     }
 
     # Walk ranked candidates: pass → submit, fail → demote to bottom
-    to_submit  = []
-    to_demote  = []
-    demote_ctr = 0
+    to_submit     = []
+    to_demote     = []
+    demote_ctr    = 0
+    transient_reasons: set = set()   # non-duplicate sanity failures (market-distance, direction)
     for c in scan_pool:
         if len(to_submit) >= slots:
             break
@@ -780,19 +789,21 @@ def api_submit():
             to_submit.append(c)
             active_entry_keys.update(entry_keys)  # prevent same key twice in this batch
         else:
-            demote_ctr += 1
-            to_demote.append((c["id"], max_rank + demote_ctr, reason))
+            # Duplicates get demoted — they resolve only when the active position clears.
+            # Market-distance and direction failures are transient: leave rank unchanged
+            # so they stay in queue order and pass on the next submit when price has moved.
+            transient_reasons.add(reason)
 
     if not to_submit:
-        reasons = list({r for _, _, r in to_demote[:5]})
         with get_db(db_path) as con:
             for (cid, new_rank, _) in to_demote:
                 con.execute("UPDATE algo_candidates SET rank=? WHERE id=?", (new_rank, cid))
+        all_reasons = list({"duplicate entry"} & {r for _, _, r in to_demote} | transient_reasons)
         return jsonify({
             "submitted": 0,
             "demoted":   len(to_demote),
-            "reasons":   reasons,
-            "error":     f"All {len(to_demote)} candidates failed sanity. Demoted to end of queue.",
+            "reasons":   all_reasons[:5],
+            "error":     f"All {len(scan_pool)} candidates failed sanity. Demoted to end of queue.",
         }), 200
 
     # Build command rows for passing candidates
@@ -819,7 +830,9 @@ def api_submit():
                         valid.append("LMT")
                     if price > entry:
                         valid.append("STP")
-            etypes = valid or ["LMT"]
+            if not valid:
+                continue  # price == entry exactly: neither leg is safe, skip
+            etypes = valid
         else:
             etypes = [c["entry_type"]]
         for etype in etypes:

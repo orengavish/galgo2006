@@ -266,7 +266,7 @@ async function clearErrors(){
 }
 
 async function purgePending(){
-  if(!confirm('Cancel ALL open algo commands (PENDING + SUBMITTED)? IB orders will be cancelled.')) return;
+  if(!confirm('Cancel ALL open algo commands (PENDING + SUBMITTED + FILLED)? All IB orders and open positions will be cancelled.')) return;
   const btn = document.getElementById('btn-purge');
   const msg = document.getElementById('purge-msg');
   btn.disabled = true;
