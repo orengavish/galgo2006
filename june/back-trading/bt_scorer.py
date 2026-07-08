@@ -346,6 +346,8 @@ def run_scoring(bt_db_path: Path, run_mc: bool = True,
             own = composites[ps_id]
             if nb_scores and own > 0:
                 m["stability_zone"] = round(_mean(nb_scores) / own, 4)
+                if m["stability_zone"] < STABILITY_THRESHOLD:
+                    m["status"] = "unstable"
             else:
                 m["stability_zone"] = None
         else:

@@ -38,10 +38,13 @@ AXIS_KEYS = list(AXES.keys())
 
 # Session window boundaries in CT (hour, minute)
 SESSION_WINDOWS = {
-    "ALL":       (dtime(8, 30),  dtime(15, 15)),
-    "MORNING":   (dtime(8, 30),  dtime(11,  0)),
-    "MIDDAY":    (dtime(11,  0), dtime(13, 30)),
-    "AFTERNOON": (dtime(13, 30), dtime(15, 15)),
+    "ALL":        (dtime(8, 30),  dtime(15, 15)),
+    "MORNING":    (dtime(8, 30),  dtime(11,  0)),
+    "MIDDAY":     (dtime(11,  0), dtime(13, 30)),
+    "AFTERNOON":  (dtime(13, 30), dtime(15, 15)),
+    # PRE_MARKET: not yet in AXES — 69% of verified trades fall here (00:00–08:29 CT).
+    # Add "PRE_MARKET" to AXES["session_window"] when ready to expand the matrix.
+    "PRE_MARKET": (dtime(0,  0),  dtime(8, 30)),
 }
 
 
