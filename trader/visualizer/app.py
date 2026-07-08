@@ -1295,6 +1295,22 @@ def api_fetch_status():
                 "file_mb": csv_file_mb.get(key),
             }
 
+    # ── Verified trade counts per date ────────────────────────────────────────
+    vt_counts: dict = {}
+    galao_db = Path(__file__).parent.parent.parent / "june" / "trader" / "data" / "galao.db"
+    if galao_db.exists():
+        try:
+            import sqlite3 as _sq3b
+            gc = _sq3b.connect(str(galao_db), timeout=5)
+            for r in gc.execute(
+                "SELECT DATE(fill_time) as d, COUNT(*) as n"
+                " FROM verified_trades GROUP BY d"
+            ).fetchall():
+                vt_counts[r[0]] = r[1]
+            gc.close()
+        except Exception:
+            pass
+
     result: dict = {}
     for ds in days:
         result[ds] = {}
@@ -1304,7 +1320,7 @@ def api_fetch_status():
                 "bidask": lookup.get((sym, ds, "bidask")),
             }
 
-    return jsonify({"days": days, "symbols": symbols, "grid": result})
+    return jsonify({"days": days, "symbols": symbols, "grid": result, "vt_counts": vt_counts})
 
 
 @app.route("/api/fetch-now", methods=["POST"])
@@ -1724,20 +1740,21 @@ def api_fetch_queue():
         except Exception as e:
             log.warning("fetch-queue progress read error: %s", e)
 
-    # ── Verified trade dates for P1 ────────────────────────────────────────────
-    vt_dates = []
+    # ── Verified trade dates + counts for P1 ─────────────────────────────────────
+    vt_counts: dict = {}   # date -> count
     if galao_db.exists():
         try:
             gcon = _sq3.connect(str(galao_db), timeout=5)
             gcon.row_factory = _sq3.Row
-            vt_dates = [
-                r[0] for r in gcon.execute(
-                    "SELECT DISTINCT DATE(fill_time) FROM verified_trades ORDER BY DATE(fill_time) ASC"
-                ).fetchall()
-            ]
+            for r in gcon.execute(
+                "SELECT DATE(fill_time) as d, COUNT(*) as n"
+                " FROM verified_trades GROUP BY d ORDER BY d ASC"
+            ).fetchall():
+                vt_counts[r[0]] = r[1]
             gcon.close()
         except Exception:
             pass
+    vt_dates = sorted(vt_counts.keys())
 
     # ── Build priority queue ───────────────────────────────────────────────────
     queue = []
@@ -1751,13 +1768,15 @@ def api_fetch_queue():
                 key = (sym, d_str)
                 if key not in seen:
                     seen.add(key)
-                    queue.append({"symbol": sym, "date": d_str, "tier": "CRITICAL"})
+                    queue.append({"symbol": sym, "date": d_str, "tier": "CRITICAL",
+                                  "vt_n": vt_counts.get(d_str, 0)})
 
     for sym, d_str in sorted(partial_keys):
         key = (sym, d_str)
         if key not in seen:
             seen.add(key)
-            queue.append({"symbol": sym, "date": d_str, "tier": "RESUME"})
+            queue.append({"symbol": sym, "date": d_str, "tier": "RESUME",
+                          "vt_n": vt_counts.get(d_str, 0)})
 
     # A few standard backfill entries so user sees what's coming next
     try:
@@ -1807,6 +1826,7 @@ def api_fetch_queue():
         "ib_status":     ib_status,
         "total_done":    total_done,
         "total_entries": total_entries,
+        "vt_counts":     vt_counts,
     })
 
 

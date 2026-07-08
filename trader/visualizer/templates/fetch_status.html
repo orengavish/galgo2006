@@ -211,7 +211,7 @@
 </style>
 
 <script>
-let _days=[], _symbols=[], _grid={}, _bidaskEnabled=false;
+let _days=[], _symbols=[], _grid={}, _bidaskEnabled=false, _vtCounts={};
 
 function _fmt(n){
   if(n==null || n===0) return '—';
@@ -230,6 +230,7 @@ function _fmtAge(s){
 // ── IB strip + current file + queue ────────────────────────────────────────
 function updateQueue(){
   fetch('/api/fetch-queue').then(r=>r.json()).then(d=>{
+    if(d.vt_counts) Object.assign(_vtCounts, d.vt_counts);
     updateIBStrip(d.ib_status, d.total_done, d.total_entries);
     updateCurrentCard(d.current);
     updateQueueList(d.queue);
@@ -317,15 +318,19 @@ function updateQueueList(queue){
     return;
   }
   emptyEl.style.display='none';
-  listEl.innerHTML = queue.map((q,i) =>
-    `<div class="queue-row">
+  listEl.innerHTML = queue.map((q,i) => {
+    const vt = q.vt_n || _vtCounts[q.date] || 0;
+    const vtBadge = vt > 0
+      ? `<span style="color:#3fb950;font-size:10px;margin-left:4px">✓${vt}vt</span>`
+      : '';
+    return `<div class="queue-row">
        <span class="queue-num">${i+1}.</span>
        <span style="color:#c9d1d9;min-width:36px">${q.symbol}</span>
-       <span style="color:#8b949e">${q.date}</span>
+       <span style="color:#8b949e">${q.date}</span>${vtBadge}
        <span style="flex:1"></span>
        <span class="tier-badge tier-${q.tier}">${q.tier}</span>
-     </div>`
-  ).join('');
+     </div>`;
+  }).join('');
 }
 
 // ── Grid cell rendering ───────────────────────────────────────────────────────
@@ -424,13 +429,18 @@ function renderGrid(){
       const b = info && info.bidask;
       return renderCell(t, b);
     }).join('');
-    return `<tr><td class="ts">${d}</td>${cells}</tr>`;
+    const vt = _vtCounts[d] || 0;
+    const vtLabel = vt > 0
+      ? `<div style="font-size:9px;color:#3fb950;margin-top:1px">✓${vt}vt</div>`
+      : '';
+    return `<tr><td class="ts">${d}${vtLabel}</td>${cells}</tr>`;
   }).join('');
 }
 
 function loadGrid(){
   fetch('/api/fetch-status').then(r=>r.json()).then(data=>{
     _days=data.days; _symbols=data.symbols; _grid=data.grid;
+    if(data.vt_counts) Object.assign(_vtCounts, data.vt_counts);
     // Hide M2K if no data
     if(_symbols.includes('M2K')){
       const hasM2K = _days.some(d=>_grid[d] && _grid[d]['M2K'] &&

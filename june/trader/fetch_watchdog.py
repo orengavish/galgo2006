@@ -76,6 +76,7 @@ def _send_email(subject: str, body: str):
 
 
 def _scheduler_pids() -> list[int]:
+    _our_root = str(_ROOT).replace("\\", "/").lower()
     pids = []
     for proc in psutil.process_iter(["pid", "cmdline"]):
         try:
@@ -84,10 +85,14 @@ def _scheduler_pids() -> list[int]:
                 continue
             exe = cmd_list[0].lower()
             if "python" not in exe:
-                continue  # skip powershell/other processes that mention fetch_scheduler in -Command
+                continue  # skip powershell/other processes
             cmdline = " ".join(cmd_list)
-            if "fetch_scheduler" in cmdline and "fetch_watchdog" not in cmdline:
-                pids.append(proc.info["pid"])
+            if "fetch_scheduler" not in cmdline or "fetch_watchdog" in cmdline:
+                continue
+            # Must belong to this project — reject schedulers from other projects
+            if _our_root not in cmdline.replace("\\", "/").lower():
+                continue
+            pids.append(proc.info["pid"])
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             pass
     return pids
