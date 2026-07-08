@@ -554,6 +554,18 @@ def api_create():
     # Drop candidates with too-tight brackets (stop out on first tick)
     cands = [c for c in cands if c["bracket"] >= _MIN_BRACKET.get(c["symbol"], 4.0)]
 
+    # Deduplicate: one entry per (symbol, direction, entry_type, entry_price, bracket)
+    # Multiple lines can produce identical candidates — keep highest-ranked (first in list)
+    _seen_keys: set = set()
+    deduped = []
+    for c in cands:
+        k = (c["symbol"], c["direction"], c["entry_type"],
+             round(c["entry_price"], 4), c["bracket"])
+        if k not in _seen_keys:
+            _seen_keys.add(k)
+            deduped.append(c)
+    cands = deduped
+
     # Persist to algo_candidates queue
     session_id = str(uuid.uuid4())
     if cands:
@@ -732,6 +744,18 @@ def api_submit():
         if info["price"] is not None:
             current_prices[sym] = info["price"]
 
+    # Build set of entry keys already active in commands (avoid duplicate positions)
+    with get_db(db_path) as con:
+        active_cmds = con.execute(
+            "SELECT symbol, direction, entry_type, entry_price FROM commands"
+            " WHERE source='algo_dashboard'"
+            " AND status IN ('PENDING','SUBMITTING','SUBMITTED','FILLED')"
+        ).fetchall()
+    active_entry_keys = {
+        (r["symbol"], r["direction"], r["entry_type"], round(r["entry_price"], 4))
+        for r in active_cmds
+    }
+
     # Walk ranked candidates: pass → submit, fail → demote to bottom
     to_submit  = []
     to_demote  = []
@@ -739,9 +763,17 @@ def api_submit():
     for c in scan_pool:
         if len(to_submit) >= slots:
             break
+        # Skip if an active command already holds this entry price
+        entry_key = (c["symbol"], c["direction"], c["entry_type"],
+                     round(c["entry_price"], 4))
+        if entry_key in active_entry_keys:
+            demote_ctr += 1
+            to_demote.append((c["id"], max_rank + demote_ctr, "duplicate entry"))
+            continue
         ok, reason = _sanity_check(c, current_prices)
         if ok:
             to_submit.append(c)
+            active_entry_keys.add(entry_key)  # prevent same key twice in this batch
         else:
             demote_ctr += 1
             to_demote.append((c["id"], max_rank + demote_ctr, reason))
