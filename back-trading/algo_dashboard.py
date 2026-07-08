@@ -678,7 +678,8 @@ def _sanity_check(cand: dict, current_prices: dict) -> tuple[bool, str]:
     entry      = cand["entry_price"]
     direction  = cand["direction"]
     entry_type = cand["entry_type"]
-    avg_move   = cand.get("avg_move") or 16.0
+    _MIN_AVG_MOVE = {"MES": 16.0, "MNQ": 150.0, "M2K": 20.0, "MYM": 200.0}
+    avg_move   = max(cand.get("avg_move") or 0, _MIN_AVG_MOVE.get(sym, 16.0))
 
     # Distance gate: entry must be within 2 avg_moves of current price
     if abs(price - entry) > 2.0 * avg_move:
@@ -763,17 +764,21 @@ def api_submit():
     for c in scan_pool:
         if len(to_submit) >= slots:
             break
-        # Skip if an active command already holds this entry price
-        entry_key = (c["symbol"], c["direction"], c["entry_type"],
-                     round(c["entry_price"], 4))
-        if entry_key in active_entry_keys:
+        # Skip if an active command already holds this entry price.
+        # LMT+STP candidates expand to one leg — check both LMT and STP keys.
+        _etypes_check = ["LMT", "STP"] if c["entry_type"] == "LMT+STP" else [c["entry_type"]]
+        entry_keys = {
+            (c["symbol"], c["direction"], et, round(c["entry_price"], 4))
+            for et in _etypes_check
+        }
+        if entry_keys & active_entry_keys:
             demote_ctr += 1
             to_demote.append((c["id"], max_rank + demote_ctr, "duplicate entry"))
             continue
         ok, reason = _sanity_check(c, current_prices)
         if ok:
             to_submit.append(c)
-            active_entry_keys.add(entry_key)  # prevent same key twice in this batch
+            active_entry_keys.update(entry_keys)  # prevent same key twice in this batch
         else:
             demote_ctr += 1
             to_demote.append((c["id"], max_rank + demote_ctr, reason))
@@ -793,7 +798,30 @@ def api_submit():
     # Build command rows for passing candidates
     rows = []
     for c in to_submit:
-        etypes = ["LMT", "STP"] if c["entry_type"] == "LMT+STP" else [c["entry_type"]]
+        if c["entry_type"] == "LMT+STP":
+            # Only submit the leg that is valid for current market position.
+            # LMT needs market on the far side (BUY: price>entry, SELL: price<entry).
+            # STP needs market on the near side (BUY: price<entry, SELL: price>entry).
+            price = current_prices.get(c["symbol"])
+            entry = c["entry_price"]
+            direction = c["direction"]
+            valid = []
+            if price is None:
+                valid = ["LMT"]  # no price → conservative: LMT only
+            else:
+                if direction == "BUY":
+                    if price > entry:
+                        valid.append("LMT")
+                    if price < entry:
+                        valid.append("STP")
+                else:  # SELL
+                    if price < entry:
+                        valid.append("LMT")
+                    if price > entry:
+                        valid.append("STP")
+            etypes = valid or ["LMT"]
+        else:
+            etypes = [c["entry_type"]]
         for etype in etypes:
             rows.append((
                 c["symbol"],
