@@ -119,6 +119,8 @@ def _prev_trading_day(from_date: date | None = None) -> date | None:
 
 
 _RTH_START_MIN, _RTH_END_MIN = 9 * 60 + 30, 16 * 60   # 09:30–16:00 CT
+_HALF_DAY_START_MIN             = 12 * 60 + 30          # 12:30 CT  (afternoon half)
+_VPRO_DIR = _ROOT / "june" / "trader" / "data" / "volume_profiles"
 
 def _find_csv(symbol: str, d: date) -> Path | None:
     p = _HIST_DIR / f"{symbol}_trades_{d.strftime('%Y%m%d')}.csv"
@@ -176,6 +178,142 @@ def _ohlcv_bars(ticks: list, interval_min: int = 5) -> list:
         b["close"] = price
         b["vol"]  += 1
     return sorted(bars.values(), key=lambda x: (x["date"], x["t_min"]))
+
+
+# ── Volume profile ─────────────────────────────────────────────────────────────
+
+def _ensure_vpro_table(db_path: Path) -> None:
+    with get_db(db_path) as con:
+        con.execute("""
+            CREATE TABLE IF NOT EXISTS volume_profiles (
+                symbol     TEXT NOT NULL,
+                trade_date TEXT NOT NULL,
+                window     TEXT NOT NULL,
+                computed_at TEXT,
+                row_count  INTEGER,
+                PRIMARY KEY (symbol, trade_date, window)
+            )
+        """)
+
+
+def _compute_volume_profile(ticks: list, tick_size: float, visit_buffer: int = 1) -> dict:
+    """Single-pass volume profile. Returns dict of price → stats dict."""
+    from collections import defaultdict
+    profile: dict = defaultdict(lambda: dict(
+        trades=0, buy_vol=0, sell_vol=0, visit_count=0, depart_up=0, depart_down=0))
+    if not ticks:
+        return {}
+    snap        = lambda p: round(round(p / tick_size) * tick_size, 10)
+    prev_price  = None
+    last_dir    = 0    # 1=up -1=down
+    current     = None # price bucket we are currently visiting
+    away_buf    = 0    # consecutive ticks NOT at current
+    depart_dir  = None # True=departed up, False=departed down
+
+    for (_, price, _) in ticks:
+        sp = snap(price)
+        profile[sp]["trades"] += 1
+        if prev_price is not None:
+            if   price > prev_price: last_dir = 1
+            elif price < prev_price: last_dir = -1
+        if last_dir > 0: profile[sp]["buy_vol"]  += 1
+        elif last_dir < 0: profile[sp]["sell_vol"] += 1
+        prev_price = price
+        # visit FSM
+        if current is None:
+            current = sp
+            profile[sp]["visit_count"] += 1
+        elif sp == current:
+            away_buf   = 0
+            depart_dir = None
+        else:
+            if away_buf == 0:
+                depart_dir = sp > current
+            away_buf += 1
+            if away_buf >= visit_buffer:
+                if depart_dir: profile[current]["depart_up"]   += 1
+                else:          profile[current]["depart_down"]  += 1
+                current  = sp
+                profile[sp]["visit_count"] += 1
+                away_buf   = 0
+                depart_dir = None
+    return dict(profile)
+
+
+def _load_window_ticks(symbol: str, anchor: date, window: str) -> list:
+    """Return RTH-filtered ticks for the given window, newest first for multi-day."""
+    if window in ("1d", "half"):
+        t = _load_ticks(symbol, anchor)
+        if not t:
+            return []
+        start = _HALF_DAY_START_MIN if window == "half" else _RTH_START_MIN
+        return [(tm, p, iso) for (tm, p, iso) in t if start <= tm < _RTH_END_MIN]
+
+    n      = 5 if window == "5d" else 10
+    result: list = []
+    search = anchor + timedelta(days=1)
+    found  = 0
+    for _ in range(n * 4):
+        search -= timedelta(days=1)
+        if search.weekday() >= 5:
+            continue
+        if not _csv_has_rth(symbol, search):
+            continue
+        t = _load_ticks(symbol, search)
+        if t:
+            rth = [(tm, p, iso) for (tm, p, iso) in t if _RTH_START_MIN <= tm < _RTH_END_MIN]
+            if rth:
+                result.extend(rth)
+                found += 1
+                if found >= n:
+                    break
+    return result
+
+
+def _get_or_compute_vpro(symbol: str, anchor: date, window: str) -> list[dict]:
+    """Return cached or freshly computed volume profile as list of row dicts."""
+    db_path   = _resolve_db()
+    _ensure_vpro_table(db_path)
+    _VPRO_DIR.mkdir(parents=True, exist_ok=True)
+    vpro_path = _VPRO_DIR / f"{symbol}_vol_{window}_{anchor.strftime('%Y%m%d')}.csv"
+
+    with get_db(db_path) as con:
+        row = con.execute(
+            "SELECT computed_at FROM volume_profiles"
+            " WHERE symbol=? AND trade_date=? AND window=?",
+            (symbol, anchor.isoformat(), window)
+        ).fetchone()
+
+    if row and vpro_path.exists():
+        rows = []
+        with open(vpro_path, newline="") as f:
+            for r in csv.DictReader(f):
+                rows.append({k: (float(v) if k == "price" else int(v)) for k, v in r.items()})
+        return rows
+
+    ticks = _load_window_ticks(symbol, anchor, window)
+    if not ticks:
+        return []
+
+    profile     = _compute_volume_profile(ticks, TICKS.get(symbol, 0.25))
+    sorted_rows = sorted(profile.items())
+    _FIELDS     = ["price", "trades", "visit_count", "depart_up", "depart_down", "buy_vol", "sell_vol"]
+
+    with open(vpro_path, "w", newline="") as f:
+        w = csv.DictWriter(f, fieldnames=_FIELDS)
+        w.writeheader()
+        for price, d in sorted_rows:
+            w.writerow({"price": price, **d})
+
+    with get_db(db_path) as con:
+        con.execute(
+            "INSERT OR REPLACE INTO volume_profiles"
+            " (symbol, trade_date, window, computed_at, row_count) VALUES (?, ?, ?, ?, ?)",
+            (symbol, anchor.isoformat(), window,
+             datetime.now(timezone.utc).isoformat(), len(sorted_rows))
+        )
+
+    return [{"price": p, **d} for p, d in sorted_rows]
 
 
 # ── Line generation ────────────────────────────────────────────────────────────
@@ -618,6 +756,36 @@ def api_submitted():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/volume_profile/<symbol>")
+def api_volume_profile(symbol: str):
+    date_str  = request.args.get("date")
+    window    = request.args.get("window", "1d")
+    recompute = request.args.get("recompute", "0") == "1"
+
+    if window not in ("1d", "half", "5d", "10d"):
+        return jsonify({"error": "window must be 1d|half|5d|10d"}), 400
+    if not date_str:
+        return jsonify({"error": "date required"}), 400
+
+    anchor = date.fromisoformat(date_str)
+
+    if recompute:
+        db_path   = _resolve_db()
+        _ensure_vpro_table(db_path)
+        vpro_path = _VPRO_DIR / f"{symbol}_vol_{window}_{anchor.strftime('%Y%m%d')}.csv"
+        with get_db(db_path) as con:
+            con.execute(
+                "DELETE FROM volume_profiles WHERE symbol=? AND trade_date=? AND window=?",
+                (symbol, anchor.isoformat(), window)
+            )
+        if vpro_path.exists():
+            vpro_path.unlink()
+
+    data = _get_or_compute_vpro(symbol, anchor, window)
+    poc  = max(data, key=lambda d: d["trades"])["price"] if data else None
+    return jsonify({"data": data, "symbol": symbol, "date": date_str, "window": window, "poc": poc})
+
+
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -655,17 +823,18 @@ body{font-size:.85rem;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v1.7</span>
+  <span class="badge bg-secondary">v2.0</span>
 </nav>
 
 <div class="container-fluid py-2">
 <ul class="nav nav-tabs mb-2" id="mainTab" role="tablist">
   <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-volume" id="btn-volume-tab">Volume</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v1.7</span>
+    <span class="badge bg-secondary">v2.0</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
@@ -810,6 +979,33 @@ body{font-size:.85rem;}
       <span class="badge source-overnight">Overnight</span></label>
     <label><input type="checkbox" id="tog-manual"    checked onchange="redrawLines()">
       <span class="badge source-manual">Manual</span></label>
+  </div>
+</div>
+
+<!-- ══════════════════════ VOLUME PROFILE ══════════════════════ -->
+<div class="tab-pane fade" id="tab-volume">
+  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
+    <ul class="nav nav-pills mb-0" id="vsym-pill-tabs">
+      <li class="nav-item"><button class="nav-link active" onclick="selectVSym('MES',this)">MES</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectVSym('MNQ',this)">MNQ</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectVSym('MYM',this)">MYM</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectVSym('M2K',this)">M2K</button></li>
+    </ul>
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="vbtn-1d"   class="btn btn-outline-secondary active" onclick="setVWindow('1d',this)">Day</button>
+      <button id="vbtn-half" class="btn btn-outline-secondary"        onclick="setVWindow('half',this)">½ Day</button>
+      <button id="vbtn-5d"   class="btn btn-outline-secondary"        onclick="setVWindow('5d',this)">5d</button>
+      <button id="vbtn-10d"  class="btn btn-outline-secondary"        onclick="setVWindow('10d',this)">10d</button>
+    </div>
+    <button class="btn btn-sm btn-outline-warning" onclick="loadVolumeProfile(true)">Recompute</button>
+    <span id="vol-msg" class="small text-muted ms-1"></span>
+  </div>
+  <div id="vol-chart" style="width:100%;height:480px;background:#1a1a2e;border-radius:4px;"></div>
+  <div class="small text-muted mt-1">
+    <span class="me-3">Gold dashed = POC (point of control)</span>
+    <span class="me-3"><span style="color:#26a69a">■</span> Buy vol</span>
+    <span><span style="color:#ef5350">■</span> Sell vol</span>
+    <span class="ms-3 text-info">Dotted lines = armed critical lines</span>
   </div>
 </div>
 
@@ -1182,18 +1378,114 @@ async function createGraphTrades(){
 
 function onSharedDateChange(){
   const active = document.querySelector('#mainTab .nav-link.active');
-  if(active?.dataset?.bsTarget === '#tab-graph') loadGraph();
+  const tgt = active?.dataset?.bsTarget;
+  if(tgt === '#tab-graph')  loadGraph();
+  if(tgt === '#tab-volume') loadVolumeProfile();
 }
 
+// click = immediate DOM changes only; shown.bs.tab = render after pane is visible
 document.getElementById('btn-graph-tab').addEventListener('click', function(){
   document.getElementById('shared-date-input').readOnly = true;
+});
+document.getElementById('btn-graph-tab').addEventListener('shown.bs.tab', function(){
   loadGraph();
 });
-document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab)').forEach(function(btn){
+
+document.getElementById('btn-volume-tab').addEventListener('shown.bs.tab', function(){
+  loadVolumeProfile();
+});
+
+document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab):not(#btn-volume-tab)').forEach(function(btn){
   btn.addEventListener('click', function(){
     document.getElementById('shared-date-input').readOnly = false;
   });
 });
+
+// ── VOLUME PROFILE ───────────────────────────────────────────────────────────
+let _vSym='MES', _vWindow='1d', _vData=[], _vLines=[];
+
+function selectVSym(sym, btn){
+  _vSym = sym;
+  document.querySelectorAll('#vsym-pill-tabs .nav-link').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  loadVolumeProfile();
+}
+
+function setVWindow(w, btn){
+  _vWindow = w;
+  document.querySelectorAll('#vbtn-1d,#vbtn-half,#vbtn-5d,#vbtn-10d').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  loadVolumeProfile();
+}
+
+async function loadVolumeProfile(recompute=false){
+  const reqDate = document.getElementById('shared-date-input').value;
+  const msg = document.getElementById('vol-msg');
+  if(!reqDate){ msg.textContent='Select a date'; return; }
+  msg.className='small text-warning ms-1';
+  msg.textContent=recompute?'Recomputing…':'Computing…';
+  try{
+    const qs = recompute ? '&recompute=1' : '';
+    const r = await (await fetch(
+      `/api/volume_profile/${_vSym}?date=${reqDate}&window=${_vWindow}${qs}`
+    )).json();
+    _vData = r.data || [];
+    const ms = parseInt(document.getElementById('min-str-lines').value)||1;
+    _vLines = await (await fetch(`/api/lines?symbol=${_vSym}&min_strength=${ms}`)).json();
+    if(!_vData.length){
+      msg.className='small text-muted ms-1';
+      msg.textContent='No data for this date / window';
+      Plotly.purge('vol-chart');
+      return;
+    }
+    const src = recompute ? 'recomputed' : 'cached';
+    msg.className='small text-success ms-1';
+    msg.textContent=`${_vData.length} levels · POC ${r.poc!=null?r.poc.toFixed(2):'—'} (${src})`;
+    drawVolumeChart(r.poc);
+  }catch(e){
+    msg.className='small text-danger ms-1';
+    msg.textContent='Error: '+e;
+  }
+}
+
+function drawVolumeChart(poc){
+  if(!_vData.length){ Plotly.purge('vol-chart'); return; }
+  const prices = _vData.map(d=>d.price);
+  const traceBuy = {
+    type:'bar', orientation:'h', name:'Buy',
+    x:_vData.map(d=>d.buy_vol), y:prices,
+    marker:{color:'rgba(38,166,154,0.85)'},
+    hovertemplate:'<b>%{y:.2f}</b><br>Buy: %{x}  Visits: %{customdata}<extra></extra>',
+    customdata:_vData.map(d=>d.visit_count)
+  };
+  const traceSell = {
+    type:'bar', orientation:'h', name:'Sell',
+    x:_vData.map(d=>d.sell_vol), y:prices,
+    marker:{color:'rgba(239,83,80,0.85)'},
+    hovertemplate:'<b>%{y:.2f}</b><br>Sell: %{x}<extra></extra>'
+  };
+  const shapes = [];
+  if(poc!=null){
+    shapes.push({type:'line', xref:'paper', x0:0, x1:1, y0:poc, y1:poc,
+      line:{color:'#ffd700', width:2, dash:'dash'}});
+  }
+  for(const l of _vLines.filter(l=>!!l.armed)){
+    shapes.push({type:'line', xref:'paper', x0:0, x1:1, y0:l.price, y1:l.price,
+      line:{color:SOURCE_COLORS[l.source]||'#888', width:1.5, dash:'dot'}});
+  }
+  const layout = {
+    barmode:'stack',
+    paper_bgcolor:'#1a1a2e', plot_bgcolor:'#1a1a2e',
+    font:{color:'#ccc'},
+    margin:{l:65, r:15, t:10, b:40},
+    xaxis:{gridcolor:'#333', zeroline:false, title:'Ticks'},
+    yaxis:{gridcolor:'#333', tickformat:'.2f', autorange:true, title:'Price'},
+    shapes,
+    showlegend:true,
+    legend:{x:0.99, y:0.99, xanchor:'right', bgcolor:'rgba(0,0,0,0.5)'}
+  };
+  Plotly.newPlot('vol-chart',[traceBuy,traceSell],layout,{responsive:true,displayModeBar:false});
+}
 
 // ── CREATE TRADES ────────────────────────────────────────────────────────────
 let _candidates=[];
