@@ -430,9 +430,11 @@ def api_history(symbol: str):
     if not ticks:
         return jsonify({"bars": [], "date": None, "symbol": symbol, "error": "no data"})
 
-    bars_raw = _ohlcv_bars(ticks, interval)
+    _RTH_START, _RTH_END = 9 * 60 + 30, 16 * 60   # 09:30 – 16:00
+    rth_bars = [b for b in _ohlcv_bars(ticks, interval)
+                if _RTH_START <= b["t_min"] < _RTH_END]
     bars = []
-    for b in bars_raw:
+    for b in rth_bars:
         hh, mm = b["t_min"] // 60, b["t_min"] % 60
         bars.append({"t": f"{b['date']}T{hh:02d}:{mm:02d}:00",
                      "open": b["open"], "high": b["high"],
@@ -613,6 +615,9 @@ body{font-size:.85rem;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
+  <li class="nav-item ms-auto d-flex align-items-center pe-1">
+    <span class="badge bg-secondary">v1.3</span>
+  </li>
 </ul>
 <div class="tab-content">
 
@@ -1126,6 +1131,7 @@ function toggleAutoRef(){
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 
 // Initial load
+document.getElementById('graph-date-input').max = new Date().toISOString().split('T')[0];
 refreshLines();
 </script>
 </body>
