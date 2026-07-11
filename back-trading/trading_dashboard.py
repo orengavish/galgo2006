@@ -42,18 +42,31 @@ SOURCE_COLORS = {
     "pivot":     "#f28e2b",
     "overnight": "#59a14f",
     "manual":    "#e15759",
+    "orb":       "#1abc9c",
+    "vwap":      "#9b59b6",
+    "volume":    "#e67e22",
+    "round":     "#7f8c8d",
 }
 SOURCE_LABELS = {
     "ohlc":      "OHLC",
     "pivot":     "Pivot",
     "overnight": "Overnight",
     "manual":    "Manual",
+    "orb":       "ORB",
+    "vwap":      "VWAP",
+    "volume":    "Volume",
+    "round":     "Round",
 }
 
 ALL_ALGO_TYPES = [
     "PDH", "PDL", "PDC", "PDO",
     "PIVOT_P", "PIVOT_R1", "PIVOT_S1", "PIVOT_R2", "PIVOT_S2", "PIVOT_R3", "PIVOT_S3",
-    "OVERNIGHT_H", "OVERNIGHT_L", "MANUAL",
+    "OVERNIGHT_H", "OVERNIGHT_L",
+    "ORB15_H", "ORB15_L", "ORB30_H", "ORB30_L",
+    "VWAP",
+    "POC", "VAH", "VAL",
+    "ROUND_BIG", "ROUND_MED", "ROUND_SML",
+    "MANUAL",
 ]
 _ALGO_LABEL = {
     "PDH":         "Previous Day High",
@@ -69,7 +82,26 @@ _ALGO_LABEL = {
     "PIVOT_S3":    "Support 3",
     "OVERNIGHT_H": "Overnight High",
     "OVERNIGHT_L": "Overnight Low",
+    "ORB15_H":     "ORB 15-Min High",
+    "ORB15_L":     "ORB 15-Min Low",
+    "ORB30_H":     "ORB 30-Min High",
+    "ORB30_L":     "ORB 30-Min Low",
+    "VWAP":        "VWAP (RTH Mean)",
+    "POC":         "Point of Control",
+    "VAH":         "Value Area High",
+    "VAL":         "Value Area Low",
+    "ROUND_BIG":   "Round Level (Major)",
+    "ROUND_MED":   "Round Level (Medium)",
+    "ROUND_SML":   "Round Level (Minor)",
     "MANUAL":      "Manual",
+}
+
+# Round number intervals (pts) and strengths per symbol
+_ROUND_LEVELS = {
+    "MES": [(100, 7), (50, 5), (25, 3)],
+    "MNQ": [(1000, 7), (500, 5), (100, 3)],
+    "MYM": [(1000, 7), (500, 5), (100, 3)],
+    "M2K": [(100, 7), (50, 5), (25, 3)],
 }
 
 # ── Flask app ──────────────────────────────────────────────────────────────────
@@ -119,8 +151,6 @@ def _prev_trading_day(from_date: date | None = None) -> date | None:
 
 
 _RTH_START_MIN, _RTH_END_MIN = 9 * 60 + 30, 16 * 60   # 09:30–16:00 CT
-_HALF_DAY_START_MIN             = 12 * 60 + 30          # 12:30 CT  (afternoon half)
-_VPRO_DIR = _ROOT / "june" / "trader" / "data" / "volume_profiles"
 
 def _find_csv(symbol: str, d: date) -> Path | None:
     p = _HIST_DIR / f"{symbol}_trades_{d.strftime('%Y%m%d')}.csv"
@@ -178,142 +208,6 @@ def _ohlcv_bars(ticks: list, interval_min: int = 5) -> list:
         b["close"] = price
         b["vol"]  += 1
     return sorted(bars.values(), key=lambda x: (x["date"], x["t_min"]))
-
-
-# ── Volume profile ─────────────────────────────────────────────────────────────
-
-def _ensure_vpro_table(db_path: Path) -> None:
-    with get_db(db_path) as con:
-        con.execute("""
-            CREATE TABLE IF NOT EXISTS volume_profiles (
-                symbol     TEXT NOT NULL,
-                trade_date TEXT NOT NULL,
-                window     TEXT NOT NULL,
-                computed_at TEXT,
-                row_count  INTEGER,
-                PRIMARY KEY (symbol, trade_date, window)
-            )
-        """)
-
-
-def _compute_volume_profile(ticks: list, tick_size: float, visit_buffer: int = 1) -> dict:
-    """Single-pass volume profile. Returns dict of price → stats dict."""
-    from collections import defaultdict
-    profile: dict = defaultdict(lambda: dict(
-        trades=0, buy_vol=0, sell_vol=0, visit_count=0, depart_up=0, depart_down=0))
-    if not ticks:
-        return {}
-    snap        = lambda p: round(round(p / tick_size) * tick_size, 10)
-    prev_price  = None
-    last_dir    = 0    # 1=up -1=down
-    current     = None # price bucket we are currently visiting
-    away_buf    = 0    # consecutive ticks NOT at current
-    depart_dir  = None # True=departed up, False=departed down
-
-    for (_, price, _) in ticks:
-        sp = snap(price)
-        profile[sp]["trades"] += 1
-        if prev_price is not None:
-            if   price > prev_price: last_dir = 1
-            elif price < prev_price: last_dir = -1
-        if last_dir > 0: profile[sp]["buy_vol"]  += 1
-        elif last_dir < 0: profile[sp]["sell_vol"] += 1
-        prev_price = price
-        # visit FSM
-        if current is None:
-            current = sp
-            profile[sp]["visit_count"] += 1
-        elif sp == current:
-            away_buf   = 0
-            depart_dir = None
-        else:
-            if away_buf == 0:
-                depart_dir = sp > current
-            away_buf += 1
-            if away_buf >= visit_buffer:
-                if depart_dir: profile[current]["depart_up"]   += 1
-                else:          profile[current]["depart_down"]  += 1
-                current  = sp
-                profile[sp]["visit_count"] += 1
-                away_buf   = 0
-                depart_dir = None
-    return dict(profile)
-
-
-def _load_window_ticks(symbol: str, anchor: date, window: str) -> list:
-    """Return RTH-filtered ticks for the given window, newest first for multi-day."""
-    if window in ("1d", "half"):
-        t = _load_ticks(symbol, anchor)
-        if not t:
-            return []
-        start = _HALF_DAY_START_MIN if window == "half" else _RTH_START_MIN
-        return [(tm, p, iso) for (tm, p, iso) in t if start <= tm < _RTH_END_MIN]
-
-    n      = 5 if window == "5d" else 10
-    result: list = []
-    search = anchor + timedelta(days=1)
-    found  = 0
-    for _ in range(n * 4):
-        search -= timedelta(days=1)
-        if search.weekday() >= 5:
-            continue
-        if not _csv_has_rth(symbol, search):
-            continue
-        t = _load_ticks(symbol, search)
-        if t:
-            rth = [(tm, p, iso) for (tm, p, iso) in t if _RTH_START_MIN <= tm < _RTH_END_MIN]
-            if rth:
-                result.extend(rth)
-                found += 1
-                if found >= n:
-                    break
-    return result
-
-
-def _get_or_compute_vpro(symbol: str, anchor: date, window: str) -> list[dict]:
-    """Return cached or freshly computed volume profile as list of row dicts."""
-    db_path   = _resolve_db()
-    _ensure_vpro_table(db_path)
-    _VPRO_DIR.mkdir(parents=True, exist_ok=True)
-    vpro_path = _VPRO_DIR / f"{symbol}_vol_{window}_{anchor.strftime('%Y%m%d')}.csv"
-
-    with get_db(db_path) as con:
-        row = con.execute(
-            "SELECT computed_at FROM volume_profiles"
-            " WHERE symbol=? AND trade_date=? AND window=?",
-            (symbol, anchor.isoformat(), window)
-        ).fetchone()
-
-    if row and vpro_path.exists():
-        rows = []
-        with open(vpro_path, newline="") as f:
-            for r in csv.DictReader(f):
-                rows.append({k: (float(v) if k == "price" else int(v)) for k, v in r.items()})
-        return rows
-
-    ticks = _load_window_ticks(symbol, anchor, window)
-    if not ticks:
-        return []
-
-    profile     = _compute_volume_profile(ticks, TICKS.get(symbol, 0.25))
-    sorted_rows = sorted(profile.items())
-    _FIELDS     = ["price", "trades", "visit_count", "depart_up", "depart_down", "buy_vol", "sell_vol"]
-
-    with open(vpro_path, "w", newline="") as f:
-        w = csv.DictWriter(f, fieldnames=_FIELDS)
-        w.writeheader()
-        for price, d in sorted_rows:
-            w.writerow({"price": price, **d})
-
-    with get_db(db_path) as con:
-        con.execute(
-            "INSERT OR REPLACE INTO volume_profiles"
-            " (symbol, trade_date, window, computed_at, row_count) VALUES (?, ?, ?, ?, ?)",
-            (symbol, anchor.isoformat(), window,
-             datetime.now(timezone.utc).isoformat(), len(sorted_rows))
-        )
-
-    return [{"price": p, **d} for p, d in sorted_rows]
 
 
 # ── Line generation ────────────────────────────────────────────────────────────
@@ -403,6 +297,84 @@ def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None) -
     if glob_l is not None:
         add(glob_l, "SUPPORT",    "overnight", "OVERNIGHT_L", 5,
             f"min(Globex 17:00-09:30 CT) = {glob_l:.2f}", on_inp)
+
+    # Opening Range Breakout (ORB)
+    ORB15_END = RTH_START + 15   # 09:45
+    ORB30_END = RTH_START + 30   # 10:00
+    orb15_p = [p for (t, p, _) in ticks if RTH_START <= t < ORB15_END]
+    orb30_p = [p for (t, p, _) in ticks if RTH_START <= t < ORB30_END]
+    if orb15_p:
+        orb15_h, orb15_l = max(orb15_p), min(orb15_p)
+        inp15 = f"09:30–09:45  {len(orb15_p)} ticks"
+        add(orb15_h, "RESISTANCE", "orb", "ORB15_H", 7,
+            f"ORB 15-min High = {orb15_h:.2f}", inp15)
+        add(orb15_l, "SUPPORT",    "orb", "ORB15_L", 7,
+            f"ORB 15-min Low = {orb15_l:.2f}",  inp15)
+    if orb30_p:
+        orb30_h, orb30_l = max(orb30_p), min(orb30_p)
+        inp30 = f"09:30–10:00  {len(orb30_p)} ticks"
+        add(orb30_h, "RESISTANCE", "orb", "ORB30_H", 6,
+            f"ORB 30-min High = {orb30_h:.2f}", inp30)
+        add(orb30_l, "SUPPORT",    "orb", "ORB30_L", 6,
+            f"ORB 30-min Low = {orb30_l:.2f}",  inp30)
+
+    # VWAP — equal-weighted arithmetic mean of RTH ticks
+    if rth_p:
+        vwap = sum(rth_p) / len(rth_p)
+        add(vwap, "RESISTANCE" if vwap >= mid else "SUPPORT",
+            "vwap", "VWAP", 8,
+            f"VWAP = {vwap:.4f}  (RTH mean, n={len(rth_p)} ticks)",
+            f"RTH n={len(rth_p)}")
+
+    # Volume Profile — POC / VAH / VAL from RTH tick histogram
+    if rth_p:
+        t_sz = TICKS.get(symbol, 0.25)
+        counts: dict = {}
+        for p in rth_p:
+            bkt = round(round(p / t_sz) * t_sz, 10)
+            counts[bkt] = counts.get(bkt, 0) + 1
+        sp = sorted(counts)
+        poc = max(counts, key=lambda k: counts[k])
+        total_t = len(rth_p)
+        va_target = total_t * 0.70
+        poc_i = sp.index(poc)
+        lo_i, hi_i = poc_i, poc_i
+        running = counts[poc]
+        while running < va_target:
+            lo_c = counts[sp[lo_i - 1]] if lo_i > 0 else -1
+            hi_c = counts[sp[hi_i + 1]] if hi_i < len(sp) - 1 else -1
+            if lo_c < 0 and hi_c < 0:
+                break
+            if lo_c >= hi_c and lo_i > 0:
+                lo_i -= 1; running += counts[sp[lo_i]]
+            elif hi_i < len(sp) - 1:
+                hi_i += 1; running += counts[sp[hi_i]]
+            else:
+                break
+        vah, val = sp[hi_i], sp[lo_i]
+        vol_inp = f"RTH ticks={total_t}  POC count={counts[poc]}"
+        add(poc, "RESISTANCE" if poc >= mid else "SUPPORT", "volume", "POC", 9,
+            f"Point of Control = {poc:.2f} ({counts[poc]} ticks)", vol_inp)
+        if vah != poc:
+            add(vah, "RESISTANCE", "volume", "VAH", 7,
+                f"Value Area High = {vah:.2f} (70% VA top)", vol_inp)
+        if val != poc:
+            add(val, "SUPPORT",    "volume", "VAL", 7,
+                f"Value Area Low = {val:.2f} (70% VA bottom)", vol_inp)
+
+    # Round psychological levels
+    _rl_map = {"ROUND_BIG": 7, "ROUND_MED": 5, "ROUND_SML": 3}
+    for interval, strength in _ROUND_LEVELS.get(symbol, [(100, 7), (50, 5), (25, 3)]):
+        akey = next(k for k, v in _rl_map.items() if v == strength)
+        lo_bkt = int(L / interval) * interval
+        n = lo_bkt
+        while n <= H + interval:
+            if L <= n <= H:
+                add(float(n), "RESISTANCE" if n >= mid else "SUPPORT",
+                    "round", akey, strength,
+                    f"Round {interval}pt level = {n}",
+                    f"range {L:.2f}–{H:.2f}")
+            n += interval
 
     # Deduplicate by tick bucket (keep highest-strength per bucket)
     seen: set = set()
@@ -526,7 +498,7 @@ def api_lines():
     _ensure_columns(db_path)
     symbol       = request.args.get("symbol", "")
     min_strength = int(request.args.get("min_strength", 1))
-    today        = date.today().isoformat()
+    req_date     = request.args.get("date", date.today().isoformat())
 
     q_base = (
         "SELECT id, symbol, price, line_type, strength,"
@@ -538,10 +510,10 @@ def api_lines():
     with get_db(db_path) as con:
         if symbol:
             rows = con.execute(q_base + " AND symbol=? ORDER BY symbol, strength DESC, price",
-                               (today, min_strength, symbol)).fetchall()
+                               (req_date, min_strength, symbol)).fetchall()
         else:
             rows = con.execute(q_base + " ORDER BY symbol, strength DESC, price",
-                               (today, min_strength)).fetchall()
+                               (req_date, min_strength)).fetchall()
 
     return jsonify([dict(r) for r in rows])
 
@@ -581,6 +553,84 @@ def api_lines_delete(line_id: int):
     with get_db(_resolve_db()) as con:
         con.execute("DELETE FROM critical_lines WHERE id=?", (line_id,))
     return jsonify({"ok": True})
+
+
+@app.route("/api/analyze_all", methods=["POST"])
+def api_analyze_all():
+    """Batch-generate lines for every available RTH date for requested symbols."""
+    body            = request.get_json(silent=True) or {}
+    symbols         = body.get("symbols", ALL_SYMBOLS)
+    algo_types      = set(body.get("algo_types", ALL_ALGO_TYPES))
+    merge_threshold = float(body.get("merge_threshold", 16.0))
+
+    # Build {sym: [date, ...]} of RTH-confirmed dates
+    sym_dates: dict[str, list[date]] = {}
+    for sym in symbols:
+        sym_dates[sym] = []
+        for p in _HIST_DIR.glob(f"{sym}_trades_????????.csv"):
+            d_str = p.stem.split("_")[-1]
+            try:
+                d = date(int(d_str[:4]), int(d_str[4:6]), int(d_str[6:8]))
+            except ValueError:
+                continue
+            if d.weekday() < 5 and _csv_has_rth(sym, d):
+                sym_dates[sym].append(d)
+
+    all_dates = sorted({d for dates in sym_dates.values() for d in dates})
+    db_path   = _resolve_db()
+    _ensure_columns(db_path)
+    analyzed: list[str] = []
+
+    for target in all_dates:
+        target_str  = target.isoformat()
+        any_written = False
+        for sym in symbols:
+            if target not in sym_dates.get(sym, []):
+                continue
+            ticks = _load_ticks(sym, target)
+            if not ticks:
+                continue
+            raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
+            kept: list = []
+            for ln in sorted(raw_lines, key=lambda x: -x["strength"]):
+                dominated = False
+                for k in kept:
+                    if abs(k["price"] - ln["price"]) <= merge_threshold:
+                        k.setdefault("merged", []).append({
+                            "algo_type": ln["algo_type"],
+                            "price":     ln["price"],
+                            "strength":  ln["strength"],
+                        })
+                        dominated = True
+                        break
+                if not dominated:
+                    kept.append(ln)
+            with get_db(db_path) as con:
+                con.execute(
+                    "DELETE FROM critical_lines"
+                    " WHERE symbol=? AND date=? AND (source IS NULL OR source != 'manual')",
+                    (sym, target_str)
+                )
+                for ln in kept:
+                    tip = {
+                        "label":     _ALGO_LABEL.get(ln["algo_type"], ln["algo_type"]),
+                        "formula":   ln["_tip"]["formula"],
+                        "inputs":    ln["_tip"]["inputs"],
+                        "from_date": target_str,
+                        "merged":    ln.get("merged", []),
+                    }
+                    con.execute(
+                        "INSERT INTO critical_lines"
+                        " (symbol, date, line_type, price, strength, armed, source, algo_type, note)"
+                        " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                        (sym, target_str, ln["line_type"], ln["price"],
+                         ln["strength"], ln["source"], ln["algo_type"], json.dumps(tip))
+                    )
+            any_written = True
+        if any_written:
+            analyzed.append(target_str)
+
+    return jsonify({"dates": analyzed, "count": len(analyzed)})
 
 
 @app.route("/api/last_data_date")
@@ -756,36 +806,6 @@ def api_submitted():
     return jsonify([dict(r) for r in rows])
 
 
-@app.route("/api/volume_profile/<symbol>")
-def api_volume_profile(symbol: str):
-    date_str  = request.args.get("date")
-    window    = request.args.get("window", "1d")
-    recompute = request.args.get("recompute", "0") == "1"
-
-    if window not in ("1d", "half", "5d", "10d"):
-        return jsonify({"error": "window must be 1d|half|5d|10d"}), 400
-    if not date_str:
-        return jsonify({"error": "date required"}), 400
-
-    anchor = date.fromisoformat(date_str)
-
-    if recompute:
-        db_path   = _resolve_db()
-        _ensure_vpro_table(db_path)
-        vpro_path = _VPRO_DIR / f"{symbol}_vol_{window}_{anchor.strftime('%Y%m%d')}.csv"
-        with get_db(db_path) as con:
-            con.execute(
-                "DELETE FROM volume_profiles WHERE symbol=? AND trade_date=? AND window=?",
-                (symbol, anchor.isoformat(), window)
-            )
-        if vpro_path.exists():
-            vpro_path.unlink()
-
-    data = _get_or_compute_vpro(symbol, anchor, window)
-    poc  = max(data, key=lambda d: d["trades"])["price"] if data else None
-    return jsonify({"data": data, "symbol": symbol, "date": date_str, "window": window, "poc": poc})
-
-
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -804,12 +824,23 @@ body{font-size:.85rem;}
 .source-pivot     {background:#f28e2b;color:#fff;}
 .source-overnight {background:#59a14f;color:#fff;}
 .source-manual    {background:#e15759;color:#fff;}
+.source-orb       {background:#1abc9c;color:#fff;}
+.source-vwap      {background:#9b59b6;color:#fff;}
+.source-volume    {background:#e67e22;color:#fff;}
+.source-round     {background:#7f8c8d;color:#fff;}
 .row-ohlc      {background:rgba(78,121,167,.12)!important;}
 .row-pivot     {background:rgba(242,142,43,.12)!important;}
 .row-overnight {background:rgba(89,161,79,.12)!important;}
 .row-manual    {background:rgba(225,87,89,.12)!important;}
+.row-orb       {background:rgba(26,188,156,.12)!important;}
+.row-vwap      {background:rgba(155,89,182,.12)!important;}
+.row-volume    {background:rgba(230,126,34,.12)!important;}
+.row-round     {background:rgba(127,140,141,.12)!important;}
 .price-chip{font-family:monospace;font-size:.8rem;padding:2px 8px;border-radius:4px;}
 #mock-banner-graph{display:none;}
+body.busy-wait{cursor:wait!important;}
+body.busy-wait *{pointer-events:none!important;}
+body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 </style>
 </head>
 <body>
@@ -823,18 +854,17 @@ body{font-size:.85rem;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.0</span>
+  <span class="badge bg-secondary">v1.7</span>
 </nav>
 
 <div class="container-fluid py-2">
 <ul class="nav nav-tabs mb-2" id="mainTab" role="tablist">
   <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-volume" id="btn-volume-tab">Volume</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.0</span>
+    <span class="badge bg-secondary">v2.1</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
@@ -890,6 +920,24 @@ body{font-size:.85rem;}
     <span class="text-muted me-1">Overnight:</span>
     <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_H" checked> ONH</label>
     <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_L" checked> ONL</label>
+    <span class="vr me-2"></span>
+    <span class="text-muted me-1">ORB:</span>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ORB15_H" checked> 15H</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ORB15_L" checked> 15L</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ORB30_H" checked> 30H</label>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="ORB30_L" checked> 30L</label>
+    <span class="vr me-2"></span>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="VWAP" checked> VWAP</label>
+    <span class="vr me-2"></span>
+    <span class="text-muted me-1">Vol:</span>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="POC" checked> POC</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="VAH" checked> VAH</label>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="VAL" checked> VAL</label>
+    <span class="vr me-2"></span>
+    <span class="text-muted me-1">Round:</span>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_BIG" checked> Big</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_MED" checked> Med</label>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="ROUND_SML"> Sml</label>
     <span class="vr me-2"></span>
     <label><input class="form-check-input algo-chk" type="checkbox" value="MANUAL" checked> Manual</label>
   </div>
@@ -966,6 +1014,19 @@ body{font-size:.85rem;}
     <button class="btn btn-sm btn-outline-warning ms-auto" onclick="createGraphTrades()">Create Trades</button>
     <span id="graph-trades-msg" class="small ms-1"></span>
   </div>
+  <!-- Row 2: Analyze + nav -->
+  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
+    <button class="btn btn-sm btn-outline-info" onclick="analyzeAll()">Analyze All</button>
+    <span id="analyze-msg" class="small text-muted"></span>
+    <div id="analyze-nav" class="d-flex align-items-center gap-1 ms-2" style="display:none">
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev symbol" onclick="navSym(-1)">◀S</button>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Next symbol" onclick="navSym(1)">S▶</button>
+      <span class="vr mx-1"></span>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev day" onclick="navDay(-1)">◀D</button>
+      <span id="analyze-day-info" class="small text-muted px-1" style="min-width:50px;text-align:center">0/0</span>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Next day" onclick="navDay(1)">D▶</button>
+    </div>
+  </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
     ⚠ No data for selected date — loaded <strong id="mock-date-graph"></strong>
   </div>
@@ -977,35 +1038,16 @@ body{font-size:.85rem;}
       <span class="badge source-pivot">Pivot</span></label>
     <label><input type="checkbox" id="tog-overnight" checked onchange="redrawLines()">
       <span class="badge source-overnight">Overnight</span></label>
+    <label><input type="checkbox" id="tog-orb"       checked onchange="redrawLines()">
+      <span class="badge source-orb">ORB</span></label>
+    <label><input type="checkbox" id="tog-vwap"      checked onchange="redrawLines()">
+      <span class="badge source-vwap">VWAP</span></label>
+    <label><input type="checkbox" id="tog-volume"    checked onchange="redrawLines()">
+      <span class="badge source-volume">Volume</span></label>
+    <label><input type="checkbox" id="tog-round"     checked onchange="redrawLines()">
+      <span class="badge source-round">Round</span></label>
     <label><input type="checkbox" id="tog-manual"    checked onchange="redrawLines()">
       <span class="badge source-manual">Manual</span></label>
-  </div>
-</div>
-
-<!-- ══════════════════════ VOLUME PROFILE ══════════════════════ -->
-<div class="tab-pane fade" id="tab-volume">
-  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
-    <ul class="nav nav-pills mb-0" id="vsym-pill-tabs">
-      <li class="nav-item"><button class="nav-link active" onclick="selectVSym('MES',this)">MES</button></li>
-      <li class="nav-item"><button class="nav-link" onclick="selectVSym('MNQ',this)">MNQ</button></li>
-      <li class="nav-item"><button class="nav-link" onclick="selectVSym('MYM',this)">MYM</button></li>
-      <li class="nav-item"><button class="nav-link" onclick="selectVSym('M2K',this)">M2K</button></li>
-    </ul>
-    <div class="btn-group btn-group-sm" role="group">
-      <button id="vbtn-1d"   class="btn btn-outline-secondary active" onclick="setVWindow('1d',this)">Day</button>
-      <button id="vbtn-half" class="btn btn-outline-secondary"        onclick="setVWindow('half',this)">½ Day</button>
-      <button id="vbtn-5d"   class="btn btn-outline-secondary"        onclick="setVWindow('5d',this)">5d</button>
-      <button id="vbtn-10d"  class="btn btn-outline-secondary"        onclick="setVWindow('10d',this)">10d</button>
-    </div>
-    <button class="btn btn-sm btn-outline-warning" onclick="loadVolumeProfile(true)">Recompute</button>
-    <span id="vol-msg" class="small text-muted ms-1"></span>
-  </div>
-  <div id="vol-chart" style="width:100%;height:480px;background:#1a1a2e;border-radius:4px;"></div>
-  <div class="small text-muted mt-1">
-    <span class="me-3">Gold dashed = POC (point of control)</span>
-    <span class="me-3"><span style="color:#26a69a">■</span> Buy vol</span>
-    <span><span style="color:#ef5350">■</span> Sell vol</span>
-    <span class="ms-3 text-info">Dotted lines = armed critical lines</span>
   </div>
 </div>
 
@@ -1073,7 +1115,30 @@ body{font-size:.85rem;}
 
 <script>
 // ── price polling ────────────────────────────────────────────────────────────
-const SOURCE_COLORS = {ohlc:'#4e79a7',pivot:'#f28e2b',overnight:'#59a14f',manual:'#e15759'};
+const SOURCE_COLORS = {
+  ohlc:'#4e79a7', pivot:'#f28e2b', overnight:'#59a14f', manual:'#e15759',
+  orb:'#1abc9c', vwap:'#9b59b6', volume:'#e67e22', round:'#7f8c8d'
+};
+
+// ── Busy state ───────────────────────────────────────────────────────────────
+let _busyCount = 0, _busyDisabled = [];
+function _enterBusy(){
+  if(++_busyCount === 1){
+    document.body.classList.add('busy-wait');
+    _busyDisabled = [];
+    document.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled)').forEach(el=>{
+      _busyDisabled.push(el); el.disabled = true;
+    });
+  }
+}
+function _exitBusy(){
+  if(--_busyCount <= 0){
+    _busyCount = 0;
+    document.body.classList.remove('busy-wait');
+    _busyDisabled.forEach(el => el.disabled = false);
+    _busyDisabled = [];
+  }
+}
 const STATUS_CLS    = {PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
                        FILLED:'warning',CLOSED:'success',CANCELLED:'dark',ERROR:'danger'};
 
@@ -1104,6 +1169,7 @@ function setAllAlgos(checked){
 }
 
 async function createLines(){
+  _enterBusy();
   const syms      = checkedVals('sym-lines');
   const algoTypes = [...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
   const mergeThr  = parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
@@ -1135,6 +1201,7 @@ async function createLines(){
 
     if(ok.length > 0) refreshLines();
   }catch(e){ document.getElementById('lines-msg').textContent='Error: '+e; }
+  finally{ _exitBusy(); }
 }
 
 async function refreshLines(){
@@ -1243,10 +1310,11 @@ function filteredBars(){
 }
 
 async function loadGraph(){
-  const reqDate = document.getElementById('shared-date-input').value||'';
-  const base = `/api/history/${_graphSym}?interval=${_graphInterval}`;
-  const url = reqDate ? `${base}&date=${reqDate}` : base;
+  _enterBusy();
   try{
+    const reqDate = document.getElementById('shared-date-input').value||'';
+    const base = `/api/history/${_graphSym}?interval=${_graphInterval}`;
+    const url = reqDate ? `${base}&date=${reqDate}` : base;
     const br = await (await fetch(url)).json();
     _chartBars = br.bars||[];
     const mock = br.mock_date;
@@ -1254,17 +1322,20 @@ async function loadGraph(){
     if(mock) document.getElementById('mock-date-graph').textContent=mock;
 
     const ms = parseInt(document.getElementById('min-str-lines').value)||1;
-    _chartLines = await (await fetch(`/api/lines?symbol=${_graphSym}&min_strength=${ms}`)).json();
+    const lineDate = reqDate || br.date || '';
+    const linesUrl = `/api/lines?symbol=${_graphSym}&min_strength=${ms}` + (lineDate?`&date=${lineDate}`:'');
+    _chartLines = await (await fetch(linesUrl)).json();
     drawChart();
   }catch(e){ console.error(e); }
+  finally{ _exitBusy(); }
 }
 
 function enabledSources(){
   const s=new Set();
-  if(document.getElementById('tog-ohlc').checked)      s.add('ohlc');
-  if(document.getElementById('tog-pivot').checked)     s.add('pivot');
-  if(document.getElementById('tog-overnight').checked) s.add('overnight');
-  if(document.getElementById('tog-manual').checked)    s.add('manual');
+  ['ohlc','pivot','overnight','orb','vwap','volume','round','manual'].forEach(src=>{
+    const el = document.getElementById('tog-'+src);
+    if(el && el.checked) s.add(src);
+  });
   return s;
 }
 
@@ -1307,6 +1378,12 @@ function drawChart(){
   }
   const bars = filteredBars();
   document.getElementById('bar-count').textContent = bars.length + ' bars';
+
+  // Y-axis range from bar prices only — prevents far-out lines from zooming the chart out
+  const yLow  = Math.min(...bars.map(b => b.low));
+  const yHigh = Math.max(...bars.map(b => b.high));
+  const yPad  = (yHigh - yLow) * 0.07;
+
   let barTrace;
   if(_graphMode==='line'){
     barTrace = {type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
@@ -1324,7 +1401,7 @@ function drawChart(){
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
     xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
-    yaxis:{gridcolor:'#333'},
+    yaxis:{range:[yLow-yPad, yHigh+yPad],gridcolor:'#333'},
     annotations:buildAnnotations(),
     showlegend:false};
   Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
@@ -1349,10 +1426,61 @@ function redrawLines(){
   drawChart();
 }
 
+// ── Analyze All + nav ────────────────────────────────────────────────────────
+let _analyzedDates = [], _analyzedIdx = 0;
+
+async function analyzeAll(){
+  _enterBusy();
+  const msg = document.getElementById('analyze-msg');
+  msg.className='small text-warning'; msg.textContent='Analyzing…';
+  try{
+    const d = await (await fetch('/api/analyze_all',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:['MES','MNQ','MYM','M2K']})
+    })).json();
+    _analyzedDates = d.dates||[];
+    _analyzedIdx   = _analyzedDates.length - 1;
+    msg.className='small text-success';
+    msg.textContent = `${_analyzedDates.length} days`;
+    const nav = document.getElementById('analyze-nav');
+    nav.style.display = 'flex';
+    _updateDayInfo();
+    if(_analyzedDates.length){
+      document.getElementById('shared-date-input').value = _analyzedDates[_analyzedIdx];
+    }
+  }catch(e){
+    document.getElementById('analyze-msg').className='small text-danger';
+    document.getElementById('analyze-msg').textContent='Error: '+e;
+  }finally{ _exitBusy(); }
+  if(_analyzedDates.length) await loadGraph();
+}
+
+function _updateDayInfo(){
+  document.getElementById('analyze-day-info').textContent =
+    `${_analyzedIdx+1}/${_analyzedDates.length}`;
+}
+
+async function navDay(delta){
+  if(!_analyzedDates.length) return;
+  _analyzedIdx = Math.max(0, Math.min(_analyzedDates.length-1, _analyzedIdx+delta));
+  document.getElementById('shared-date-input').value = _analyzedDates[_analyzedIdx];
+  _updateDayInfo();
+  await loadGraph();
+}
+
+function navSym(delta){
+  const syms=['MES','MNQ','MYM','M2K'];
+  const next = syms[(syms.indexOf(_graphSym)+delta+syms.length)%syms.length];
+  document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(btn=>{
+    if(btn.textContent===next) btn.click();
+  });
+}
+
 async function createGraphTrades(){
   const msg = document.getElementById('graph-trades-msg');
   msg.className='small ms-1 text-warning';
   msg.textContent='Generating…';
+  _enterBusy();
   try{
     const d = await (await fetch('/api/trades/create',{method:'POST',
       headers:{'Content-Type':'application/json'},
@@ -1373,124 +1501,29 @@ async function createGraphTrades(){
   }catch(e){
     msg.className='small ms-1 text-danger';
     msg.textContent='Error: '+e;
-  }
+  }finally{ _exitBusy(); }
 }
 
 function onSharedDateChange(){
   const active = document.querySelector('#mainTab .nav-link.active');
-  const tgt = active?.dataset?.bsTarget;
-  if(tgt === '#tab-graph')  loadGraph();
-  if(tgt === '#tab-volume') loadVolumeProfile();
+  if(active?.dataset?.bsTarget === '#tab-graph') loadGraph();
 }
 
-// click = immediate DOM changes only; shown.bs.tab = render after pane is visible
 document.getElementById('btn-graph-tab').addEventListener('click', function(){
   document.getElementById('shared-date-input').readOnly = true;
-});
-document.getElementById('btn-graph-tab').addEventListener('shown.bs.tab', function(){
   loadGraph();
 });
-
-document.getElementById('btn-volume-tab').addEventListener('shown.bs.tab', function(){
-  loadVolumeProfile();
-});
-
-document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab):not(#btn-volume-tab)').forEach(function(btn){
+document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab)').forEach(function(btn){
   btn.addEventListener('click', function(){
     document.getElementById('shared-date-input').readOnly = false;
   });
 });
 
-// ── VOLUME PROFILE ───────────────────────────────────────────────────────────
-let _vSym='MES', _vWindow='1d', _vData=[], _vLines=[];
-
-function selectVSym(sym, btn){
-  _vSym = sym;
-  document.querySelectorAll('#vsym-pill-tabs .nav-link').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  loadVolumeProfile();
-}
-
-function setVWindow(w, btn){
-  _vWindow = w;
-  document.querySelectorAll('#vbtn-1d,#vbtn-half,#vbtn-5d,#vbtn-10d').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  loadVolumeProfile();
-}
-
-async function loadVolumeProfile(recompute=false){
-  const reqDate = document.getElementById('shared-date-input').value;
-  const msg = document.getElementById('vol-msg');
-  if(!reqDate){ msg.textContent='Select a date'; return; }
-  msg.className='small text-warning ms-1';
-  msg.textContent=recompute?'Recomputing…':'Computing…';
-  try{
-    const qs = recompute ? '&recompute=1' : '';
-    const r = await (await fetch(
-      `/api/volume_profile/${_vSym}?date=${reqDate}&window=${_vWindow}${qs}`
-    )).json();
-    _vData = r.data || [];
-    const ms = parseInt(document.getElementById('min-str-lines').value)||1;
-    _vLines = await (await fetch(`/api/lines?symbol=${_vSym}&min_strength=${ms}`)).json();
-    if(!_vData.length){
-      msg.className='small text-muted ms-1';
-      msg.textContent='No data for this date / window';
-      Plotly.purge('vol-chart');
-      return;
-    }
-    const src = recompute ? 'recomputed' : 'cached';
-    msg.className='small text-success ms-1';
-    msg.textContent=`${_vData.length} levels · POC ${r.poc!=null?r.poc.toFixed(2):'—'} (${src})`;
-    drawVolumeChart(r.poc);
-  }catch(e){
-    msg.className='small text-danger ms-1';
-    msg.textContent='Error: '+e;
-  }
-}
-
-function drawVolumeChart(poc){
-  if(!_vData.length){ Plotly.purge('vol-chart'); return; }
-  const prices = _vData.map(d=>d.price);
-  const traceBuy = {
-    type:'bar', orientation:'h', name:'Buy',
-    x:_vData.map(d=>d.buy_vol), y:prices,
-    marker:{color:'rgba(38,166,154,0.85)'},
-    hovertemplate:'<b>%{y:.2f}</b><br>Buy: %{x}  Visits: %{customdata}<extra></extra>',
-    customdata:_vData.map(d=>d.visit_count)
-  };
-  const traceSell = {
-    type:'bar', orientation:'h', name:'Sell',
-    x:_vData.map(d=>d.sell_vol), y:prices,
-    marker:{color:'rgba(239,83,80,0.85)'},
-    hovertemplate:'<b>%{y:.2f}</b><br>Sell: %{x}<extra></extra>'
-  };
-  const shapes = [];
-  if(poc!=null){
-    shapes.push({type:'line', xref:'paper', x0:0, x1:1, y0:poc, y1:poc,
-      line:{color:'#ffd700', width:2, dash:'dash'}});
-  }
-  for(const l of _vLines.filter(l=>!!l.armed)){
-    shapes.push({type:'line', xref:'paper', x0:0, x1:1, y0:l.price, y1:l.price,
-      line:{color:SOURCE_COLORS[l.source]||'#888', width:1.5, dash:'dot'}});
-  }
-  const layout = {
-    barmode:'stack',
-    paper_bgcolor:'#1a1a2e', plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc'},
-    margin:{l:65, r:15, t:10, b:40},
-    xaxis:{gridcolor:'#333', zeroline:false, title:'Ticks'},
-    yaxis:{gridcolor:'#333', tickformat:'.2f', autorange:true, title:'Price'},
-    shapes,
-    showlegend:true,
-    legend:{x:0.99, y:0.99, xanchor:'right', bgcolor:'rgba(0,0,0,0.5)'}
-  };
-  Plotly.newPlot('vol-chart',[traceBuy,traceSell],layout,{responsive:true,displayModeBar:false});
-}
-
 // ── CREATE TRADES ────────────────────────────────────────────────────────────
 let _candidates=[];
 
 async function createTrades(){
+  _enterBusy();
   const syms     = checkedVals('sym-trades');
   const brackets = [...document.querySelectorAll('.bkt-chk:checked')].map(e=>parseFloat(e.value));
   const ms       = parseInt(document.getElementById('min-str-trades').value)||1;
@@ -1510,6 +1543,7 @@ async function createTrades(){
     document.getElementById('trades-msg').textContent='';
     renderTrades(_candidates);
   }catch(e){ document.getElementById('trades-msg').textContent='Error: '+e; }
+  finally{ _exitBusy(); }
 }
 
 function renderTrades(cands){
@@ -1536,6 +1570,7 @@ function renderTrades(cands){
 
 async function submitTrades(){
   if(!_candidates.length) return;
+  _enterBusy();
   const btn=document.getElementById('btn-submit');
   btn.disabled=true;
   try{
@@ -1547,6 +1582,7 @@ async function submitTrades(){
     btn.textContent='Submit 0 Trades';
     document.getElementById('trades-tbody').innerHTML='';
   }catch(e){ document.getElementById('trades-msg').textContent='Error: '+e; btn.disabled=false; }
+  finally{ _exitBusy(); }
 }
 
 // ── SUBMITTED ────────────────────────────────────────────────────────────────
@@ -1591,13 +1627,14 @@ function _lastWeekday(){
 }
 
 async function loadLastDay(){
+  _enterBusy();
   try{
     const d = await (await fetch('/api/last_data_date')).json();
     document.getElementById('shared-date-input').value = d.date || _lastWeekday();
   }catch(e){
     document.getElementById('shared-date-input').value = _lastWeekday();
-  }
-  createLines();
+  }finally{ _exitBusy(); }
+  await createLines();
 }
 
 // Initial load — set shared date picker to last actual data date, max = today
