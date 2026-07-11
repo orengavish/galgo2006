@@ -50,6 +50,28 @@ SOURCE_LABELS = {
     "manual":    "Manual",
 }
 
+ALL_ALGO_TYPES = [
+    "PDH", "PDL", "PDC", "PDO",
+    "PIVOT_P", "PIVOT_R1", "PIVOT_S1", "PIVOT_R2", "PIVOT_S2", "PIVOT_R3", "PIVOT_S3",
+    "OVERNIGHT_H", "OVERNIGHT_L", "MANUAL",
+]
+_ALGO_LABEL = {
+    "PDH":         "Previous Day High",
+    "PDL":         "Previous Day Low",
+    "PDC":         "Previous Day Close",
+    "PDO":         "Previous Day Open",
+    "PIVOT_P":     "Pivot Point",
+    "PIVOT_R1":    "Resistance 1",
+    "PIVOT_S1":    "Support 1",
+    "PIVOT_R2":    "Resistance 2",
+    "PIVOT_S2":    "Support 2",
+    "PIVOT_R3":    "Resistance 3",
+    "PIVOT_S3":    "Support 3",
+    "OVERNIGHT_H": "Overnight High",
+    "OVERNIGHT_L": "Overnight Low",
+    "MANUAL":      "Manual",
+}
+
 # ── Flask app ──────────────────────────────────────────────────────────────────
 
 app = Flask(__name__)
@@ -74,13 +96,15 @@ def _resolve_db() -> Path:
 
 
 def _ensure_columns(db_path: Path) -> None:
-    """Add source / algo_type to critical_lines if absent (idempotent)."""
+    """Add source / algo_type / note to critical_lines if absent (idempotent)."""
     with get_db(db_path) as con:
         existing = {r[1] for r in con.execute("PRAGMA table_info(critical_lines)").fetchall()}
         if "source" not in existing:
             con.execute("ALTER TABLE critical_lines ADD COLUMN source TEXT DEFAULT 'manual'")
         if "algo_type" not in existing:
             con.execute("ALTER TABLE critical_lines ADD COLUMN algo_type TEXT DEFAULT 'MANUAL'")
+        if "note" not in existing:
+            con.execute("ALTER TABLE critical_lines ADD COLUMN note TEXT")
 
 
 # ── History helpers ────────────────────────────────────────────────────────────
@@ -135,7 +159,7 @@ def _ohlcv_bars(ticks: list, interval_min: int = 5) -> list:
 
 # ── Line generation ────────────────────────────────────────────────────────────
 
-def _generate_lines(symbol: str, ticks: list) -> list[dict]:
+def _generate_lines(symbol: str, ticks: list, filter_types: set | None = None) -> list[dict]:
     tick   = TICKS.get(symbol, 0.25)
     rt     = lambda p: round(round(p / tick) * tick, 10)
 
@@ -160,42 +184,66 @@ def _generate_lines(symbol: str, ticks: list) -> list[dict]:
 
     lines = []
 
-    def add(price, line_type, source, algo_type, strength):
+    def add(price, line_type, source, algo_type, strength, formula="", inputs=""):
+        if filter_types is not None and algo_type not in filter_types:
+            return
         lines.append({"price": rt(price), "line_type": line_type,
-                      "source": source, "algo_type": algo_type, "strength": strength})
+                      "source": source, "algo_type": algo_type, "strength": strength,
+                      "_tip": {"formula": formula, "inputs": inputs}})
+
+    ohlc_inp = (f"H={H:.2f}  L={L:.2f}"
+                + (f"  O={rth_open:.2f}"  if rth_open  is not None else "")
+                + (f"  C={rth_close:.2f}" if rth_close is not None else ""))
 
     # Full-session H / L
-    add(H, "RESISTANCE", "ohlc", "PDH", 10)
-    add(L, "SUPPORT",    "ohlc", "PDL", 10)
+    add(H, "RESISTANCE", "ohlc", "PDH", 10,
+        "max(all session prices)", ohlc_inp)
+    add(L, "SUPPORT",    "ohlc", "PDL", 10,
+        "min(all session prices)", ohlc_inp)
 
     # RTH close / open — classify by side of midpoint
     if rth_close is not None:
         add(rth_close,
             "RESISTANCE" if rth_close >= mid else "SUPPORT",
-            "ohlc", "PDC", 9)
+            "ohlc", "PDC", 9,
+            f"last RTH price = {rth_close:.2f}", ohlc_inp)
     if rth_open is not None:
         add(rth_open,
             "RESISTANCE" if rth_open >= mid else "SUPPORT",
-            "ohlc", "PDO", 8)
+            "ohlc", "PDO", 8,
+            f"first RTH price = {rth_open:.2f}", ohlc_inp)
 
     # Pivot points (use RTH H/L/C when available)
     ph = max(rth_p) if rth_p else H
     pl = min(rth_p) if rth_p else L
     pc = rth_close or all_p[-1]
     P  = (ph + pl + pc) / 3.0
-    add(P,                "RESISTANCE", "pivot", "PIVOT_P",  8)
-    add(2*P - pl,         "RESISTANCE", "pivot", "PIVOT_R1", 7)
-    add(2*P - ph,         "SUPPORT",    "pivot", "PIVOT_S1", 7)
-    add(P + (ph - pl),    "RESISTANCE", "pivot", "PIVOT_R2", 6)
-    add(P - (ph - pl),    "SUPPORT",    "pivot", "PIVOT_S2", 6)
-    add(ph + 2*(P - pl),  "RESISTANCE", "pivot", "PIVOT_R3", 5)
-    add(pl - 2*(ph - P),  "SUPPORT",    "pivot", "PIVOT_S3", 5)
+    piv_inp = f"RTH H={ph:.2f}  L={pl:.2f}  C={pc:.2f}  P={P:.2f}"
+    add(P,               "RESISTANCE", "pivot", "PIVOT_P",  8,
+        f"(H+L+C)/3 = ({ph:.2f}+{pl:.2f}+{pc:.2f})/3 = {P:.2f}", piv_inp)
+    add(2*P - pl,        "RESISTANCE", "pivot", "PIVOT_R1", 7,
+        f"2xP - L = 2x{P:.2f} - {pl:.2f} = {2*P-pl:.2f}", piv_inp)
+    add(2*P - ph,        "SUPPORT",    "pivot", "PIVOT_S1", 7,
+        f"2xP - H = 2x{P:.2f} - {ph:.2f} = {2*P-ph:.2f}", piv_inp)
+    add(P + (ph - pl),   "RESISTANCE", "pivot", "PIVOT_R2", 6,
+        f"P + (H-L) = {P:.2f} + ({ph:.2f}-{pl:.2f}) = {P+(ph-pl):.2f}", piv_inp)
+    add(P - (ph - pl),   "SUPPORT",    "pivot", "PIVOT_S2", 6,
+        f"P - (H-L) = {P:.2f} - ({ph:.2f}-{pl:.2f}) = {P-(ph-pl):.2f}", piv_inp)
+    add(ph + 2*(P - pl), "RESISTANCE", "pivot", "PIVOT_R3", 5,
+        f"H + 2x(P-L) = {ph:.2f} + 2x({P:.2f}-{pl:.2f}) = {ph+2*(P-pl):.2f}", piv_inp)
+    add(pl - 2*(ph - P), "SUPPORT",    "pivot", "PIVOT_S3", 5,
+        f"L - 2x(H-P) = {pl:.2f} - 2x({ph:.2f}-{P:.2f}) = {pl-2*(ph-P):.2f}", piv_inp)
 
     # Overnight / Globex
+    on_inp = ((f"GLX H={glob_h:.2f}" if glob_h is not None else "")
+              + ("  " if glob_h is not None and glob_l is not None else "")
+              + (f"L={glob_l:.2f}" if glob_l is not None else ""))
     if glob_h is not None:
-        add(glob_h, "RESISTANCE", "overnight", "OVERNIGHT_H", 5)
+        add(glob_h, "RESISTANCE", "overnight", "OVERNIGHT_H", 5,
+            f"max(Globex 17:00-09:30 CT) = {glob_h:.2f}", on_inp)
     if glob_l is not None:
-        add(glob_l, "SUPPORT",    "overnight", "OVERNIGHT_L", 5)
+        add(glob_l, "SUPPORT",    "overnight", "OVERNIGHT_L", 5,
+            f"min(Globex 17:00-09:30 CT) = {glob_l:.2f}", on_inp)
 
     # Deduplicate by tick bucket (keep highest-strength per bucket)
     seen: set = set()
@@ -230,7 +278,9 @@ def api_prices():
 @app.route("/api/lines/create", methods=["POST"])
 def api_lines_create():
     body    = request.get_json(silent=True) or {}
-    symbols = body.get("symbols", ALL_SYMBOLS)
+    symbols         = body.get("symbols", ALL_SYMBOLS)
+    algo_types      = set(body.get("algo_types", ALL_ALGO_TYPES))
+    merge_threshold = float(body.get("merge_threshold", 16.0))
     today   = date.today().isoformat()
     db_path = _resolve_db()
     _ensure_columns(db_path)
@@ -240,7 +290,7 @@ def api_lines_create():
     expected_prev   = _prev_trading_day()
 
     for sym in symbols:
-        # Walk back up to 14 trading days to find history
+        # Walk back up to 20 calendar days to find history
         ticks, used_date = None, None
         search = date.today()
         for _ in range(20):
@@ -259,7 +309,23 @@ def api_lines_create():
         if expected_prev and used_date != expected_prev:
             mock_date = used_date.isoformat()
 
-        lines = _generate_lines(sym, ticks)
+        raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
+
+        # Apply merge threshold: sort by strength DESC; suppress lines within threshold of a stronger one
+        kept = []
+        for ln in sorted(raw_lines, key=lambda x: -x["strength"]):
+            dominated = False
+            for k in kept:
+                if abs(k["price"] - ln["price"]) <= merge_threshold:
+                    k.setdefault("merged", []).append({
+                        "algo_type": ln["algo_type"],
+                        "price":     ln["price"],
+                        "strength":  ln["strength"],
+                    })
+                    dominated = True
+                    break
+            if not dominated:
+                kept.append(ln)
 
         with get_db(db_path) as con:
             con.execute(
@@ -267,16 +333,23 @@ def api_lines_create():
                 " WHERE symbol=? AND date=? AND (source IS NULL OR source != 'manual')",
                 (sym, today)
             )
-            for ln in lines:
+            for ln in kept:
+                tip = {
+                    "label":     _ALGO_LABEL.get(ln["algo_type"], ln["algo_type"]),
+                    "formula":   ln["_tip"]["formula"],
+                    "inputs":    ln["_tip"]["inputs"],
+                    "from_date": used_date.isoformat(),
+                    "merged":    ln.get("merged", []),
+                }
                 con.execute(
                     "INSERT INTO critical_lines"
-                    " (symbol, date, line_type, price, strength, armed, source, algo_type)"
-                    " VALUES (?, ?, ?, ?, ?, 1, ?, ?)",
+                    " (symbol, date, line_type, price, strength, armed, source, algo_type, note)"
+                    " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
                     (sym, today, ln["line_type"], ln["price"],
-                     ln["strength"], ln["source"], ln["algo_type"])
+                     ln["strength"], ln["source"], ln["algo_type"], json.dumps(tip))
                 )
 
-        results[sym] = {"lines": len(lines), "from_date": used_date.isoformat()}
+        results[sym] = {"lines": len(kept), "from_date": used_date.isoformat()}
 
     return jsonify({"results": results, "mock_date": mock_date, "today": today})
 
@@ -292,7 +365,8 @@ def api_lines():
     q_base = (
         "SELECT id, symbol, price, line_type, strength,"
         " COALESCE(source,'manual') AS source,"
-        " COALESCE(algo_type,'MANUAL') AS algo_type"
+        " COALESCE(algo_type,'MANUAL') AS algo_type,"
+        " note"
         " FROM critical_lines WHERE date=? AND strength>=?"
     )
     with get_db(db_path) as con:
@@ -541,8 +615,8 @@ body{font-size:.85rem;}
 
 <!-- ══════════════════════ LINES ══════════════════════ -->
 <div class="tab-pane fade show active" id="tab-lines">
-  <div class="d-flex flex-wrap gap-2 align-items-center mb-2">
-    <button class="btn btn-sm btn-primary" onclick="createLines()">Create Lines</button>
+  <!-- Row 1: Symbols + merge threshold + Create -->
+  <div class="d-flex flex-wrap gap-2 align-items-center mb-1">
     <span class="text-muted small">Symbols:</span>
     <div id="sym-lines" class="d-flex gap-2">
       <label class="small"><input class="form-check-input" type="checkbox" value="MES" checked> MES</label>
@@ -550,12 +624,49 @@ body{font-size:.85rem;}
       <label class="small"><input class="form-check-input" type="checkbox" value="MYM" checked> MYM</label>
       <label class="small"><input class="form-check-input" type="checkbox" value="M2K" checked> M2K</label>
     </div>
-    <label class="small ms-2">Strength ≥
+    <span class="text-muted small ms-2">Merge ≤</span>
+    <div class="d-flex gap-2">
+      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="4"> 4pt</label>
+      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="8"> 8pt</label>
+      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="16" checked> 16pt</label>
+    </div>
+    <button class="btn btn-sm btn-primary ms-1" onclick="createLines()">Create Lines</button>
+    <span id="lines-msg" class="small text-muted ms-1"></span>
+  </div>
+  <!-- Row 2: Algo type checkboxes (all 14 preselected) -->
+  <div class="d-flex flex-wrap gap-1 align-items-center mb-1 small border rounded px-2 py-1 bg-body-tertiary">
+    <span class="fw-semibold text-muted me-1">Algos</span>
+    <a href="#" class="text-muted" style="font-size:.75rem" onclick="setAllAlgos(true);return false">All</a>
+    <a href="#" class="text-muted ms-1 me-2" style="font-size:.75rem" onclick="setAllAlgos(false);return false">Clear</a>
+    <span class="vr me-2"></span>
+    <span class="text-muted me-1">OHLC:</span>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PDH" checked> PDH</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PDL" checked> PDL</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PDC" checked> PDC</label>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="PDO" checked> PDO</label>
+    <span class="vr me-2"></span>
+    <span class="text-muted me-1">Pivot:</span>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_P" checked> P</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R1" checked> R1</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S1" checked> S1</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R2" checked> R2</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S2" checked> S2</label>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_R3" checked> R3</label>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="PIVOT_S3" checked> S3</label>
+    <span class="vr me-2"></span>
+    <span class="text-muted me-1">Overnight:</span>
+    <label class="me-1"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_H" checked> ONH</label>
+    <label class="me-2"><input class="form-check-input algo-chk" type="checkbox" value="OVERNIGHT_L" checked> ONL</label>
+    <span class="vr me-2"></span>
+    <label><input class="form-check-input algo-chk" type="checkbox" value="MANUAL" checked> Manual</label>
+  </div>
+  <!-- Row 3: Strength filter + refresh -->
+  <div class="d-flex gap-2 align-items-center mb-2">
+    <label class="small">Strength ≥
       <input type="number" id="min-str-lines" class="form-control form-control-sm d-inline-block"
              style="width:55px" min="1" max="10" value="1" onchange="refreshLines()">
     </label>
     <button class="btn btn-sm btn-outline-secondary" onclick="refreshLines()">Refresh</button>
-    <span id="lines-msg" class="small text-muted ms-1"></span>
   </div>
 
   <div id="mock-banner" class="alert alert-warning py-1 px-2 mb-2 small">
@@ -712,12 +823,19 @@ function strengthColor(s){
 function fmt(v){ return v!=null?v.toFixed(2):'—'; }
 
 // ── LINES ────────────────────────────────────────────────────────────────────
+function setAllAlgos(checked){
+  document.querySelectorAll('.algo-chk').forEach(e=>e.checked=checked);
+}
+
 async function createLines(){
-  const syms = checkedVals('sym-lines');
+  const syms      = checkedVals('sym-lines');
+  const algoTypes = [...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
+  const mergeThr  = parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
   document.getElementById('lines-msg').textContent='Creating…';
   try{
     const d = await (await fetch('/api/lines/create',{method:'POST',
-      headers:{'Content-Type':'application/json'},body:JSON.stringify({symbols:syms})})).json();
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({symbols:syms,algo_types:algoTypes,merge_threshold:mergeThr})})).json();
     const mock = d.mock_date;
     document.getElementById('mock-banner').style.display = mock?'block':'none';
     if(mock) document.getElementById('mock-date-lbl').textContent=mock;
@@ -732,11 +850,29 @@ async function refreshLines(){
   try{
     const rows = await (await fetch(`/api/lines?min_strength=${ms}`)).json();
     const tb = document.getElementById('lines-tbody');
+    // Dispose existing tooltips before clearing
+    tb.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el=>{
+      bootstrap.Tooltip.getInstance(el)?.dispose();
+    });
     tb.innerHTML='';
     for(const r of rows){
       const sc = SOURCE_COLORS[r.source]||'#888';
       const sl = r.source.charAt(0).toUpperCase()+r.source.slice(1);
       const tr = document.createElement('tr');
+      // Build tooltip from stored note JSON
+      let tipHtml = '';
+      if(r.note){
+        try{
+          const n = typeof r.note==='string'?JSON.parse(r.note):r.note;
+          const mergedPart = n.merged&&n.merged.length
+            ? '<hr style="border-color:#555;margin:3px 0"><span class="text-warning">Absorbed: '
+              +n.merged.map(m=>`${m.algo_type}@${m.price.toFixed(2)}`).join(', ')+'</span>'
+            : '';
+          tipHtml = `<b>${n.label}</b><br><small>${n.formula}</small><br>`
+            +`<small class="text-muted">${n.inputs}</small><br>`
+            +`<small class="text-muted">From: ${n.from_date}</small>${mergedPart}`;
+        }catch(_){}
+      }
       tr.innerHTML=`<td>${r.id}</td><td><b>${r.symbol}</b></td>
         <td class="font-monospace">${r.price.toFixed(2)}</td>
         <td>${r.line_type==='SUPPORT'?'<span class="text-success">SUPP</span>':'<span class="text-danger">RESI</span>'}</td>
@@ -745,6 +881,13 @@ async function refreshLines(){
         <td><span class="badge" style="background:${sc}">${sl}</span></td>
         <td><button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:.7rem"
             onclick="delLine(${r.id})">✕</button></td>`;
+      if(tipHtml){
+        tr.setAttribute('data-bs-toggle','tooltip');
+        tr.setAttribute('data-bs-html','true');
+        tr.setAttribute('data-bs-placement','auto');
+        tr.setAttribute('title', tipHtml);
+        new bootstrap.Tooltip(tr, {html:true, boundary:'document'});
+      }
       tb.appendChild(tr);
     }
   }catch(e){}
