@@ -710,17 +710,28 @@ body{font-size:.85rem;}
 
 <!-- ══════════════════════ GRAPH ══════════════════════ -->
 <div class="tab-pane fade" id="tab-graph">
-  <ul class="nav nav-pills mb-1" id="sym-pill-tabs">
-    <li class="nav-item"><button class="nav-link active" onclick="selectSym('MES',this)">MES</button></li>
-    <li class="nav-item"><button class="nav-link" onclick="selectSym('MNQ',this)">MNQ</button></li>
-    <li class="nav-item"><button class="nav-link" onclick="selectSym('MYM',this)">MYM</button></li>
-    <li class="nav-item"><button class="nav-link" onclick="selectSym('M2K',this)">M2K</button></li>
-  </ul>
+  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
+    <ul class="nav nav-pills mb-0" id="sym-pill-tabs">
+      <li class="nav-item"><button class="nav-link active" onclick="selectSym('MES',this)">MES</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectSym('MNQ',this)">MNQ</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectSym('MYM',this)">MYM</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectSym('M2K',this)">M2K</button></li>
+    </ul>
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-mode-candle" class="btn btn-outline-secondary active" onclick="setGraphMode('candle',this)">Candle</button>
+      <button id="btn-mode-line"   class="btn btn-outline-secondary"        onclick="setGraphMode('line',this)">Line</button>
+    </div>
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-range-all" class="btn btn-outline-secondary active" onclick="setGraphRange('all',this)">All Day</button>
+      <button id="btn-range-4h"  class="btn btn-outline-secondary"        onclick="setGraphRange('4h',this)">Last 4h</button>
+      <button id="btn-range-1h"  class="btn btn-outline-secondary"        onclick="setGraphRange('1h',this)">Last 1h</button>
+    </div>
+    <span class="text-muted small" id="graph-date-lbl"></span>
+  </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
     ⚠ MOCK — showing <strong id="mock-date-graph"></strong>
   </div>
-  <div class="text-muted small mb-1" id="graph-date-lbl"></div>
-  <div id="chart" style="width:100%;height:420px;background:#1a1a2e;border-radius:4px;"></div>
+  <div id="chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
   <div class="d-flex gap-3 mt-2 flex-wrap small">
     <label><input type="checkbox" id="tog-ohlc"      checked onchange="redrawLines()">
       <span class="badge source-ohlc">OHLC</span></label>
@@ -912,13 +923,33 @@ async function addManualLine(){
 }
 
 // ── GRAPH ────────────────────────────────────────────────────────────────────
-let _graphSym='MES', _chartBars=[], _chartLines=[];
+let _graphSym='MES', _chartBars=[], _chartLines=[], _graphMode='candle', _graphRange='all';
+
+function setGraphMode(mode, btn){
+  _graphMode = mode;
+  document.querySelectorAll('#btn-mode-candle,#btn-mode-line').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  drawChart();
+}
+
+function setGraphRange(range, btn){
+  _graphRange = range;
+  document.querySelectorAll('#btn-range-all,#btn-range-4h,#btn-range-1h').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  drawChart();
+}
 
 function selectSym(sym,btn){
   _graphSym=sym;
   document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   loadGraph();
+}
+
+function filteredBars(){
+  if(_graphRange==='all') return _chartBars;
+  const n = _graphRange==='1h' ? 12 : 48;  // 12×5min=1h, 48×5min=4h
+  return _chartBars.slice(-n);
 }
 
 async function loadGraph(){
@@ -928,7 +959,7 @@ async function loadGraph(){
     const mock = br.mock_date;
     document.getElementById('mock-banner-graph').style.display=mock?'block':'none';
     if(mock) document.getElementById('mock-date-graph').textContent=mock;
-    document.getElementById('graph-date-lbl').textContent = br.date?`Date: ${br.date}`:'No data';
+    document.getElementById('graph-date-lbl').textContent = br.date||'No data';
 
     const ms = parseInt(document.getElementById('min-str-lines').value)||1;
     _chartLines = await (await fetch(`/api/lines?symbol=${_graphSym}&min_strength=${ms}`)).json();
@@ -943,14 +974,21 @@ function drawChart(){
       `<div class="d-flex align-items-center justify-content-center h-100 text-muted">No history data for ${_graphSym}</div>`;
     return;
   }
-  const ts = _chartBars.map(b=>b.t);
-  const trace = {type:'candlestick',x:ts,
-    open:_chartBars.map(b=>b.open),high:_chartBars.map(b=>b.high),
-    low:_chartBars.map(b=>b.low),close:_chartBars.map(b=>b.close),
-    name:_graphSym,increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}}};
+  const bars = filteredBars();
+  let trace;
+  if(_graphMode==='line'){
+    trace = {type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
+      name:_graphSym,line:{color:'#7db3d8',width:1.5}};
+  } else {
+    trace = {type:'candlestick',x:bars.map(b=>b.t),
+      open:bars.map(b=>b.open),high:bars.map(b=>b.high),
+      low:bars.map(b=>b.low),close:bars.map(b=>b.close),
+      name:_graphSym,
+      increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}}};
+  }
   const layout={
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc'},margin:{l:55,r:10,t:15,b:40},
+    font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
     xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
     yaxis:{gridcolor:'#333'},
     shapes:buildShapes(),annotations:buildAnnotations(),showlegend:false};
