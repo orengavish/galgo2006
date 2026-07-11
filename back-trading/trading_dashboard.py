@@ -13,6 +13,7 @@ Usage:
 import sys
 import csv
 import json
+import socket
 import argparse
 from pathlib import Path
 from datetime import datetime, date, timezone, timedelta
@@ -497,6 +498,7 @@ HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <title>Trading Dashboard</title>
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23212529'/%3E%3Crect x='4' y='20' width='5' height='9' rx='1' fill='%23198754'/%3E%3Cline x1='6.5' y1='12' x2='6.5' y2='20' stroke='%23198754' stroke-width='1.5'/%3E%3Crect x='4' y='12' width='5' height='4' rx='1' fill='%23198754' opacity='.4'/%3E%3Crect x='13' y='8' width='5' height='21' rx='1' fill='%230d6efd'/%3E%3Cline x1='15.5' y1='4' x2='15.5' y2='8' stroke='%230d6efd' stroke-width='1.5'/%3E%3Crect x='13' y='4' width='5' height='5' rx='1' fill='%230d6efd' opacity='.4'/%3E%3Crect x='22' y='14' width='5' height='15' rx='1' fill='%23dc3545'/%3E%3Cline x1='24.5' y1='7' x2='24.5' y2='14' stroke='%23dc3545' stroke-width='1.5'/%3E%3Crect x='22' y='7' width='5' height='5' rx='1' fill='%23dc3545' opacity='.4'/%3E%3C/svg%3E">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/css/bootstrap.min.css" rel="stylesheet">
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.3/dist/js/bootstrap.bundle.min.js"></script>
@@ -951,8 +953,11 @@ def main():
     parser.add_argument("--host",  default="0.0.0.0")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
-    print(f"Trading Dashboard → http://{args.host}:{args.port}")
-    print(f"LAN access        → http://192.168.1.132:{args.port}")
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+        if _s.connect_ex(("127.0.0.1", args.port)) == 0:
+            print(f"[trading_dashboard] port {args.port} already in use — exiting"); sys.exit(0)
+    print(f"Trading Dashboard -> http://{args.host}:{args.port}")
+    print(f"LAN access        -> http://192.168.1.132:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug)
 
 
