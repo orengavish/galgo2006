@@ -682,6 +682,40 @@ def api_history(symbol: str):
                     "symbol": symbol, "mock_date": mock})
 
 
+@app.route("/api/volume_profile/<symbol>")
+def api_volume_profile(symbol: str):
+    req_date_str = request.args.get("date")
+    start        = date.fromisoformat(req_date_str) if req_date_str else (date.today() - timedelta(days=1))
+
+    ticks, used_date = None, None
+    search = start + timedelta(days=1)
+    for _ in range(20):
+        search -= timedelta(days=1)
+        if search.weekday() >= 5:
+            continue
+        if not _csv_has_rth(symbol, search):
+            continue
+        t = _load_ticks(symbol, search)
+        if t:
+            ticks, used_date = t, search
+            break
+
+    if not ticks:
+        return jsonify({"profile": [], "date": None, "symbol": symbol, "error": "no data"})
+
+    t_sz  = TICKS.get(symbol, 0.25)
+    rth_p = [p for (t_min, p, _) in ticks if _RTH_START_MIN <= t_min < _RTH_END_MIN]
+    counts: dict = {}
+    for p in rth_p:
+        bkt = round(round(p / t_sz) * t_sz, 10)
+        counts[bkt] = counts.get(bkt, 0) + 1
+
+    profile = [{"price": p, "count": c} for p, c in sorted(counts.items())]
+    mock    = used_date.isoformat() if used_date != start else None
+    return jsonify({"profile": profile, "date": used_date.isoformat(),
+                    "symbol": symbol, "mock_date": mock, "tick_size": t_sz})
+
+
 @app.route("/api/trades/create", methods=["POST"])
 def api_trades_create():
     body         = request.get_json(silent=True) or {}
@@ -861,6 +895,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 <ul class="nav nav-tabs mb-2" id="mainTab" role="tablist">
   <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
+  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-bars"  id="btn-bars-tab">Bars</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
@@ -1048,6 +1083,46 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <span class="badge source-round">Round</span></label>
     <label><input type="checkbox" id="tog-manual"    checked onchange="redrawLines()">
       <span class="badge source-manual">Manual</span></label>
+  </div>
+</div>
+
+<!-- ══════════════════════ BARS (Volume Profile) ══════════════════════ -->
+<div class="tab-pane fade" id="tab-bars">
+  <!-- Row 1: symbol + transpose + info + nav -->
+  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
+    <ul class="nav nav-pills mb-0" id="bars-sym-pills">
+      <li class="nav-item"><button class="nav-link active" onclick="selectBarsSym('MES',this)">MES</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('MNQ',this)">MNQ</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('MYM',this)">MYM</button></li>
+      <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('M2K',this)">M2K</button></li>
+    </ul>
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-bars-px"    class="btn btn-outline-secondary active" onclick="setBarsTranspose(false,this)">Price X</button>
+      <button id="btn-bars-trans" class="btn btn-outline-secondary"        onclick="setBarsTranspose(true,this)">Transpose</button>
+    </div>
+    <span id="bars-info" class="small text-muted ms-1"></span>
+    <div id="bars-nav" class="d-flex align-items-center gap-1 ms-auto" style="display:none">
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev symbol" onclick="navBarsSym(-1)">◀S</button>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Next symbol" onclick="navBarsSym(1)">S▶</button>
+      <span class="vr mx-1"></span>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev day" onclick="navBarsDay(-1)">◀D</button>
+      <span id="bars-day-info" class="small text-muted px-1" style="min-width:50px;text-align:center">0/0</span>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Next day" onclick="navBarsDay(1)">D▶</button>
+    </div>
+  </div>
+  <div id="mock-banner-bars" class="alert alert-warning py-1 px-2 mb-1 small" style="display:none">
+    ⚠ No data for selected date — loaded <strong id="mock-date-bars"></strong>
+  </div>
+  <div id="bars-chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
+  <div class="d-flex gap-3 mt-2 flex-wrap small">
+    <label><input type="checkbox" id="btog-ohlc"      checked onchange="redrawBarsLines()"><span class="badge source-ohlc">OHLC</span></label>
+    <label><input type="checkbox" id="btog-pivot"     checked onchange="redrawBarsLines()"><span class="badge source-pivot">Pivot</span></label>
+    <label><input type="checkbox" id="btog-overnight" checked onchange="redrawBarsLines()"><span class="badge source-overnight">Overnight</span></label>
+    <label><input type="checkbox" id="btog-orb"       checked onchange="redrawBarsLines()"><span class="badge source-orb">ORB</span></label>
+    <label><input type="checkbox" id="btog-vwap"      checked onchange="redrawBarsLines()"><span class="badge source-vwap">VWAP</span></label>
+    <label><input type="checkbox" id="btog-volume"    checked onchange="redrawBarsLines()"><span class="badge source-volume">Volume</span></label>
+    <label><input type="checkbox" id="btog-round"     checked onchange="redrawBarsLines()"><span class="badge source-round">Round</span></label>
+    <label><input type="checkbox" id="btog-manual"    checked onchange="redrawBarsLines()"><span class="badge source-manual">Manual</span></label>
   </div>
 </div>
 
@@ -1442,8 +1517,8 @@ async function analyzeAll(){
     _analyzedIdx   = _analyzedDates.length - 1;
     msg.className='small text-success';
     msg.textContent = `${_analyzedDates.length} days`;
-    const nav = document.getElementById('analyze-nav');
-    nav.style.display = 'flex';
+    document.getElementById('analyze-nav').style.display = 'flex';
+    document.getElementById('bars-nav').style.display   = 'flex';
     _updateDayInfo();
     if(_analyzedDates.length){
       document.getElementById('shared-date-input').value = _analyzedDates[_analyzedIdx];
@@ -1456,8 +1531,9 @@ async function analyzeAll(){
 }
 
 function _updateDayInfo(){
-  document.getElementById('analyze-day-info').textContent =
-    `${_analyzedIdx+1}/${_analyzedDates.length}`;
+  const txt = `${_analyzedIdx+1}/${_analyzedDates.length}`;
+  document.getElementById('analyze-day-info').textContent = txt;
+  document.getElementById('bars-day-info').textContent    = txt;
 }
 
 async function navDay(delta){
@@ -1505,19 +1581,175 @@ async function createGraphTrades(){
 }
 
 function onSharedDateChange(){
-  const active = document.querySelector('#mainTab .nav-link.active');
-  if(active?.dataset?.bsTarget === '#tab-graph') loadGraph();
+  const tgt = document.querySelector('#mainTab .nav-link.active')?.dataset?.bsTarget;
+  if(tgt === '#tab-graph') loadGraph();
+  else if(tgt === '#tab-bars') loadBars();
 }
 
 document.getElementById('btn-graph-tab').addEventListener('click', function(){
   document.getElementById('shared-date-input').readOnly = true;
   loadGraph();
 });
-document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab)').forEach(function(btn){
+document.getElementById('btn-bars-tab').addEventListener('click', function(){
+  document.getElementById('shared-date-input').readOnly = true;
+  loadBars();
+});
+document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab):not(#btn-bars-tab)').forEach(function(btn){
   btn.addEventListener('click', function(){
     document.getElementById('shared-date-input').readOnly = false;
   });
 });
+
+// ── BARS (Volume Profile) ────────────────────────────────────────────────────
+let _barsSym='MES', _barsProfile=[], _barsBarsLines=[], _barsTransposed=false, _visBarsLines=[];
+
+function selectBarsSym(sym, btn){
+  _barsSym = sym;
+  document.querySelectorAll('#bars-sym-pills .nav-link').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  loadBars();
+}
+
+function setBarsTranspose(on, btn){
+  _barsTransposed = on;
+  document.querySelectorAll('#btn-bars-px,#btn-bars-trans').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  drawBarsChart();
+}
+
+function enabledBarsSources(){
+  const s=new Set();
+  ['ohlc','pivot','overnight','orb','vwap','volume','round','manual'].forEach(src=>{
+    const el=document.getElementById('btog-'+src);
+    if(el&&el.checked) s.add(src);
+  });
+  return s;
+}
+
+async function loadBars(){
+  _enterBusy();
+  try{
+    const reqDate = document.getElementById('shared-date-input').value||'';
+    const url = `/api/volume_profile/${_barsSym}`+(reqDate?`?date=${reqDate}`:'');
+    const d   = await (await fetch(url)).json();
+    _barsProfile = d.profile||[];
+
+    const mock = d.mock_date;
+    document.getElementById('mock-banner-bars').style.display = mock?'block':'none';
+    if(mock) document.getElementById('mock-date-bars').textContent = mock;
+    document.getElementById('bars-info').textContent =
+      _barsProfile.length ? `${_barsProfile.length} price levels` : 'No data';
+
+    const ms       = parseInt(document.getElementById('min-str-lines').value)||1;
+    const lineDate = reqDate||d.date||'';
+    const linesUrl = `/api/lines?symbol=${_barsSym}&min_strength=${ms}`+(lineDate?`&date=${lineDate}`:'');
+    _barsBarsLines = await (await fetch(linesUrl)).json();
+    drawBarsChart();
+  }catch(e){ console.error(e); }
+  finally{ _exitBusy(); }
+}
+
+function _barsLineTraces(){
+  if(!_barsProfile.length) return [];
+  const en       = enabledBarsSources();
+  _visBarsLines  = _barsBarsLines.filter(l=>en.has(l.source));
+  const maxCount = Math.max(..._barsProfile.map(p=>p.count));
+  return _visBarsLines.map(l=>{
+    const armed = l._armed!==undefined ? l._armed : !!l.armed;
+    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.35)';
+    const lw    = armed ? 2 : 1;
+    const dash  = armed ? 'solid' : 'dot';
+    if(_barsTransposed){
+      return {type:'scatter',mode:'lines',x:[0,maxCount],y:[l.price,l.price],
+        line:{color:col,width:lw,dash},name:l.algo_type,showlegend:false,
+        hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
+    } else {
+      return {type:'scatter',mode:'lines',x:[l.price,l.price],y:[0,maxCount],
+        line:{color:col,width:lw,dash},name:l.algo_type,showlegend:false,
+        hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
+    }
+  });
+}
+
+function _barsAnnotations(){
+  const en = enabledBarsSources();
+  return _barsBarsLines.filter(l=>en.has(l.source)).map(l=>{
+    const armed = l._armed!==undefined ? l._armed : !!l.armed;
+    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.45)';
+    if(_barsTransposed){
+      return {xref:'paper',yref:'y',x:1,y:l.price,text:`${l.algo_type} ${l.price}`,
+        showarrow:false,xanchor:'right',font:{size:9,color:col}};
+    } else {
+      return {xref:'x',yref:'paper',x:l.price,y:1.0,text:l.algo_type,
+        showarrow:false,textangle:-90,xanchor:'center',yanchor:'top',
+        font:{size:8,color:col}};
+    }
+  });
+}
+
+function drawBarsChart(){
+  const chartEl = document.getElementById('bars-chart');
+  if(!_barsProfile.length){
+    Plotly.purge('bars-chart');
+    chartEl.innerHTML=`<div class="d-flex align-items-center justify-content-center h-100 text-muted">No volume data for ${_barsSym}</div>`;
+    return;
+  }
+  const prices = _barsProfile.map(p=>p.price);
+  const counts = _barsProfile.map(p=>p.count);
+  let barTrace;
+  if(_barsTransposed){
+    barTrace={type:'bar',orientation:'h',x:counts,y:prices,
+      marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
+      hovertemplate:'%{y:.2f}: %{x} ticks<extra></extra>'};
+  } else {
+    barTrace={type:'bar',x:prices,y:counts,
+      marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
+      hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
+  }
+  const lineTraces = _barsLineTraces();
+  const layout={
+    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
+    font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
+    bargap:0.05,
+    xaxis:{gridcolor:'#333',title:{text:_barsTransposed?'Ticks':'Price',font:{size:10}}},
+    yaxis:{gridcolor:'#333',title:{text:_barsTransposed?'Price':'Ticks',font:{size:10}}},
+    annotations:_barsAnnotations(),
+    showlegend:false
+  };
+  Plotly.newPlot('bars-chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
+  chartEl.on('plotly_click',function(evtData){
+    const cn=evtData.points[0].curveNumber;
+    if(cn===0) return;
+    const line=_visBarsLines[cn-1];
+    if(!line) return;
+    const wasArmed=line._armed!==undefined?line._armed:!!line.armed;
+    line._armed=!wasArmed;
+    fetch(`/api/lines/${line.id}`,{method:'PATCH',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({armed:line._armed?1:0})});
+    drawBarsChart();
+  });
+}
+
+function redrawBarsLines(){
+  if(_barsProfile.length) drawBarsChart();
+}
+
+async function navBarsDay(delta){
+  if(!_analyzedDates.length) return;
+  _analyzedIdx=Math.max(0,Math.min(_analyzedDates.length-1,_analyzedIdx+delta));
+  document.getElementById('shared-date-input').value=_analyzedDates[_analyzedIdx];
+  _updateDayInfo();
+  await loadBars();
+}
+
+function navBarsSym(delta){
+  const syms=['MES','MNQ','MYM','M2K'];
+  const next=syms[(syms.indexOf(_barsSym)+delta+syms.length)%syms.length];
+  document.querySelectorAll('#bars-sym-pills .nav-link').forEach(btn=>{
+    if(btn.textContent===next) btn.click();
+  });
+}
 
 // ── CREATE TRADES ────────────────────────────────────────────────────────────
 let _candidates=[];
