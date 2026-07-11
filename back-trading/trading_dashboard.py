@@ -145,16 +145,18 @@ def _load_ticks(symbol: str, d: date) -> list | None:
 def _ohlcv_bars(ticks: list, interval_min: int = 5) -> list:
     bars: dict = {}
     for (t_min, price, iso) in ticks:
-        key = (t_min // interval_min) * interval_min
+        date_part  = iso[:10]                                  # "YYYY-MM-DD" from the CT timestamp
+        bucket_min = (t_min // interval_min) * interval_min
+        key = (date_part, bucket_min)
         if key not in bars:
-            bars[key] = {"t_min": key, "iso": iso,
+            bars[key] = {"date": date_part, "t_min": bucket_min, "iso": iso,
                          "open": price, "high": price, "low": price, "close": price, "vol": 0}
         b = bars[key]
         b["high"]  = max(b["high"], price)
         b["low"]   = min(b["low"],  price)
         b["close"] = price
         b["vol"]  += 1
-    return sorted(bars.values(), key=lambda x: x["t_min"])
+    return sorted(bars.values(), key=lambda x: (x["date"], x["t_min"]))
 
 
 # ── Line generation ────────────────────────────────────────────────────────────
@@ -432,7 +434,7 @@ def api_history(symbol: str):
     bars = []
     for b in bars_raw:
         hh, mm = b["t_min"] // 60, b["t_min"] % 60
-        bars.append({"t": f"{used_date.isoformat()}T{hh:02d}:{mm:02d}:00",
+        bars.append({"t": f"{b['date']}T{hh:02d}:{mm:02d}:00",
                      "open": b["open"], "high": b["high"],
                      "low":  b["low"],  "close": b["close"], "vol": b["vol"]})
 
@@ -602,6 +604,7 @@ body{font-size:.85rem;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
+  <span class="badge bg-secondary">v1.3</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -726,10 +729,10 @@ body{font-size:.85rem;}
       <button id="btn-range-4h"  class="btn btn-outline-secondary"        onclick="setGraphRange('4h',this)">Last 4h</button>
       <button id="btn-range-1h"  class="btn btn-outline-secondary"        onclick="setGraphRange('1h',this)">Last 1h</button>
     </div>
-    <span class="text-muted small" id="graph-date-lbl"></span>
+    <input type="date" id="graph-date-input" class="form-control form-control-sm" style="width:148px" onchange="loadGraph()">
   </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
-    ⚠ MOCK — showing <strong id="mock-date-graph"></strong>
+    ⚠ No data for selected date — loaded <strong id="mock-date-graph"></strong>
   </div>
   <div id="chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
   <div class="d-flex gap-3 mt-2 flex-wrap small">
@@ -953,13 +956,16 @@ function filteredBars(){
 }
 
 async function loadGraph(){
+  const reqDate = document.getElementById('graph-date-input').value||'';
+  const url = reqDate ? `/api/history/${_graphSym}?date=${reqDate}` : `/api/history/${_graphSym}`;
   try{
-    const br = await (await fetch(`/api/history/${_graphSym}`)).json();
+    const br = await (await fetch(url)).json();
     _chartBars = br.bars||[];
     const mock = br.mock_date;
     document.getElementById('mock-banner-graph').style.display=mock?'block':'none';
     if(mock) document.getElementById('mock-date-graph').textContent=mock;
-    document.getElementById('graph-date-lbl').textContent = br.date||'No data';
+    // Update picker to the actually-loaded date (auto-fills on first load)
+    if(br.date) document.getElementById('graph-date-input').value = br.date;
 
     const ms = parseInt(document.getElementById('min-str-lines').value)||1;
     _chartLines = await (await fetch(`/api/lines?symbol=${_graphSym}&min_strength=${ms}`)).json();
