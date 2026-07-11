@@ -283,18 +283,19 @@ def api_lines_create():
     symbols         = body.get("symbols", ALL_SYMBOLS)
     algo_types      = set(body.get("algo_types", ALL_ALGO_TYPES))
     merge_threshold = float(body.get("merge_threshold", 16.0))
+    hist_date_str   = body.get("history_date")
+    hist_start      = date.fromisoformat(hist_date_str) if hist_date_str else date.today()
     today   = date.today().isoformat()
     db_path = _resolve_db()
     _ensure_columns(db_path)
 
     results: dict   = {}
     mock_date: str | None = None
-    expected_prev   = _prev_trading_day()
 
     for sym in symbols:
-        # Walk back up to 20 calendar days to find history
+        # Walk back up to 20 calendar days from hist_start to find history
         ticks, used_date = None, None
-        search = date.today()
+        search = hist_start + timedelta(days=1)
         for _ in range(20):
             search -= timedelta(days=1)
             if search.weekday() >= 5:
@@ -308,7 +309,7 @@ def api_lines_create():
             results[sym] = {"lines": 0, "from_date": None, "error": "no history CSV found"}
             continue
 
-        if expected_prev and used_date != expected_prev:
+        if used_date != hist_start:
             mock_date = used_date.isoformat()
 
         raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
@@ -638,6 +639,8 @@ body{font-size:.85rem;}
       <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="8"> 8pt</label>
       <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="16" checked> 16pt</label>
     </div>
+    <input type="date" id="lines-date-input" class="form-control form-control-sm ms-1" style="width:148px"
+           onchange="document.getElementById('graph-date-input').value=this.value">
     <button class="btn btn-sm btn-primary ms-1" onclick="createLines()">Create Lines</button>
     <span id="lines-msg" class="small text-muted ms-1"></span>
   </div>
@@ -734,7 +737,9 @@ body{font-size:.85rem;}
       <button id="btn-range-4h"  class="btn btn-outline-secondary"        onclick="setGraphRange('4h',this)">Last 4h</button>
       <button id="btn-range-1h"  class="btn btn-outline-secondary"        onclick="setGraphRange('1h',this)">Last 1h</button>
     </div>
-    <input type="date" id="graph-date-input" class="form-control form-control-sm" style="width:148px" onchange="loadGraph()">
+    <input type="date" id="graph-date-input" class="form-control form-control-sm" style="width:148px"
+           onchange="document.getElementById('lines-date-input').value=this.value; loadGraph()">
+    <span id="bar-count" class="text-muted small ms-1"></span>
   </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
     ⚠ No data for selected date — loaded <strong id="mock-date-graph"></strong>
@@ -850,11 +855,14 @@ async function createLines(){
   const syms      = checkedVals('sym-lines');
   const algoTypes = [...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
   const mergeThr  = parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
+  const histDate  = document.getElementById('lines-date-input').value||'';
   document.getElementById('lines-msg').textContent='Creating…';
   try{
+    const payload = {symbols:syms,algo_types:algoTypes,merge_threshold:mergeThr};
+    if(histDate) payload.history_date = histDate;
     const d = await (await fetch('/api/lines/create',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({symbols:syms,algo_types:algoTypes,merge_threshold:mergeThr})})).json();
+      body:JSON.stringify(payload)})).json();
     const mock = d.mock_date;
     document.getElementById('mock-banner').style.display = mock?'block':'none';
     if(mock) document.getElementById('mock-date-lbl').textContent=mock;
@@ -986,6 +994,7 @@ function drawChart(){
     return;
   }
   const bars = filteredBars();
+  document.getElementById('bar-count').textContent = bars.length + ' bars';
   let trace;
   if(_graphMode==='line'){
     trace = {type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
@@ -1130,8 +1139,15 @@ function toggleAutoRef(){
 
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 
-// Initial load
-document.getElementById('graph-date-input').max = new Date().toISOString().split('T')[0];
+// Initial load — set both date pickers to today, max = today
+(function(){
+  const today = new Date().toISOString().split('T')[0];
+  ['graph-date-input','lines-date-input'].forEach(id=>{
+    const el = document.getElementById(id);
+    el.value = today;
+    el.max   = today;
+  });
+})();
 refreshLines();
 </script>
 </body>
