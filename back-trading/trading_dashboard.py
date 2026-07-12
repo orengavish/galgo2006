@@ -15,6 +15,7 @@ import csv
 import json
 import socket
 import argparse
+import threading
 from pathlib import Path
 from datetime import datetime, date, timezone, timedelta
 
@@ -109,6 +110,12 @@ _ROUND_LEVELS = {
 app = Flask(__name__)
 
 _DB_OVERRIDE: Path | None = None
+
+_build_progress: dict = {
+    "running": False, "total": 0, "done": 0,
+    "current": "", "log": [],
+}
+_build_lock = threading.Lock()
 
 
 def _resolve_db() -> Path:
@@ -566,6 +573,72 @@ def api_lines_delete(line_id: int):
     return jsonify({"ok": True})
 
 
+def _build_lines_for(sym: str, target: date, algo_types: set,
+                     merge_threshold: float, db_path: Path, force: bool) -> dict:
+    """Generate and store lines for one (symbol, date).
+
+    Returns {"action": "skip"|"done"|"no_csv"|"no_rth", "count": N}.
+    force=False → skip if non-manual lines already exist.
+    force=True  → always regenerate (delete existing non-manual first).
+    """
+    target_str = target.isoformat()
+
+    if not force:
+        with get_db(db_path) as con:
+            existing = con.execute(
+                "SELECT COUNT(*) FROM critical_lines"
+                " WHERE symbol=? AND date=? AND (source IS NULL OR source != 'manual')",
+                (sym, target_str),
+            ).fetchone()[0]
+        if existing > 0:
+            return {"action": "skip", "count": existing}
+
+    ticks = _load_ticks(sym, target)
+    if not ticks:
+        return {"action": "no_csv", "count": 0}
+    if not any(_RTH_START_MIN <= t < _RTH_END_MIN for (t, _, _) in ticks):
+        return {"action": "no_rth", "count": 0}
+
+    raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
+    kept: list = []
+    for ln in sorted(raw_lines, key=lambda x: -x["strength"]):
+        dominated = False
+        for k in kept:
+            if abs(k["price"] - ln["price"]) <= merge_threshold:
+                k.setdefault("merged", []).append({
+                    "algo_type": ln["algo_type"],
+                    "price":     ln["price"],
+                    "strength":  ln["strength"],
+                })
+                dominated = True
+                break
+        if not dominated:
+            kept.append(ln)
+
+    with get_db(db_path) as con:
+        con.execute(
+            "DELETE FROM critical_lines"
+            " WHERE symbol=? AND date=? AND (source IS NULL OR source != 'manual')",
+            (sym, target_str),
+        )
+        for ln in kept:
+            tip = {
+                "label":     _ALGO_LABEL.get(ln["algo_type"], ln["algo_type"]),
+                "formula":   ln["_tip"]["formula"],
+                "inputs":    ln["_tip"]["inputs"],
+                "from_date": target_str,
+                "merged":    ln.get("merged", []),
+            }
+            con.execute(
+                "INSERT INTO critical_lines"
+                " (symbol, date, line_type, price, strength, armed, source, algo_type, note)"
+                " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (sym, target_str, ln["line_type"], ln["price"],
+                 ln["strength"], ln["source"], ln["algo_type"], json.dumps(tip)),
+            )
+    return {"action": "done", "count": len(kept)}
+
+
 @app.route("/api/analyze_all", methods=["POST"])
 def api_analyze_all():
     """Batch-generate lines for every available RTH date for requested symbols."""
@@ -574,7 +647,6 @@ def api_analyze_all():
     algo_types      = set(body.get("algo_types", ALL_ALGO_TYPES))
     merge_threshold = float(body.get("merge_threshold", 16.0))
 
-    # Build {sym: [date, ...]} of RTH-confirmed dates
     sym_dates: dict[str, list[date]] = {}
     for sym in symbols:
         sym_dates[sym] = []
@@ -593,55 +665,74 @@ def api_analyze_all():
     analyzed: list[str] = []
 
     for target in all_dates:
-        target_str  = target.isoformat()
         any_written = False
         for sym in symbols:
             if target not in sym_dates.get(sym, []):
                 continue
-            ticks = _load_ticks(sym, target)
-            if not ticks:
-                continue
-            raw_lines = _generate_lines(sym, ticks, filter_types=algo_types)
-            kept: list = []
-            for ln in sorted(raw_lines, key=lambda x: -x["strength"]):
-                dominated = False
-                for k in kept:
-                    if abs(k["price"] - ln["price"]) <= merge_threshold:
-                        k.setdefault("merged", []).append({
-                            "algo_type": ln["algo_type"],
-                            "price":     ln["price"],
-                            "strength":  ln["strength"],
-                        })
-                        dominated = True
-                        break
-                if not dominated:
-                    kept.append(ln)
-            with get_db(db_path) as con:
-                con.execute(
-                    "DELETE FROM critical_lines"
-                    " WHERE symbol=? AND date=? AND (source IS NULL OR source != 'manual')",
-                    (sym, target_str)
-                )
-                for ln in kept:
-                    tip = {
-                        "label":     _ALGO_LABEL.get(ln["algo_type"], ln["algo_type"]),
-                        "formula":   ln["_tip"]["formula"],
-                        "inputs":    ln["_tip"]["inputs"],
-                        "from_date": target_str,
-                        "merged":    ln.get("merged", []),
-                    }
-                    con.execute(
-                        "INSERT INTO critical_lines"
-                        " (symbol, date, line_type, price, strength, armed, source, algo_type, note)"
-                        " VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)",
-                        (sym, target_str, ln["line_type"], ln["price"],
-                         ln["strength"], ln["source"], ln["algo_type"], json.dumps(tip))
-                    )
-            any_written = True
+            r = _build_lines_for(sym, target, algo_types, merge_threshold, db_path, force=True)
+            if r["action"] == "done":
+                any_written = True
         if any_written:
-            analyzed.append(target_str)
+            analyzed.append(target.isoformat())
 
     return jsonify({"dates": analyzed, "count": len(analyzed)})
+
+
+def _build_db_thread(force: bool, weeks_back: int = 2) -> None:
+    global _build_progress
+    db_path    = _resolve_db()
+    _ensure_columns(db_path)
+    algo_types = set(ALL_ALGO_TYPES) - {"MANUAL"}
+
+    today       = date.today()
+    market_days = []
+    for i in range(1, weeks_back * 7 + 1):
+        d = today - timedelta(days=i)
+        if d.weekday() < 5:
+            market_days.append(d)
+    market_days = sorted(market_days, reverse=True)[:10]
+
+    jobs = [(d, sym) for d in market_days for sym in ALL_SYMBOLS]
+    with _build_lock:
+        _build_progress["total"]   = len(jobs)
+        _build_progress["done"]    = 0
+        _build_progress["log"]     = []
+        _build_progress["current"] = ""
+
+    for (d, sym) in jobs:
+        with _build_lock:
+            _build_progress["current"] = f"{d.isoformat()} {sym}"
+        result = _build_lines_for(sym, d, algo_types, 16.0, db_path, force)
+        with _build_lock:
+            _build_progress["log"].append({
+                "date": d.isoformat(), "symbol": sym,
+                "action": result["action"], "count": result["count"],
+            })
+            _build_progress["done"] += 1
+
+    with _build_lock:
+        _build_progress["running"] = False
+        _build_progress["current"] = ""
+
+
+@app.route("/api/build_db", methods=["POST"])
+def api_build_db():
+    global _build_progress
+    with _build_lock:
+        if _build_progress["running"]:
+            return jsonify({"error": "already running"})
+        _build_progress["running"] = True
+    body  = request.get_json(silent=True) or {}
+    force = bool(body.get("force", False))
+    t = threading.Thread(target=_build_db_thread, args=(force,), daemon=True)
+    t.start()
+    return jsonify({"started": True})
+
+
+@app.route("/api/build_db/status")
+def api_build_db_status():
+    with _build_lock:
+        return jsonify(dict(_build_progress))
 
 
 @app.route("/api/last_data_date")
@@ -902,7 +993,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.5</span>
+  <span class="badge bg-secondary">v2.6</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -913,7 +1004,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.5</span>
+    <span class="badge bg-secondary">v2.6</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
@@ -1032,6 +1123,27 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     </div>
     <button class="btn btn-sm btn-success" onclick="addManualLine()">Add Line</button>
     <span id="manual-msg" class="small text-muted"></span>
+  </div>
+
+  <hr class="my-2">
+  <!-- Build Lines DB panel -->
+  <div class="d-flex gap-2 align-items-center mb-2">
+    <button class="btn btn-sm btn-primary" onclick="buildLinesDB(false)">Build Lines DB</button>
+    <button class="btn btn-sm btn-outline-danger" onclick="buildLinesDB(true)">Force Rebuild</button>
+    <span id="build-db-msg" class="small text-muted ms-1"></span>
+  </div>
+  <div id="build-db-panel" style="display:none">
+    <div class="progress mb-2" style="height:5px">
+      <div id="build-db-bar" class="progress-bar bg-primary" role="progressbar" style="width:0%"></div>
+    </div>
+    <div style="max-height:200px;overflow-y:auto">
+      <table class="table table-sm table-bordered mb-0 small">
+        <thead class="table-dark sticky-top">
+          <tr><th>Date</th><th>MES</th><th>MNQ</th><th>MYM</th><th>M2K</th></tr>
+        </thead>
+        <tbody id="build-db-tbody"></tbody>
+      </table>
+    </div>
   </div>
 </div>
 
@@ -1867,6 +1979,69 @@ function _lastWeekday(){
 function loadLastDay(){
   document.getElementById('shared-date-input').value = _lastWeekday();
   onSharedDateChange();
+}
+
+// ── BUILD LINES DB ───────────────────────────────────────────────────────────
+let _buildPollTimer = null;
+
+async function buildLinesDB(force){
+  _enterBusy();
+  try{
+    const r = await (await fetch('/api/build_db',{
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({force})
+    })).json();
+    if(r.error){
+      document.getElementById('build-db-msg').textContent = '⚠ '+r.error;
+      return;
+    }
+    document.getElementById('build-db-panel').style.display = 'block';
+    document.getElementById('build-db-msg').textContent = 'Starting…';
+    document.getElementById('build-db-bar').style.width = '0%';
+    document.getElementById('build-db-tbody').innerHTML = '';
+    if(_buildPollTimer) clearInterval(_buildPollTimer);
+    _buildPollTimer = setInterval(_pollBuildStatus, 800);
+  }catch(e){ console.error(e); }
+  finally{ _exitBusy(); }
+}
+
+async function _pollBuildStatus(){
+  try{
+    const s = await (await fetch('/api/build_db/status')).json();
+    const pct = s.total > 0 ? Math.round(s.done / s.total * 100) : 0;
+    document.getElementById('build-db-bar').style.width = pct+'%';
+    document.getElementById('build-db-msg').textContent = s.running
+      ? (s.current ? s.current+' ('+s.done+'/'+s.total+')' : 'Running…')
+      : ('Done — '+s.done+'/'+s.total+' processed');
+    _renderBuildTable(s.log);
+    if(!s.running && _buildPollTimer){
+      clearInterval(_buildPollTimer);
+      _buildPollTimer = null;
+    }
+  }catch(e){ console.error(e); }
+}
+
+function _renderBuildTable(log){
+  const SYMS = ['MES','MNQ','MYM','M2K'];
+  const byDate = {};
+  for(const e of log){
+    if(!byDate[e.date]) byDate[e.date] = {};
+    byDate[e.date][e.symbol] = e;
+  }
+  const dates = Object.keys(byDate).sort().reverse();
+  const html = dates.map(d => {
+    const cells = SYMS.map(sym => {
+      const e = byDate[d]?.[sym];
+      if(!e) return '<td class="text-muted text-center">…</td>';
+      if(e.action==='done')   return `<td class="text-success text-center">✓ ${e.count}</td>`;
+      if(e.action==='skip')   return `<td class="text-muted text-center">↷ ${e.count}</td>`;
+      if(e.action==='no_csv') return '<td class="text-warning text-center">no csv</td>';
+      if(e.action==='no_rth') return '<td class="text-warning text-center">no rth</td>';
+      return '<td class="text-danger text-center">?</td>';
+    }).join('');
+    return `<tr><td>${d}</td>${cells}</tr>`;
+  }).join('');
+  document.getElementById('build-db-tbody').innerHTML = html;
 }
 
 // Initial load — set shared date picker to last market calendar day, max = today
