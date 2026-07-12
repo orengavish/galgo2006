@@ -515,24 +515,42 @@ def api_lines():
     db_path      = _resolve_db()
     _ensure_columns(db_path)
     symbol       = request.args.get("symbol", "")
+    symbols_str  = request.args.get("symbols", "")
     min_strength = int(request.args.get("min_strength", 1))
-    req_date     = request.args.get("date", date.today().isoformat())
+
+    # Date range — support single date OR from/to
+    req_date  = request.args.get("date", "")
+    date_from = request.args.get("date_from", "")
+    date_to   = request.args.get("date_to", "")
+    if req_date:
+        date_from = date_to = req_date
+    if not date_from:
+        date_from = date_to = date.today().isoformat()
+    if not date_to:
+        date_to = date_from
 
     q_base = (
-        "SELECT id, symbol, price, line_type, strength,"
+        "SELECT id, symbol, date, price, line_type, strength,"
         " COALESCE(source,'manual') AS source,"
         " COALESCE(algo_type,'MANUAL') AS algo_type,"
         " note, COALESCE(armed,1) AS armed"
-        " FROM critical_lines WHERE date=? AND strength>=?"
+        " FROM critical_lines WHERE date>=? AND date<=? AND strength>=?"
     )
-    with get_db(db_path) as con:
-        if symbol:
-            rows = con.execute(q_base + " AND symbol=? ORDER BY symbol, strength DESC, price",
-                               (req_date, min_strength, symbol)).fetchall()
-        else:
-            rows = con.execute(q_base + " ORDER BY symbol, strength DESC, price",
-                               (req_date, min_strength)).fetchall()
+    params: list = [date_from, date_to, min_strength]
 
+    syms_list: list[str] = []
+    if symbol:
+        syms_list = [symbol]
+    elif symbols_str:
+        syms_list = [s.strip() for s in symbols_str.split(",") if s.strip()]
+    if syms_list:
+        ph = ",".join("?" * len(syms_list))
+        q_base += f" AND symbol IN ({ph})"
+        params.extend(syms_list)
+
+    q_base += " ORDER BY date DESC, symbol, strength DESC, price"
+    with get_db(db_path) as con:
+        rows = con.execute(q_base, params).fetchall()
     return jsonify([dict(r) for r in rows])
 
 
@@ -678,11 +696,13 @@ def api_analyze_all():
     return jsonify({"dates": analyzed, "count": len(analyzed)})
 
 
-def _build_db_thread(force: bool, weeks_back: int = 2) -> None:
+def _build_db_thread(force: bool, algo_types: set | None = None,
+                     merge_threshold: float = 16.0, weeks_back: int = 2) -> None:
     global _build_progress
-    db_path    = _resolve_db()
+    db_path = _resolve_db()
     _ensure_columns(db_path)
-    algo_types = set(ALL_ALGO_TYPES) - {"MANUAL"}
+    if algo_types is None:
+        algo_types = set(ALL_ALGO_TYPES) - {"MANUAL"}
 
     today       = date.today()
     market_days = []
@@ -702,7 +722,7 @@ def _build_db_thread(force: bool, weeks_back: int = 2) -> None:
     for (d, sym) in jobs:
         with _build_lock:
             _build_progress["current"] = f"{d.isoformat()} {sym}"
-        result = _build_lines_for(sym, d, algo_types, 16.0, db_path, force)
+        result = _build_lines_for(sym, d, algo_types, merge_threshold, db_path, force)
         with _build_lock:
             _build_progress["log"].append({
                 "date": d.isoformat(), "symbol": sym,
@@ -722,9 +742,17 @@ def api_build_db():
         if _build_progress["running"]:
             return jsonify({"error": "already running"})
         _build_progress["running"] = True
-    body  = request.get_json(silent=True) or {}
-    force = bool(body.get("force", False))
-    t = threading.Thread(target=_build_db_thread, args=(force,), daemon=True)
+    body          = request.get_json(silent=True) or {}
+    force         = bool(body.get("force", False))
+    algos         = body.get("algo_types")
+    algo_types    = set(algos) if algos else None
+    merge_thr     = float(body.get("merge_threshold", 16.0))
+    weeks_back    = int(body.get("weeks_back", 2))
+    t = threading.Thread(
+        target=_build_db_thread,
+        args=(force, algo_types, merge_thr, weeks_back),
+        daemon=True,
+    )
     t.start()
     return jsonify({"started": True})
 
@@ -945,6 +973,29 @@ def api_submitted():
     return jsonify([dict(r) for r in rows])
 
 
+@app.route("/api/available_dates")
+def api_available_dates():
+    """Dates that have CSV data for at least one requested symbol in the given range."""
+    symbols_str  = request.args.get("symbols", ",".join(ALL_SYMBOLS))
+    syms         = [s.strip() for s in symbols_str.split(",") if s.strip()] or ALL_SYMBOLS
+    today        = date.today()
+    date_from_s  = request.args.get("date_from", (today - timedelta(days=14)).isoformat())
+    date_to_s    = request.args.get("date_to",   (today - timedelta(days=1)).isoformat())
+    date_from    = date.fromisoformat(date_from_s)
+    date_to      = date.fromisoformat(date_to_s)
+
+    available: set[str] = set()
+    cur = date_from
+    while cur <= date_to:
+        if cur.weekday() < 5:
+            for sym in syms:
+                if _find_csv(sym, cur):
+                    available.add(cur.isoformat())
+                    break
+        cur += timedelta(days=1)
+    return jsonify({"dates": sorted(available)})
+
+
 # ── HTML ───────────────────────────────────────────────────────────────────────
 
 HTML = r"""<!doctype html>
@@ -976,7 +1027,6 @@ body{font-size:.85rem;}
 .row-volume    {background:rgba(230,126,34,.12)!important;}
 .row-round     {background:rgba(127,140,141,.12)!important;}
 .price-chip{font-family:monospace;font-size:.8rem;padding:2px 8px;border-radius:4px;}
-#mock-banner-graph{display:none;}
 body.busy-wait{cursor:wait!important;}
 body.busy-wait *{pointer-events:none!important;}
 body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
@@ -993,50 +1043,65 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.6</span>
+  <span class="badge bg-secondary">v3.0</span>
 </nav>
 
+<!-- Line detail modal -->
+<div class="modal fade" id="lineModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-lg">
+    <div class="modal-content bg-dark border-secondary">
+      <div class="modal-header border-secondary py-2">
+        <h6 class="modal-title font-monospace" id="lm-title"></h6>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body small" id="lm-body"></div>
+      <div class="modal-footer border-secondary py-2">
+        <button class="btn btn-sm btn-outline-warning" id="lm-toggle-btn" onclick="toggleCurrentLine()">Enable/Disable</button>
+        <button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <div class="container-fluid py-2">
+
+<!-- Shared controls: symbols + date range -->
+<div class="d-flex align-items-center gap-3 mb-2 pb-2 border-bottom border-secondary flex-wrap">
+  <span class="text-muted small fw-semibold">Symbols:</span>
+  <div id="shared-syms" class="d-flex gap-2">
+    <label class="small"><input class="form-check-input" type="checkbox" value="MES" checked> MES</label>
+    <label class="small"><input class="form-check-input" type="checkbox" value="MNQ" checked> MNQ</label>
+    <label class="small"><input class="form-check-input" type="checkbox" value="MYM" checked> MYM</label>
+    <label class="small"><input class="form-check-input" type="checkbox" value="M2K" checked> M2K</label>
+  </div>
+  <div class="vr"></div>
+  <span class="text-muted small fw-semibold">Date:</span>
+  <div class="d-flex align-items-center gap-2 flex-wrap">
+    <label class="small"><input type="radio" name="date-range" value="day" checked onchange="onDateRangeChange()"> Last Day</label>
+    <label class="small"><input type="radio" name="date-range" value="week" onchange="onDateRangeChange()"> Last Week</label>
+    <label class="small"><input type="radio" name="date-range" value="2weeks" onchange="onDateRangeChange()"> Last 2 Weeks</label>
+    <label class="small"><input type="radio" name="date-range" value="custom" onchange="onDateRangeChange()"> Custom:</label>
+    <input type="date" id="range-from" class="form-control form-control-sm" style="width:140px;display:none" onchange="onDateRangeChange()">
+    <span id="range-sep" style="display:none" class="text-muted small">–</span>
+    <input type="date" id="range-to"   class="form-control form-control-sm" style="width:140px;display:none" onchange="onDateRangeChange()">
+  </div>
+</div>
+
 <ul class="nav nav-tabs mb-2" id="mainTab" role="tablist">
   <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-bars"  id="btn-bars-tab">Bars</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.6</span>
+    <span class="badge bg-secondary">v3.0</span>
   </li>
 </ul>
-<div class="d-flex align-items-center gap-2 mb-2">
-  <label class="small text-muted mb-0">Date</label>
-  <input type="date" id="shared-date-input" class="form-control form-control-sm" style="width:148px"
-         onchange="onSharedDateChange()">
-  <button class="btn btn-sm btn-outline-info" onclick="loadLastDay()">Last Day</button>
-</div>
 
 <div class="tab-content">
 
 <!-- ══════════════════════ LINES ══════════════════════ -->
 <div class="tab-pane fade show active" id="tab-lines">
-  <!-- Row 1: Symbols + merge threshold + Create -->
-  <div class="d-flex flex-wrap gap-2 align-items-center mb-1">
-    <span class="text-muted small">Symbols:</span>
-    <div id="sym-lines" class="d-flex gap-2">
-      <label class="small"><input class="form-check-input" type="checkbox" value="MES" checked> MES</label>
-      <label class="small"><input class="form-check-input" type="checkbox" value="MNQ" checked> MNQ</label>
-      <label class="small"><input class="form-check-input" type="checkbox" value="MYM" checked> MYM</label>
-      <label class="small"><input class="form-check-input" type="checkbox" value="M2K" checked> M2K</label>
-    </div>
-    <span class="text-muted small ms-2">Merge ≤</span>
-    <div class="d-flex gap-2">
-      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="4"> 4pt</label>
-      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="8"> 8pt</label>
-      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="16" checked> 16pt</label>
-    </div>
-    <button class="btn btn-sm btn-primary" onclick="createLines()">Create Lines</button>
-    <span id="lines-msg" class="small text-muted ms-1"></span>
-  </div>
-  <!-- Row 2: Algo type checkboxes (all 14 preselected) -->
+  <!-- Algo types row -->
   <div class="d-flex flex-wrap gap-1 align-items-center mb-1 small border rounded px-2 py-1 bg-body-tertiary">
     <span class="fw-semibold text-muted me-1">Algos</span>
     <a href="#" class="text-muted" style="font-size:.75rem" onclick="setAllAlgos(true);return false">All</a>
@@ -1081,23 +1146,47 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="vr me-2"></span>
     <label><input class="form-check-input algo-chk" type="checkbox" value="MANUAL" checked> Manual</label>
   </div>
-  <!-- Row 3: Strength filter + refresh -->
-  <div class="d-flex gap-2 align-items-center mb-2">
+  <!-- Merge + strength + refresh -->
+  <div class="d-flex gap-3 align-items-center mb-2 flex-wrap">
+    <span class="text-muted small">Merge ≤</span>
+    <div class="d-flex gap-2">
+      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="4"> 4pt</label>
+      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="8"> 8pt</label>
+      <label class="small"><input class="form-check-input" type="radio" name="merge-thr" value="16" checked> 16pt</label>
+    </div>
     <label class="small">Strength ≥
       <input type="number" id="min-str-lines" class="form-control form-control-sm d-inline-block"
              style="width:55px" min="1" max="10" value="1" onchange="refreshLines()">
     </label>
     <button class="btn btn-sm btn-outline-secondary" onclick="refreshLines()">Refresh</button>
   </div>
-
-
+  <!-- Create buttons -->
+  <div class="d-flex gap-2 align-items-center mb-2">
+    <button class="btn btn-sm btn-primary" onclick="buildLinesDB(false)">Create</button>
+    <button class="btn btn-sm btn-outline-danger" onclick="buildLinesDB(true)">Force Create</button>
+    <span id="build-db-msg" class="small text-muted ms-1"></span>
+  </div>
+  <!-- Build progress panel -->
+  <div id="build-db-panel" style="display:none;margin-bottom:10px">
+    <div class="progress mb-2" style="height:5px">
+      <div id="build-db-bar" class="progress-bar bg-primary" role="progressbar" style="width:0%"></div>
+    </div>
+    <div style="max-height:200px;overflow-y:auto">
+      <table class="table table-sm table-bordered mb-0 small">
+        <thead class="table-dark sticky-top">
+          <tr><th>Date</th><th>MES</th><th>MNQ</th><th>MYM</th><th>M2K</th></tr>
+        </thead>
+        <tbody id="build-db-tbody"></tbody>
+      </table>
+    </div>
+  </div>
+  <!-- Lines table with Date column -->
   <table class="table table-sm table-hover table-bordered mb-1">
     <thead class="table-dark">
-      <tr><th>ID</th><th>Sym</th><th>Price</th><th>Type</th><th>Algo</th><th>Str</th><th>Source</th><th></th></tr>
+      <tr><th>ID</th><th>Sym</th><th>Date</th><th>Price</th><th>Type</th><th>Algo</th><th>Str</th><th>Source</th><th>Armed</th><th></th></tr>
     </thead>
     <tbody id="lines-tbody"></tbody>
   </table>
-
   <hr class="my-2">
   <div class="d-flex gap-2 align-items-end flex-wrap">
     <div>
@@ -1124,31 +1213,11 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <button class="btn btn-sm btn-success" onclick="addManualLine()">Add Line</button>
     <span id="manual-msg" class="small text-muted"></span>
   </div>
-
-  <hr class="my-2">
-  <!-- Build Lines DB panel -->
-  <div class="d-flex gap-2 align-items-center mb-2">
-    <button class="btn btn-sm btn-primary" onclick="buildLinesDB(false)">Build Lines DB</button>
-    <button class="btn btn-sm btn-outline-danger" onclick="buildLinesDB(true)">Force Rebuild</button>
-    <span id="build-db-msg" class="small text-muted ms-1"></span>
-  </div>
-  <div id="build-db-panel" style="display:none">
-    <div class="progress mb-2" style="height:5px">
-      <div id="build-db-bar" class="progress-bar bg-primary" role="progressbar" style="width:0%"></div>
-    </div>
-    <div style="max-height:200px;overflow-y:auto">
-      <table class="table table-sm table-bordered mb-0 small">
-        <thead class="table-dark sticky-top">
-          <tr><th>Date</th><th>MES</th><th>MNQ</th><th>MYM</th><th>M2K</th></tr>
-        </thead>
-        <tbody id="build-db-tbody"></tbody>
-      </table>
-    </div>
-  </div>
 </div>
 
 <!-- ══════════════════════ GRAPH ══════════════════════ -->
 <div class="tab-pane fade" id="tab-graph">
+  <!-- Row 1: Sym pills | mode | interval | Reset Zoom -->
   <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
     <ul class="nav nav-pills mb-0" id="sym-pill-tabs">
       <li class="nav-item"><button class="nav-link active" onclick="selectSym('MES',this)">MES</button></li>
@@ -1159,99 +1228,59 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <div class="btn-group btn-group-sm" role="group">
       <button id="btn-mode-candle" class="btn btn-outline-secondary active" onclick="setGraphMode('candle',this)">Candle</button>
       <button id="btn-mode-line"   class="btn btn-outline-secondary"        onclick="setGraphMode('line',this)">Line</button>
+      <button id="btn-mode-bars"   class="btn btn-outline-secondary"        onclick="setGraphMode('bars',this)">Bars</button>
     </div>
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-int-30s" class="btn btn-outline-secondary"        onclick="setGraphInterval(0.5,this)">30s</button>
+      <button id="btn-int-1"   class="btn btn-outline-secondary"        onclick="setGraphInterval(1,this)">1m</button>
+      <button id="btn-int-5"   class="btn btn-outline-secondary active" onclick="setGraphInterval(5,this)">5m</button>
+      <button id="btn-int-15"  class="btn btn-outline-secondary"        onclick="setGraphInterval(15,this)">15m</button>
+      <button id="btn-int-30"  class="btn btn-outline-secondary"        onclick="setGraphInterval(30,this)">30m</button>
+    </div>
+    <button class="btn btn-sm btn-outline-secondary ms-auto" onclick="resetZoom()">Reset Zoom</button>
+    <span id="bar-count" class="text-muted small ms-1"></span>
+  </div>
+  <!-- Row 2: Time range | nav -->
+  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
     <div class="btn-group btn-group-sm" role="group">
       <button id="btn-range-all" class="btn btn-outline-secondary active" onclick="setGraphRange('all',this)">All Day</button>
       <button id="btn-range-4h"  class="btn btn-outline-secondary"        onclick="setGraphRange('4h',this)">Last 4h</button>
       <button id="btn-range-1h"  class="btn btn-outline-secondary"        onclick="setGraphRange('1h',this)">Last 1h</button>
     </div>
-    <div class="btn-group btn-group-sm" role="group">
-      <button id="btn-int-30s" class="btn btn-outline-secondary"        onclick="setGraphInterval(0.5,this)">30s</button>
-      <button id="btn-int-1"  class="btn btn-outline-secondary"        onclick="setGraphInterval(1,this)">1m</button>
-      <button id="btn-int-5"  class="btn btn-outline-secondary active" onclick="setGraphInterval(5,this)">5m</button>
-      <button id="btn-int-15" class="btn btn-outline-secondary"        onclick="setGraphInterval(15,this)">15m</button>
-      <button id="btn-int-30" class="btn btn-outline-secondary"        onclick="setGraphInterval(30,this)">30m</button>
-    </div>
-    <span id="bar-count" class="text-muted small ms-1"></span>
-    <button class="btn btn-sm btn-outline-warning ms-auto" onclick="createGraphTrades()">Create Trades</button>
-    <span id="graph-trades-msg" class="small ms-1"></span>
-  </div>
-  <!-- Row 2: Analyze + nav -->
-  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
-    <button class="btn btn-sm btn-outline-info" onclick="analyzeAll()">Analyze All</button>
-    <span id="analyze-msg" class="small text-muted"></span>
-    <div id="analyze-nav" class="d-flex align-items-center gap-1 ms-2" style="display:none">
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev symbol" onclick="navSym(-1)">◀S</button>
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Next symbol" onclick="navSym(1)">S▶</button>
+    <span class="vr"></span>
+    <div class="d-flex align-items-center gap-1">
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev symbol" onclick="navSym(-1)">&#9664;S</button>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Next symbol" onclick="navSym(1)">S&#9654;</button>
       <span class="vr mx-1"></span>
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev day" onclick="navDay(-1)">◀D</button>
-      <span id="analyze-day-info" class="small text-muted px-1" style="min-width:50px;text-align:center">0/0</span>
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Next day" onclick="navDay(1)">D▶</button>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev day" onclick="navDay(-1)">&#9664;D</button>
+      <span id="day-info" class="small text-muted px-1" style="min-width:90px;text-align:center">&#8212;</span>
+      <button class="btn btn-sm btn-outline-secondary px-2" title="Next day" onclick="navDay(1)">D&#9654;</button>
     </div>
   </div>
-  <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
-    ⚠ No data for <strong id="mock-req-graph"></strong> — showing <strong id="mock-date-graph"></strong>
+  <!-- Mock banner -->
+  <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small" style="display:none">
+    &#9888; No data for <strong id="mock-req-graph"></strong> &#8212; showing <strong id="mock-date-graph"></strong>
   </div>
+  <!-- Sanity bar -->
   <div class="d-flex gap-4 align-items-center px-1 mb-1 small text-muted">
-    <span>Trades&nbsp;<b id="sb-trades" class="text-info">—</b></span>
-    <span>Bars&nbsp;<b id="sb-bars" class="text-light">—</b></span>
-    <span>Low&nbsp;<b id="sb-low" class="text-success">—</b></span>
-    <span>High&nbsp;<b id="sb-high" class="text-danger fw-bold">—</b></span>
+    <span>Trades&nbsp;<b id="sb-trades" class="text-info">&#8212;</b></span>
+    <span>Bars&nbsp;<b id="sb-bars" class="text-light">&#8212;</b></span>
+    <span>Low&nbsp;<b id="sb-low" class="text-success">&#8212;</b></span>
+    <span>High&nbsp;<b id="sb-high" class="text-danger fw-bold">&#8212;</b></span>
+    <span id="graph-date-label" class="ms-auto text-muted small"></span>
   </div>
+  <!-- Chart -->
   <div id="chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
+  <!-- Source toggles -->
   <div class="d-flex gap-3 mt-2 flex-wrap small">
-    <label><input type="checkbox" id="tog-ohlc"      checked onchange="redrawLines()">
-      <span class="badge source-ohlc">OHLC</span></label>
-    <label><input type="checkbox" id="tog-pivot"     checked onchange="redrawLines()">
-      <span class="badge source-pivot">Pivot</span></label>
-    <label><input type="checkbox" id="tog-overnight" checked onchange="redrawLines()">
-      <span class="badge source-overnight">Overnight</span></label>
-    <label><input type="checkbox" id="tog-orb"       checked onchange="redrawLines()">
-      <span class="badge source-orb">ORB</span></label>
-    <label><input type="checkbox" id="tog-vwap"      checked onchange="redrawLines()">
-      <span class="badge source-vwap">VWAP</span></label>
-    <label><input type="checkbox" id="tog-volume"    checked onchange="redrawLines()">
-      <span class="badge source-volume">Volume</span></label>
-    <label><input type="checkbox" id="tog-round"     checked onchange="redrawLines()">
-      <span class="badge source-round">Round</span></label>
-    <label><input type="checkbox" id="tog-manual"    checked onchange="redrawLines()">
-      <span class="badge source-manual">Manual</span></label>
-  </div>
-</div>
-
-<!-- ══════════════════════ BARS (Volume Profile) ══════════════════════ -->
-<div class="tab-pane fade" id="tab-bars">
-  <!-- Row 1: symbol + transpose + info + nav -->
-  <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
-    <ul class="nav nav-pills mb-0" id="bars-sym-pills">
-      <li class="nav-item"><button class="nav-link active" onclick="selectBarsSym('MES',this)">MES</button></li>
-      <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('MNQ',this)">MNQ</button></li>
-      <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('MYM',this)">MYM</button></li>
-      <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('M2K',this)">M2K</button></li>
-    </ul>
-    <span id="bars-info" class="small text-muted ms-1"></span>
-    <div id="bars-nav" class="d-flex align-items-center gap-1 ms-auto" style="display:none">
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev symbol" onclick="navBarsSym(-1)">◀S</button>
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Next symbol" onclick="navBarsSym(1)">S▶</button>
-      <span class="vr mx-1"></span>
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Prev day" onclick="navBarsDay(-1)">◀D</button>
-      <span id="bars-day-info" class="small text-muted px-1" style="min-width:50px;text-align:center">0/0</span>
-      <button class="btn btn-sm btn-outline-secondary px-2" title="Next day" onclick="navBarsDay(1)">D▶</button>
-    </div>
-  </div>
-  <div id="mock-banner-bars" class="alert alert-warning py-1 px-2 mb-1 small" style="display:none">
-    ⚠ No data for <strong id="mock-req-bars"></strong> — showing <strong id="mock-date-bars"></strong>
-  </div>
-  <div id="bars-chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
-  <div class="d-flex gap-3 mt-2 flex-wrap small">
-    <label><input type="checkbox" id="btog-ohlc"      checked onchange="redrawBarsLines()"><span class="badge source-ohlc">OHLC</span></label>
-    <label><input type="checkbox" id="btog-pivot"     checked onchange="redrawBarsLines()"><span class="badge source-pivot">Pivot</span></label>
-    <label><input type="checkbox" id="btog-overnight" checked onchange="redrawBarsLines()"><span class="badge source-overnight">Overnight</span></label>
-    <label><input type="checkbox" id="btog-orb"       checked onchange="redrawBarsLines()"><span class="badge source-orb">ORB</span></label>
-    <label><input type="checkbox" id="btog-vwap"      checked onchange="redrawBarsLines()"><span class="badge source-vwap">VWAP</span></label>
-    <label><input type="checkbox" id="btog-volume"    checked onchange="redrawBarsLines()"><span class="badge source-volume">Volume</span></label>
-    <label><input type="checkbox" id="btog-round"     checked onchange="redrawBarsLines()"><span class="badge source-round">Round</span></label>
-    <label><input type="checkbox" id="btog-manual"    checked onchange="redrawBarsLines()"><span class="badge source-manual">Manual</span></label>
+    <label><input type="checkbox" id="tog-ohlc"      checked onchange="redrawLines()"><span class="badge source-ohlc">OHLC</span></label>
+    <label><input type="checkbox" id="tog-pivot"     checked onchange="redrawLines()"><span class="badge source-pivot">Pivot</span></label>
+    <label><input type="checkbox" id="tog-overnight" checked onchange="redrawLines()"><span class="badge source-overnight">Overnight</span></label>
+    <label><input type="checkbox" id="tog-orb"       checked onchange="redrawLines()"><span class="badge source-orb">ORB</span></label>
+    <label><input type="checkbox" id="tog-vwap"      checked onchange="redrawLines()"><span class="badge source-vwap">VWAP</span></label>
+    <label><input type="checkbox" id="tog-volume"    checked onchange="redrawLines()"><span class="badge source-volume">Volume</span></label>
+    <label><input type="checkbox" id="tog-round"     checked onchange="redrawLines()"><span class="badge source-round">Round</span></label>
+    <label><input type="checkbox" id="tog-manual"    checked onchange="redrawLines()"><span class="badge source-manual">Manual</span></label>
   </div>
 </div>
 
@@ -1269,27 +1298,24 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <label class="small"><input class="form-check-input bkt-chk" type="checkbox" value="2"  checked> 2</label>
     <label class="small"><input class="form-check-input bkt-chk" type="checkbox" value="4"  checked> 4</label>
     <label class="small"><input class="form-check-input bkt-chk" type="checkbox" value="10" checked> 10</label>
-    <label class="small ms-2">Strength ≥
+    <label class="small ms-2">Strength &#8805;
       <input type="number" id="min-str-trades" class="form-control form-control-sm d-inline-block"
              style="width:55px" min="1" max="10" value="1">
     </label>
     <button class="btn btn-sm btn-primary" onclick="createTrades()">Create Trades</button>
   </div>
-
   <div class="d-flex gap-2 mb-2">
     <span class="badge bg-secondary" id="ctr-total">Total: 0</span>
     <span class="badge bg-success"   id="ctr-passed">Passed: 0</span>
     <span class="badge bg-warning text-dark" id="ctr-filtered">Filtered: 0</span>
-    <span class="badge bg-info text-dark"    id="ctr-syms">Symbols: —</span>
+    <span class="badge bg-info text-dark"    id="ctr-syms">Symbols: &#8212;</span>
   </div>
-
   <div class="mb-2">
     <button class="btn btn-sm btn-success" id="btn-submit" disabled onclick="submitTrades()">
       Submit 0 Trades
     </button>
     <span id="trades-msg" class="small text-muted ms-2"></span>
   </div>
-
   <table class="table table-sm table-hover table-bordered">
     <thead class="table-dark">
       <tr><th>#</th><th>Sym</th><th>Algo</th><th>Dir</th><th>ET</th>
@@ -1318,142 +1344,209 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 </div><!-- container -->
 
 <script>
-// ── price polling ────────────────────────────────────────────────────────────
-const SOURCE_COLORS = {
-  ohlc:'#4e79a7', pivot:'#f28e2b', overnight:'#59a14f', manual:'#e15759',
-  orb:'#1abc9c', vwap:'#9b59b6', volume:'#e67e22', round:'#7f8c8d'
+// ── Constants ─────────────────────────────────────────────────────────────────
+const SOURCE_COLORS={
+  ohlc:'#4e79a7',pivot:'#f28e2b',overnight:'#59a14f',manual:'#e15759',
+  orb:'#1abc9c',vwap:'#9b59b6',volume:'#e67e22',round:'#7f8c8d'
 };
 
-// ── Busy state ───────────────────────────────────────────────────────────────
-let _busyCount = 0, _busyDisabled = [];
+// ── Busy state ────────────────────────────────────────────────────────────────
+let _busyCount=0,_busyDisabled=[];
 function _enterBusy(){
-  if(++_busyCount === 1){
+  if(++_busyCount===1){
     document.body.classList.add('busy-wait');
-    _busyDisabled = [];
+    _busyDisabled=[];
     document.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled)').forEach(el=>{
-      _busyDisabled.push(el); el.disabled = true;
+      _busyDisabled.push(el);el.disabled=true;
     });
   }
 }
 function _exitBusy(){
-  if(--_busyCount <= 0){
-    _busyCount = 0;
+  if(--_busyCount<=0){
+    _busyCount=0;
     document.body.classList.remove('busy-wait');
-    _busyDisabled.forEach(el => el.disabled = false);
-    _busyDisabled = [];
+    _busyDisabled.forEach(el=>el.disabled=false);
+    _busyDisabled=[];
   }
 }
-const STATUS_CLS    = {PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
-                       FILLED:'warning',CLOSED:'success',CANCELLED:'dark',ERROR:'danger'};
+const STATUS_CLS={PENDING:'secondary',SUBMITTED:'primary',SUBMITTING:'info',
+                  FILLED:'warning',CLOSED:'success',CANCELLED:'dark',ERROR:'danger'};
 
+// ── Price polling ─────────────────────────────────────────────────────────────
 async function pollPrices(){
   try{
-    const d = await (await fetch('/api/prices')).json();
+    const d=await (await fetch('/api/prices')).json();
     for(const [s,p] of Object.entries(d)){
-      const el = document.getElementById('chip-'+s);
-      if(el) el.textContent = s+' '+(p!=null?p.toFixed(2):'—');
+      const el=document.getElementById('chip-'+s);
+      if(el) el.textContent=s+' '+(p!=null?p.toFixed(2):'--');
     }
   }catch(e){}
 }
-pollPrices(); setInterval(pollPrices,5000);
+pollPrices();setInterval(pollPrices,5000);
 
-// ── helpers ──────────────────────────────────────────────────────────────────
-function checkedVals(containerId){
-  return [...document.querySelectorAll('#'+containerId+' input[type=checkbox]:checked')].map(e=>e.value);
+// ── Helpers ───────────────────────────────────────────────────────────────────
+function checkedVals(id){
+  return[...document.querySelectorAll('#'+id+' input[type=checkbox]:checked')].map(e=>e.value);
 }
 function strengthColor(s){
   const g=['#555','#666','#777','#888','#999','#aaa','#f0a','#f60','#f80','#f00'];
   return g[Math.max(0,Math.min(9,s-1))];
 }
-function fmt(v){ return v!=null?v.toFixed(2):'—'; }
+function fmt(v){return v!=null?v.toFixed(2):'--';}
 
-// ── LINES ────────────────────────────────────────────────────────────────────
+function _lastWeekday(){
+  const d=new Date();d.setDate(d.getDate()-1);
+  while(d.getDay()===0||d.getDay()===6)d.setDate(d.getDate()-1);
+  return d.toISOString().split('T')[0];
+}
+function _nWeekdaysBack(n){
+  const d=new Date();let c=0;d.setDate(d.getDate()-1);
+  while(true){
+    if(d.getDay()!==0&&d.getDay()!==6)c++;
+    if(c===n)return d.toISOString().split('T')[0];
+    d.setDate(d.getDate()-1);
+  }
+}
+
+// ── Shared Controls ───────────────────────────────────────────────────────────
+function _sharedSyms(){return checkedVals('shared-syms');}
+
+function _getDateRange(){
+  const v=document.querySelector('input[name="date-range"]:checked')?.value||'day';
+  const lw=_lastWeekday();
+  if(v==='day')    return{from:lw,to:lw};
+  if(v==='week')   return{from:_nWeekdaysBack(5),to:lw};
+  if(v==='2weeks') return{from:_nWeekdaysBack(10),to:lw};
+  return{from:document.getElementById('range-from').value||lw,
+         to:document.getElementById('range-to').value||lw};
+}
+
+function onDateRangeChange(){
+  const isCustom=document.querySelector('input[name="date-range"]:checked')?.value==='custom';
+  document.getElementById('range-from').style.display=isCustom?'':'none';
+  document.getElementById('range-sep').style.display=isCustom?'':'none';
+  document.getElementById('range-to').style.display=isCustom?'':'none';
+  const tgt=document.querySelector('#mainTab .nav-link.active')?.dataset?.bsTarget;
+  if(tgt==='#tab-lines')refreshLines();
+  else if(tgt==='#tab-graph')initGraphAndLoad();
+}
+
+// ── LINES ─────────────────────────────────────────────────────────────────────
 function setAllAlgos(checked){
   document.querySelectorAll('.algo-chk').forEach(e=>e.checked=checked);
 }
 
-async function createLines(){
+async function buildLinesDB(force){
   _enterBusy();
-  const syms      = checkedVals('sym-lines');
-  const algoTypes = [...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
-  const mergeThr  = parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
-  const histDate  = document.getElementById('shared-date-input').value||'';
-  document.getElementById('lines-msg').textContent='Creating…';
+  const msg=document.getElementById('build-db-msg');
+  const algos=[...document.querySelectorAll('.algo-chk:checked')].map(e=>e.value);
+  const mergeThr=parseFloat(document.querySelector('input[name="merge-thr"]:checked')?.value||'16');
+  msg.className='small text-warning ms-1';
+  msg.textContent=force?'Force creating...':'Creating missing...';
   try{
-    const payload = {symbols:syms,algo_types:algoTypes,merge_threshold:mergeThr};
-    if(histDate) payload.history_date = histDate;
-    const d = await (await fetch('/api/lines/create',{method:'POST',
+    const r=await (await fetch('/api/build_db',{method:'POST',
       headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(payload)})).json();
-    const ok     = Object.entries(d.results).filter(([,v]) => !v.error);
-    const failed = Object.entries(d.results).filter(([,v]) =>  v.error);
-    const okMsg  = ok.map(([s,v]) => `${s}:${v.lines}`).join(' ');
-    const noMsg  = failed.map(([s]) => s).join(' ');
-    const mockSyms = ok.filter(([,v]) => v.mock).map(([s,v]) => `${s}→${v.mock}`).join(' ');
+      body:JSON.stringify({force,algo_types:algos,merge_threshold:mergeThr,weeks_back:2})
+    })).json();
+    if(r.error){msg.className='small text-danger ms-1';msg.textContent=''+r.error;return;}
+    document.getElementById('build-db-panel').style.display='block';
+    document.getElementById('build-db-bar').style.width='0%';
+    document.getElementById('build-db-tbody').innerHTML='';
+    msg.textContent='Starting...';
+    if(_buildPollTimer)clearInterval(_buildPollTimer);
+    _buildPollTimer=setInterval(_pollBuildStatus,800);
+  }catch(e){msg.className='small text-danger ms-1';msg.textContent='Error: '+e;}
+  finally{_exitBusy();}
+}
 
-    const linesMsg = document.getElementById('lines-msg');
-    if(ok.length === 0){
-      linesMsg.className = 'small text-danger ms-1';
-      linesMsg.textContent = 'No data found for: ' + noMsg;
-    } else if(failed.length > 0){
-      linesMsg.className = 'small text-warning ms-1';
-      linesMsg.textContent = `Created ${okMsg}${mockSyms?' ('+mockSyms+')':''} | No data: ${noMsg}`;
-    } else {
-      linesMsg.className = 'small text-success ms-1';
-      linesMsg.textContent = `Created ${okMsg}${mockSyms?' ('+mockSyms+')':''}`;
-    }
+let _buildPollTimer=null;
+async function _pollBuildStatus(){
+  try{
+    const s=await (await fetch('/api/build_db/status')).json();
+    const pct=s.total>0?Math.round(s.done/s.total*100):0;
+    document.getElementById('build-db-bar').style.width=pct+'%';
+    const msg=document.getElementById('build-db-msg');
+    msg.className=s.running?'small text-warning ms-1':'small text-success ms-1';
+    msg.textContent=s.running
+      ?(s.current?s.current+' ('+s.done+'/'+s.total+')':'Running...')
+      :('Done -- '+s.done+'/'+s.total+' processed');
+    _renderBuildTable(s.log);
+    if(!s.running&&_buildPollTimer){clearInterval(_buildPollTimer);_buildPollTimer=null;refreshLines();}
+  }catch(e){}
+}
 
-    if(ok.length > 0) refreshLines();
-  }catch(e){ document.getElementById('lines-msg').textContent='Error: '+e; }
-  finally{ _exitBusy(); }
+function _renderBuildTable(log){
+  const SYMS=['MES','MNQ','MYM','M2K'];
+  const byDate={};
+  for(const e of log){if(!byDate[e.date])byDate[e.date]={};byDate[e.date][e.symbol]=e;}
+  const dates=Object.keys(byDate).sort().reverse();
+  const html=dates.map(d=>{
+    const cells=SYMS.map(sym=>{
+      const e=byDate[d]?.[sym];
+      if(!e)return'<td class="text-muted text-center">...</td>';
+      if(e.action==='done')  return`<td class="text-success text-center">+ ${e.count}</td>`;
+      if(e.action==='skip')  return`<td class="text-muted text-center">~ ${e.count}</td>`;
+      if(e.action==='no_csv')return'<td class="text-warning text-center">no csv</td>';
+      if(e.action==='no_rth')return'<td class="text-warning text-center">no rth</td>';
+      return'<td class="text-danger text-center">?</td>';
+    }).join('');
+    return`<tr><td>${d}</td>${cells}</tr>`;
+  }).join('');
+  document.getElementById('build-db-tbody').innerHTML=html;
 }
 
 async function refreshLines(){
-  const ms = parseInt(document.getElementById('min-str-lines').value)||1;
+  const syms=_sharedSyms();
+  const{from,to}=_getDateRange();
+  const ms=parseInt(document.getElementById('min-str-lines').value)||1;
+  let url=`/api/lines?min_strength=${ms}&date_from=${from}&date_to=${to}`;
+  if(syms.length>0&&syms.length<4)url+='&symbols='+syms.join(',');
   try{
-    const rows = await (await fetch(`/api/lines?min_strength=${ms}`)).json();
-    const tb = document.getElementById('lines-tbody');
-    // Dispose existing tooltips before clearing
+    const rows=await (await fetch(url)).json();
+    const tb=document.getElementById('lines-tbody');
     tb.querySelectorAll('[data-bs-toggle="tooltip"]').forEach(el=>{
       bootstrap.Tooltip.getInstance(el)?.dispose();
     });
     tb.innerHTML='';
     for(const r of rows){
-      const sc = SOURCE_COLORS[r.source]||'#888';
-      const sl = r.source.charAt(0).toUpperCase()+r.source.slice(1);
-      const tr = document.createElement('tr');
-      // Build tooltip from stored note JSON
-      let tipHtml = '';
+      const sc=SOURCE_COLORS[r.source]||'#888';
+      const sl=r.source.charAt(0).toUpperCase()+r.source.slice(1);
+      const armedBadge=r.armed
+        ?'<span class="badge bg-success">ON</span>'
+        :'<span class="badge bg-secondary">off</span>';
+      const tr=document.createElement('tr');
+      let tipHtml='';
       if(r.note){
         try{
-          const n = typeof r.note==='string'?JSON.parse(r.note):r.note;
-          const mergedPart = n.merged&&n.merged.length
-            ? '<hr style="border-color:#555;margin:3px 0"><span class="text-warning">Absorbed: '
-              +n.merged.map(m=>`${m.algo_type}@${m.price.toFixed(2)}`).join(', ')+'</span>'
-            : '';
-          tipHtml = `<b>${n.label}</b><br><small>${n.formula}</small><br>`
+          const n=typeof r.note==='string'?JSON.parse(r.note):r.note;
+          const mp=n.merged&&n.merged.length
+            ?'<hr style="border-color:#555;margin:3px 0"><span class="text-warning">Absorbed: '
+              +n.merged.map(m=>`${m.algo_type}@${m.price.toFixed(2)}`).join(', ')+'</span>':'';
+          tipHtml=`<b>${n.label}</b><br><small>${n.formula}</small><br>`
             +`<small class="text-muted">${n.inputs}</small><br>`
-            +`<small class="text-muted">From: ${n.from_date}</small>${mergedPart}`;
+            +`<small class="text-muted">From: ${n.from_date}</small>${mp}`;
         }catch(_){}
       }
       tr.innerHTML=`<td>${r.id}</td><td><b>${r.symbol}</b></td>
+        <td class="text-muted small">${r.date||'--'}</td>
         <td class="font-monospace">${r.price.toFixed(2)}</td>
         <td>${r.line_type==='SUPPORT'?'<span class="text-success">SUPP</span>':'<span class="text-danger">RESI</span>'}</td>
         <td><small>${r.algo_type}</small></td>
         <td><span class="badge" style="background:${strengthColor(r.strength)}">${r.strength}</span></td>
         <td><span class="badge" style="background:${sc}">${sl}</span></td>
+        <td>${armedBadge}</td>
         <td><button class="btn btn-sm btn-outline-danger py-0 px-1" style="font-size:.7rem"
-            onclick="delLine(${r.id})">✕</button></td>`;
+            onclick="delLine(${r.id})">x</button></td>`;
       if(tipHtml){
         tr.setAttribute('data-bs-toggle','tooltip');
         tr.setAttribute('data-bs-html','true');
         tr.setAttribute('data-bs-placement','auto');
-        tr.setAttribute('title', tipHtml);
-        new bootstrap.Tooltip(tr, {html:true, boundary:'document'});
+        tr.setAttribute('title',tipHtml);
+        new bootstrap.Tooltip(tr,{html:true,boundary:'document'});
       }
       tb.appendChild(tr);
     }
-  }catch(e){}
+  }catch(e){console.error(e);}
 }
 
 async function delLine(id){
@@ -1462,438 +1555,365 @@ async function delLine(id){
 }
 
 async function addManualLine(){
-  const sym   = document.getElementById('m-sym').value;
-  const price = parseFloat(document.getElementById('m-price').value);
-  const ltype = document.getElementById('m-type').value;
-  const str   = parseInt(document.getElementById('m-str').value)||8;
-  if(!price){ document.getElementById('manual-msg').textContent='Enter price'; return; }
+  const sym=document.getElementById('m-sym').value;
+  const price=parseFloat(document.getElementById('m-price').value);
+  const ltype=document.getElementById('m-type').value;
+  const str=parseInt(document.getElementById('m-str').value)||8;
+  if(!price){document.getElementById('manual-msg').textContent='Enter price';return;}
   await fetch('/api/lines/manual',{method:'POST',headers:{'Content-Type':'application/json'},
     body:JSON.stringify({symbol:sym,price,line_type:ltype,strength:str})});
-  document.getElementById('manual-msg').textContent='Added ✓';
+  document.getElementById('manual-msg').textContent='Added';
   setTimeout(()=>document.getElementById('manual-msg').textContent='',2000);
   refreshLines();
 }
 
-// ── GRAPH ────────────────────────────────────────────────────────────────────
-let _graphSym='MES', _chartBars=[], _chartLines=[], _graphMode='candle', _graphRange='all', _graphInterval=5;
-let _visibleLines=[];  // mirrors line traces 1:1 (trace index 0 = bar, 1..N = lines)
+// ── GRAPH ─────────────────────────────────────────────────────────────────────
+let _graphSym='MES',_chartBars=[],_chartLines=[],_barsProfile=[];
+let _graphMode='candle',_graphRange='all',_graphInterval=5;
+let _visibleLines=[];
+let _graphDates=[],_graphDateIdx=0,_graphCurrentDate=null;
+let _graphZoomState=null;
 
-function setGraphMode(mode, btn){
-  _graphMode = mode;
-  document.querySelectorAll('#btn-mode-candle,#btn-mode-line').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  drawChart();
+async function initGraphAndLoad(){
+  const{from,to}=_getDateRange();
+  const syms=_sharedSyms();
+  const url=`/api/available_dates?date_from=${from}&date_to=${to}&symbols=${syms.join(',')}`;
+  try{
+    const d=await (await fetch(url)).json();
+    _graphDates=d.dates||[];
+    if(_graphCurrentDate&&_graphDates.includes(_graphCurrentDate)){
+      _graphDateIdx=_graphDates.indexOf(_graphCurrentDate);
+    }else{
+      _graphDateIdx=_graphDates.length-1;
+    }
+    _updateDayInfo();
+  }catch(e){console.error(e);}
+  if(_graphDates.length){
+    await loadGraph();
+  }else{
+    Plotly.purge('chart');
+    document.getElementById('chart').innerHTML=
+      '<div class="d-flex align-items-center justify-content-center h-100 text-muted">No data in selected date range</div>';
+    document.getElementById('day-info').textContent='--';
+  }
 }
 
-function setGraphRange(range, btn){
-  _graphRange = range;
-  document.querySelectorAll('#btn-range-all,#btn-range-4h,#btn-range-1h').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  drawChart();
+function _updateDayInfo(){
+  const total=_graphDates.length;
+  const d=_graphDates[_graphDateIdx]||'';
+  document.getElementById('day-info').textContent=
+    total>0?`${_graphDateIdx+1}/${total}  ${d}`:'--';
 }
 
-function setGraphInterval(min, btn){
-  _graphInterval = min;
-  document.querySelectorAll('#btn-int-30s,#btn-int-1,#btn-int-5,#btn-int-15,#btn-int-30').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  loadGraph();
+async function navDay(delta){
+  if(!_graphDates.length)return;
+  _graphDateIdx=Math.max(0,Math.min(_graphDates.length-1,_graphDateIdx+delta));
+  _graphZoomState=null;
+  _updateDayInfo();
+  await loadGraph();
+}
+
+function navSym(delta){
+  const syms=_sharedSyms().length?_sharedSyms():['MES','MNQ','MYM','M2K'];
+  const idx=syms.indexOf(_graphSym);
+  const next=syms[(idx+delta+syms.length)%syms.length];
+  document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(btn=>{
+    if(btn.textContent.trim()===next)btn.click();
+  });
 }
 
 function selectSym(sym,btn){
+  if(_graphSym!==sym)_graphZoomState=null;
   _graphSym=sym;
   document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   loadGraph();
 }
 
+function setGraphMode(mode,btn){
+  _graphMode=mode;
+  document.querySelectorAll('#btn-mode-candle,#btn-mode-line,#btn-mode-bars').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  drawChart();
+}
+
+function setGraphRange(range,btn){
+  _graphRange=range;
+  document.querySelectorAll('#btn-range-all,#btn-range-4h,#btn-range-1h').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  if(_graphMode!=='bars')drawChart();
+}
+
+function setGraphInterval(min,btn){
+  _graphInterval=min;
+  document.querySelectorAll('#btn-int-30s,#btn-int-1,#btn-int-5,#btn-int-15,#btn-int-30').forEach(b=>b.classList.remove('active'));
+  btn.classList.add('active');
+  loadGraph();
+}
+
 function filteredBars(){
-  if(_graphRange==='all') return _chartBars;
-  const bph = Math.round(60 / _graphInterval);
-  const n = _graphRange==='1h' ? bph : bph * 4;
+  if(_graphRange==='all')return _chartBars;
+  const bph=Math.round(60/_graphInterval);
+  const n=_graphRange==='1h'?bph:bph*4;
   return _chartBars.slice(-n);
 }
 
 async function loadGraph(){
+  const reqDate=_graphDates[_graphDateIdx];
+  if(!reqDate)return;
+  if(reqDate!==_graphCurrentDate)_graphZoomState=null;
+  _graphCurrentDate=reqDate;
   _enterBusy();
   try{
-    const reqDate = document.getElementById('shared-date-input').value||'';
-    const base = `/api/history/${_graphSym}?interval=${_graphInterval}`;
-    const url = reqDate ? `${base}&date=${reqDate}` : base;
-    const br = await (await fetch(url)).json();
-    _chartBars = br.bars||[];
-    const mock = br.mock_date;
+    const br=await (await fetch(`/api/history/${_graphSym}?interval=${_graphInterval}&date=${reqDate}`)).json();
+    _chartBars=br.bars||[];
+    const mock=br.mock_date;
     document.getElementById('mock-banner-graph').style.display=mock?'block':'none';
     if(mock){
-      document.getElementById('mock-req-graph').textContent  = reqDate||'selected date';
-      document.getElementById('mock-date-graph').textContent = mock;
+      document.getElementById('mock-req-graph').textContent=reqDate;
+      document.getElementById('mock-date-graph').textContent=mock;
     }
-    document.getElementById('sb-trades').textContent =
-      br.total_ticks!=null ? br.total_ticks.toLocaleString() : '—';
-
-    const ms = parseInt(document.getElementById('min-str-lines').value)||1;
-    // Only use historical date for lines when Analyze All has been run; otherwise use today's lines
-    const lineDate = _analyzedDates.length > 0 ? (reqDate || br.date || '') : '';
-    const linesUrl = `/api/lines?symbol=${_graphSym}&min_strength=${ms}` + (lineDate?`&date=${lineDate}`:'');
-    _chartLines = await (await fetch(linesUrl)).json();
+    document.getElementById('sb-trades').textContent=br.total_ticks!=null?br.total_ticks.toLocaleString():'--';
+    document.getElementById('graph-date-label').textContent=br.date||reqDate;
+    const ms=parseInt(document.getElementById('min-str-lines').value)||1;
+    const lineDate=br.date||reqDate;
+    _chartLines=await (await fetch(`/api/lines?symbol=${_graphSym}&min_strength=${ms}&date=${lineDate}`)).json();
+    const vp=await (await fetch(`/api/volume_profile/${_graphSym}?date=${reqDate}`)).json();
+    _barsProfile=vp.profile||[];
     drawChart();
-  }catch(e){ console.error(e); }
-  finally{ _exitBusy(); }
+  }catch(e){console.error(e);}
+  finally{_exitBusy();}
 }
 
 function enabledSources(){
   const s=new Set();
   ['ohlc','pivot','overnight','orb','vwap','volume','round','manual'].forEach(src=>{
-    const el = document.getElementById('tog-'+src);
-    if(el && el.checked) s.add(src);
+    const el=document.getElementById('tog-'+src);
+    if(el&&el.checked)s.add(src);
   });
   return s;
 }
 
-function buildLineTraces(bars){
-  if(!bars.length) return [];
-  const x0 = bars[0].t, x1 = bars[bars.length-1].t;
-  const en  = enabledSources();
-  _visibleLines = _chartLines.filter(l => en.has(l.source));
-  return _visibleLines.map(l => {
-    const armed = l._armed !== undefined ? l._armed : !!l.armed;
-    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.35)';
-    return {
-      type:'scatter', mode:'lines',
-      x:[x0, x1], y:[l.price, l.price],
-      line:{color:col, width:armed?3:1, dash:armed?'solid':'dot'},
-      name:l.algo_type,
-      hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`,
-      showlegend:false
-    };
-  });
+// ── Line Popup ────────────────────────────────────────────────────────────────
+let _currentPopupLine=null;
+
+function openLinePopup(line){
+  _currentPopupLine=line;
+  const note=(()=>{
+    try{return typeof line.note==='string'?JSON.parse(line.note):(line.note||{});}
+    catch(_){return{};}
+  })();
+  const armed=line._armed!==undefined?line._armed:!!line.armed;
+  document.getElementById('lm-title').textContent=
+    `${line.algo_type} @ ${line.price.toFixed(2)}  --  ${line.line_type}`;
+  const mh=note.merged&&note.merged.length
+    ?`<div class="mt-2 pt-2 border-top border-secondary"><small class="text-warning">Absorbed: ${note.merged.map(m=>`${m.algo_type}@${m.price.toFixed(2)}`).join(', ')}</small></div>`:'';
+  document.getElementById('lm-body').innerHTML=`
+    <div class="row g-1 small">
+      <div class="col-3 text-muted">Symbol</div><div class="col-9">${line.symbol||'--'}</div>
+      <div class="col-3 text-muted">Price</div><div class="col-9 font-monospace fw-bold">${line.price.toFixed(2)}</div>
+      <div class="col-3 text-muted">Type</div><div class="col-9">${line.line_type||'--'}</div>
+      <div class="col-3 text-muted">Strength</div><div class="col-9">${line.strength}</div>
+      <div class="col-3 text-muted">Algo</div><div class="col-9">${note.label||line.algo_type||'--'}</div>
+      ${note.formula?`<div class="col-3 text-muted">Formula</div><div class="col-9 text-light">${note.formula}</div>`:''}
+      ${note.inputs?`<div class="col-3 text-muted">Inputs</div><div class="col-9 text-muted small">${note.inputs}</div>`:''}
+      ${note.from_date?`<div class="col-3 text-muted">From</div><div class="col-9">${note.from_date}</div>`:''}
+      <div class="col-3 text-muted">Status</div><div class="col-9">${armed?'<span class="text-success">Enabled</span>':'<span class="text-secondary">Disabled (dotted)</span>'}</div>
+    </div>${mh}`;
+  const btn=document.getElementById('lm-toggle-btn');
+  btn.textContent=armed?'Disable':'Enable';
+  btn.className=armed?'btn btn-sm btn-outline-warning':'btn btn-sm btn-outline-success';
+  new bootstrap.Modal(document.getElementById('lineModal')).show();
 }
 
-function buildAnnotations(){
-  const en = enabledSources();
-  return _chartLines.filter(l => en.has(l.source)).map(l => {
-    const armed = l._armed !== undefined ? l._armed : !!l.armed;
-    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.45)';
-    return {xref:'paper',yref:'y',x:1,y:l.price,
-      text:`${l.algo_type} ${l.price}`,showarrow:false,
-      xanchor:'right',font:{size:9,color:col}};
-  });
-}
-
-function drawChart(){
-  if(!_chartBars.length){
-    Plotly.purge('chart');
-    document.getElementById('chart').innerHTML=
-      `<div class="d-flex align-items-center justify-content-center h-100 text-muted">No history data for ${_graphSym}</div>`;
-    return;
-  }
-  const bars = filteredBars();
-  document.getElementById('bar-count').textContent = bars.length + ' bars';
-
-  // Y-axis range from bar prices only — prevents far-out lines from zooming the chart out
-  const yLow  = Math.min(...bars.map(b => b.low));
-  const yHigh = Math.max(...bars.map(b => b.high));
-  const yPad  = (yHigh - yLow) * 0.07;
-
-  // Sanity bar
-  document.getElementById('sb-bars').textContent = bars.length;
-  document.getElementById('sb-low').textContent  = yLow.toFixed(2);
-  document.getElementById('sb-high').textContent = yHigh.toFixed(2);
-
-  let barTrace;
-  if(_graphMode==='line'){
-    barTrace = {type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
-      name:_graphSym,line:{color:'#7db3d8',width:1.5},showlegend:false};
-  } else {
-    barTrace = {type:'candlestick',x:bars.map(b=>b.t),
-      open:bars.map(b=>b.open),high:bars.map(b=>b.high),
-      low:bars.map(b=>b.low),close:bars.map(b=>b.close),
-      name:_graphSym,
-      increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}},
-      showlegend:false};
-  }
-  const lineTraces = buildLineTraces(bars);
-  const layout={
-    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
-    xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
-    yaxis:{range:[yLow-yPad, yHigh+yPad],gridcolor:'#333'},
-    annotations:buildAnnotations(),
-    showlegend:false};
-  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
-
-  document.getElementById('chart').on('plotly_click', function(evtData){
-    const cn = evtData.points[0].curveNumber;
-    if(cn === 0) return;
-    const line = _visibleLines[cn - 1];
-    if(!line) return;
-    const wasArmed = line._armed !== undefined ? line._armed : !!line.armed;
-    line._armed = !wasArmed;
-    fetch(`/api/lines/${line.id}`, {method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({armed: line._armed ? 1 : 0})
-    });
-    drawChart();
-  });
-}
-
-function redrawLines(){
-  if(!_chartBars.length) return;
+function toggleCurrentLine(){
+  const line=_currentPopupLine;
+  if(!line)return;
+  const wasArmed=line._armed!==undefined?line._armed:!!line.armed;
+  line._armed=!wasArmed;
+  fetch(`/api/lines/${line.id}`,{method:'PATCH',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({armed:line._armed?1:0})});
+  bootstrap.Modal.getInstance(document.getElementById('lineModal'))?.hide();
   drawChart();
 }
 
-// ── Analyze All + nav ────────────────────────────────────────────────────────
-let _analyzedDates = [], _analyzedIdx = 0;
-
-async function analyzeAll(){
-  _enterBusy();
-  const msg = document.getElementById('analyze-msg');
-  msg.className='small text-warning'; msg.textContent='Analyzing…';
-  try{
-    const d = await (await fetch('/api/analyze_all',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({symbols:['MES','MNQ','MYM','M2K']})
-    })).json();
-    _analyzedDates = d.dates||[];
-    _analyzedIdx   = _analyzedDates.length - 1;
-    msg.className='small text-success';
-    msg.textContent = `${_analyzedDates.length} days`;
-    document.getElementById('analyze-nav').style.display = 'flex';
-    document.getElementById('bars-nav').style.display   = 'flex';
-    _updateDayInfo();
-    if(_analyzedDates.length){
-      document.getElementById('shared-date-input').value = _analyzedDates[_analyzedIdx];
-    }
-  }catch(e){
-    document.getElementById('analyze-msg').className='small text-danger';
-    document.getElementById('analyze-msg').textContent='Error: '+e;
-  }finally{ _exitBusy(); }
-  if(_analyzedDates.length) await loadGraph();
-}
-
-function _updateDayInfo(){
-  const txt = `${_analyzedIdx+1}/${_analyzedDates.length}`;
-  document.getElementById('analyze-day-info').textContent = txt;
-  document.getElementById('bars-day-info').textContent    = txt;
-}
-
-async function navDay(delta){
-  if(!_analyzedDates.length) return;
-  _analyzedIdx = Math.max(0, Math.min(_analyzedDates.length-1, _analyzedIdx+delta));
-  document.getElementById('shared-date-input').value = _analyzedDates[_analyzedIdx];
-  _updateDayInfo();
-  await loadGraph();
-}
-
-function navSym(delta){
-  const syms=['MES','MNQ','MYM','M2K'];
-  const next = syms[(syms.indexOf(_graphSym)+delta+syms.length)%syms.length];
-  document.querySelectorAll('#sym-pill-tabs .nav-link').forEach(btn=>{
-    if(btn.textContent===next) btn.click();
+// ── Chart ─────────────────────────────────────────────────────────────────────
+function buildLineTraces(bars){
+  if(!bars.length)return[];
+  const x0=bars[0].t,x1=bars[bars.length-1].t;
+  const en=enabledSources();
+  _visibleLines=_chartLines.filter(l=>en.has(l.source));
+  return _visibleLines.map(l=>{
+    const armed=l._armed!==undefined?l._armed:!!l.armed;
+    const col=armed?(SOURCE_COLORS[l.source]||'#888'):'rgba(128,128,128,0.35)';
+    return{type:'scatter',mode:'lines',x:[x0,x1],y:[l.price,l.price],
+      line:{color:col,width:armed?3:1,dash:armed?'solid':'dot'},
+      name:l.algo_type,hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`,
+      showlegend:false};
   });
 }
 
-async function createGraphTrades(){
-  const msg = document.getElementById('graph-trades-msg');
-  msg.className='small ms-1 text-warning';
-  msg.textContent='Generating…';
-  _enterBusy();
-  try{
-    const d = await (await fetch('/api/trades/create',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({symbols:[_graphSym], brackets:[4,8], min_strength:1})
-    })).json();
-    const cands = d.candidates||[];
-    if(!cands.length){
-      msg.className='small ms-1 text-muted';
-      msg.textContent='No armed lines';
-      return;
-    }
-    const s = await (await fetch('/api/trades/submit',{method:'POST',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({candidates:cands})
-    })).json();
-    msg.className='small ms-1 text-success';
-    msg.textContent=`${s.submitted} trades submitted`;
-  }catch(e){
-    msg.className='small ms-1 text-danger';
-    msg.textContent='Error: '+e;
-  }finally{ _exitBusy(); }
-}
-
-function onSharedDateChange(){
-  const tgt = document.querySelector('#mainTab .nav-link.active')?.dataset?.bsTarget;
-  if(tgt === '#tab-graph') loadGraph();
-  else if(tgt === '#tab-bars') loadBars();
-}
-
-document.getElementById('btn-graph-tab').addEventListener('click', function(){
-  document.getElementById('shared-date-input').readOnly = true;
-  loadGraph();
-});
-document.getElementById('btn-bars-tab').addEventListener('click', function(){
-  document.getElementById('shared-date-input').readOnly = true;
-  loadBars();
-});
-document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab):not(#btn-bars-tab)').forEach(function(btn){
-  btn.addEventListener('click', function(){
-    document.getElementById('shared-date-input').readOnly = false;
+function buildAnnotations(bars){
+  const en=enabledSources();
+  return _chartLines.filter(l=>en.has(l.source)).map(l=>{
+    const armed=l._armed!==undefined?l._armed:!!l.armed;
+    const col=armed?(SOURCE_COLORS[l.source]||'#888'):'rgba(128,128,128,0.45)';
+    return{xref:'paper',yref:'y',x:1,y:l.price,text:`${l.algo_type} ${l.price}`,
+      showarrow:false,xanchor:'right',font:{size:9,color:col}};
   });
-});
-
-// ── BARS (Volume Profile) ────────────────────────────────────────────────────
-let _barsSym='MES', _barsProfile=[], _barsBarsLines=[], _visBarsLines=[];
-
-function selectBarsSym(sym, btn){
-  _barsSym = sym;
-  document.querySelectorAll('#bars-sym-pills .nav-link').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  loadBars();
 }
 
-function enabledBarsSources(){
-  const s=new Set();
-  ['ohlc','pivot','overnight','orb','vwap','volume','round','manual'].forEach(src=>{
-    const el=document.getElementById('btog-'+src);
-    if(el&&el.checked) s.add(src);
-  });
-  return s;
-}
-
-async function loadBars(){
-  _enterBusy();
-  try{
-    const reqDate = document.getElementById('shared-date-input').value||'';
-    const url = `/api/volume_profile/${_barsSym}`+(reqDate?`?date=${reqDate}`:'');
-    const d   = await (await fetch(url)).json();
-    _barsProfile = d.profile||[];
-
-    const mock = d.mock_date;
-    document.getElementById('mock-banner-bars').style.display = mock?'block':'none';
-    if(mock){
-      document.getElementById('mock-req-bars').textContent  = reqDate||'selected date';
-      document.getElementById('mock-date-bars').textContent = mock;
-    }
-    document.getElementById('bars-info').textContent =
-      _barsProfile.length ? `${_barsProfile.length} price levels` : 'No data';
-
-    const ms       = parseInt(document.getElementById('min-str-lines').value)||1;
-    const lineDate = _analyzedDates.length > 0 ? (reqDate||d.date||'') : '';
-    const linesUrl = `/api/lines?symbol=${_barsSym}&min_strength=${ms}`+(lineDate?`&date=${lineDate}`:'');
-    _barsBarsLines = await (await fetch(linesUrl)).json();
-    drawBarsChart();
-  }catch(e){ console.error(e); }
-  finally{ _exitBusy(); }
-}
-
-function _barsLineTraces(){
-  if(!_barsProfile.length) return [];
-  const en       = enabledBarsSources();
-  _visBarsLines  = _barsBarsLines.filter(l=>en.has(l.source));
-  const maxCount = Math.max(..._barsProfile.map(p=>p.count));
-  return _visBarsLines.map(l=>{
-    const armed = l._armed!==undefined ? l._armed : !!l.armed;
-    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.35)';
-    return {type:'scatter',mode:'lines',
-      x:[l.price,l.price],y:[0,maxCount],
+function buildBarsLineTraces(){
+  if(!_barsProfile.length)return[];
+  const en=enabledSources();
+  _visibleLines=_chartLines.filter(l=>en.has(l.source));
+  const maxCount=Math.max(..._barsProfile.map(p=>p.count),1);
+  return _visibleLines.map(l=>{
+    const armed=l._armed!==undefined?l._armed:!!l.armed;
+    const col=armed?(SOURCE_COLORS[l.source]||'#888'):'rgba(128,128,128,0.35)';
+    return{type:'scatter',mode:'lines',x:[l.price,l.price],y:[0,maxCount],
       line:{color:col,width:armed?3:1,dash:armed?'solid':'dot'},
       name:l.algo_type,showlegend:false,
       hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
   });
 }
 
-function _barsAnnotations(){
-  const en = enabledBarsSources();
-  return _barsBarsLines.filter(l=>en.has(l.source)).map(l=>{
-    const armed = l._armed!==undefined ? l._armed : !!l.armed;
-    const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.45)';
-    return {xref:'x',yref:'paper',x:l.price,y:1.0,text:l.algo_type,
-      showarrow:false,textangle:-90,xanchor:'center',yanchor:'top',
-      font:{size:8,color:col}};
+function buildBarsAnnotations(){
+  const en=enabledSources();
+  return _chartLines.filter(l=>en.has(l.source)).map(l=>{
+    const armed=l._armed!==undefined?l._armed:!!l.armed;
+    const col=armed?(SOURCE_COLORS[l.source]||'#888'):'rgba(128,128,128,0.45)';
+    return{xref:'x',yref:'paper',x:l.price,y:1.0,text:l.algo_type,
+      showarrow:false,textangle:-90,xanchor:'center',yanchor:'top',font:{size:8,color:col}};
   });
 }
 
-function drawBarsChart(){
-  const chartEl = document.getElementById('bars-chart');
-  if(!_barsProfile.length){
-    Plotly.purge('bars-chart');
-    chartEl.innerHTML=`<div class="d-flex align-items-center justify-content-center h-100 text-muted">No volume data for ${_barsSym}</div>`;
+function _attachChartHandlers(){
+  const el=document.getElementById('chart');
+  el.on('plotly_click',function(evtData){
+    const cn=evtData.points[0].curveNumber;
+    if(cn===0)return;
+    const line=_visibleLines[cn-1];
+    if(line)openLinePopup(line);
+  });
+  el.on('plotly_relayout',function(evt){
+    if(evt['xaxis.range[0]']!=null){
+      _graphZoomState={
+        x:[evt['xaxis.range[0]'],evt['xaxis.range[1]']],
+        y:evt['yaxis.range[0]']!=null?[evt['yaxis.range[0]'],evt['yaxis.range[1]']]:null
+      };
+    }else if(evt['xaxis.autorange']){
+      _graphZoomState=null;
+    }
+  });
+}
+
+function _applyZoom(layout){
+  if(!_graphZoomState)return;
+  if(_graphZoomState.x){layout.xaxis.range=_graphZoomState.x;delete layout.xaxis.autorange;}
+  if(_graphZoomState.y){layout.yaxis.range=_graphZoomState.y;delete layout.yaxis.autorange;}
+}
+
+function drawChart(){
+  if(_graphMode==='bars'){drawBarsMode();return;}
+  if(!_chartBars.length){
+    Plotly.purge('chart');
+    document.getElementById('chart').innerHTML=
+      `<div class="d-flex align-items-center justify-content-center h-100 text-muted">No history data for ${_graphSym}</div>`;
     return;
   }
-  const prices = _barsProfile.map(p=>p.price);
-  const counts = _barsProfile.map(p=>p.count);
+  const bars=filteredBars();
+  document.getElementById('bar-count').textContent=bars.length+' bars';
+  const yLow=Math.min(...bars.map(b=>b.low));
+  const yHigh=Math.max(...bars.map(b=>b.high));
+  const yPad=(yHigh-yLow)*0.07;
+  document.getElementById('sb-bars').textContent=bars.length;
+  document.getElementById('sb-low').textContent=yLow.toFixed(2);
+  document.getElementById('sb-high').textContent=yHigh.toFixed(2);
+  let barTrace;
+  if(_graphMode==='line'){
+    barTrace={type:'scatter',mode:'lines',x:bars.map(b=>b.t),y:bars.map(b=>b.close),
+      name:_graphSym,line:{color:'#7db3d8',width:1.5},showlegend:false};
+  }else{
+    barTrace={type:'candlestick',x:bars.map(b=>b.t),
+      open:bars.map(b=>b.open),high:bars.map(b=>b.high),
+      low:bars.map(b=>b.low),close:bars.map(b=>b.close),name:_graphSym,
+      increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}},showlegend:false};
+  }
+  const lineTraces=buildLineTraces(bars);
+  const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
+    font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
+    xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
+    yaxis:{range:[yLow-yPad,yHigh+yPad],gridcolor:'#333'},
+    annotations:buildAnnotations(bars),showlegend:false,dragmode:'zoom'};
+  _applyZoom(layout);
+  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
+  _attachChartHandlers();
+}
+
+function drawBarsMode(){
+  const chartEl=document.getElementById('chart');
+  if(!_barsProfile.length){
+    Plotly.purge('chart');
+    chartEl.innerHTML=`<div class="d-flex align-items-center justify-content-center h-100 text-muted">No volume data for ${_graphSym}</div>`;
+    return;
+  }
+  document.getElementById('bar-count').textContent=_barsProfile.length+' price levels';
+  const prices=_barsProfile.map(p=>p.price);
+  const counts=_barsProfile.map(p=>p.count);
   const barTrace={type:'bar',x:prices,y:counts,
     marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
     hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
-  const lineTraces = _barsLineTraces();
-  const layout={
-    paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
-    font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
-    bargap:0.05,
+  const lineTraces=buildBarsLineTraces();
+  const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
+    font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},bargap:0.05,
     xaxis:{gridcolor:'#333',title:{text:'Price',font:{size:10}}},
     yaxis:{gridcolor:'#333',title:{text:'Ticks',font:{size:10}}},
-    annotations:_barsAnnotations(),
-    showlegend:false
-  };
-  Plotly.newPlot('bars-chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
-  chartEl.on('plotly_click',function(evtData){
-    const cn=evtData.points[0].curveNumber;
-    if(cn===0) return;
-    const line=_visBarsLines[cn-1];
-    if(!line) return;
-    const wasArmed=line._armed!==undefined?line._armed:!!line.armed;
-    line._armed=!wasArmed;
-    fetch(`/api/lines/${line.id}`,{method:'PATCH',
-      headers:{'Content-Type':'application/json'},
-      body:JSON.stringify({armed:line._armed?1:0})});
-    drawBarsChart();
-  });
+    annotations:buildBarsAnnotations(),showlegend:false,dragmode:'zoom'};
+  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
+  _attachChartHandlers();
 }
 
-function redrawBarsLines(){
-  if(_barsProfile.length) drawBarsChart();
+function resetZoom(){
+  _graphZoomState=null;
+  try{Plotly.relayout('chart',{'xaxis.autorange':true,'yaxis.autorange':true});}catch(_){}
 }
 
-async function navBarsDay(delta){
-  if(!_analyzedDates.length) return;
-  _analyzedIdx=Math.max(0,Math.min(_analyzedDates.length-1,_analyzedIdx+delta));
-  document.getElementById('shared-date-input').value=_analyzedDates[_analyzedIdx];
-  _updateDayInfo();
-  await loadBars();
+function redrawLines(){
+  if(_graphMode==='bars'){if(_barsProfile.length)drawBarsMode();}
+  else{if(_chartBars.length)drawChart();}
 }
 
-function navBarsSym(delta){
-  const syms=['MES','MNQ','MYM','M2K'];
-  const next=syms[(syms.indexOf(_barsSym)+delta+syms.length)%syms.length];
-  document.querySelectorAll('#bars-sym-pills .nav-link').forEach(btn=>{
-    if(btn.textContent===next) btn.click();
-  });
-}
+document.getElementById('btn-graph-tab').addEventListener('click',function(){
+  initGraphAndLoad();
+});
 
-// ── CREATE TRADES ────────────────────────────────────────────────────────────
+// ── CREATE TRADES ─────────────────────────────────────────────────────────────
 let _candidates=[];
 
 async function createTrades(){
   _enterBusy();
-  const syms     = checkedVals('sym-trades');
-  const brackets = [...document.querySelectorAll('.bkt-chk:checked')].map(e=>parseFloat(e.value));
-  const ms       = parseInt(document.getElementById('min-str-trades').value)||1;
-  document.getElementById('trades-msg').textContent='Generating…';
+  const syms=checkedVals('sym-trades');
+  const brackets=[...document.querySelectorAll('.bkt-chk:checked')].map(e=>parseFloat(e.value));
+  const ms=parseInt(document.getElementById('min-str-trades').value)||1;
+  document.getElementById('trades-msg').textContent='Generating...';
   try{
-    const d = await (await fetch('/api/trades/create',{method:'POST',
+    const d=await (await fetch('/api/trades/create',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({symbols:syms,brackets,min_strength:ms})})).json();
     _candidates=d.candidates||[];
-    document.getElementById('ctr-total').textContent   ='Total: '+d.total;
-    document.getElementById('ctr-passed').textContent  ='Passed: '+d.passed;
+    document.getElementById('ctr-total').textContent='Total: '+d.total;
+    document.getElementById('ctr-passed').textContent='Passed: '+d.passed;
     document.getElementById('ctr-filtered').textContent='Filtered: '+d.filtered;
-    document.getElementById('ctr-syms').textContent    ='Symbols: '+(d.symbols_covered||[]).join(', ');
+    document.getElementById('ctr-syms').textContent='Symbols: '+(d.symbols_covered||[]).join(', ');
     const btn=document.getElementById('btn-submit');
     btn.textContent=`Submit ${_candidates.length} Trades`;
     btn.disabled=_candidates.length===0;
     document.getElementById('trades-msg').textContent='';
     renderTrades(_candidates);
-  }catch(e){ document.getElementById('trades-msg').textContent='Error: '+e; }
-  finally{ _exitBusy(); }
+  }catch(e){document.getElementById('trades-msg').textContent='Error: '+e;}
+  finally{_exitBusy();}
 }
 
 function renderTrades(cands){
@@ -1919,7 +1939,7 @@ function renderTrades(cands){
 }
 
 async function submitTrades(){
-  if(!_candidates.length) return;
+  if(!_candidates.length)return;
   _enterBusy();
   const btn=document.getElementById('btn-submit');
   btn.disabled=true;
@@ -1927,15 +1947,14 @@ async function submitTrades(){
     const d=await (await fetch('/api/trades/submit',{method:'POST',
       headers:{'Content-Type':'application/json'},
       body:JSON.stringify({candidates:_candidates})})).json();
-    document.getElementById('trades-msg').textContent=`Submitted ${d.submitted} ✓`;
-    _candidates=[];
-    btn.textContent='Submit 0 Trades';
+    document.getElementById('trades-msg').textContent=`Submitted ${d.submitted}`;
+    _candidates=[];btn.textContent='Submit 0 Trades';
     document.getElementById('trades-tbody').innerHTML='';
-  }catch(e){ document.getElementById('trades-msg').textContent='Error: '+e; btn.disabled=false; }
-  finally{ _exitBusy(); }
+  }catch(e){document.getElementById('trades-msg').textContent='Error: '+e;btn.disabled=false;}
+  finally{_exitBusy();}
 }
 
-// ── SUBMITTED ────────────────────────────────────────────────────────────────
+// ── SUBMITTED ─────────────────────────────────────────────────────────────────
 let _autoRefTimer=null;
 
 async function loadSubmitted(){
@@ -1952,7 +1971,7 @@ async function loadSubmitted(){
         <td class="font-monospace">${fmt(r.entry_price)}</td>
         <td class="font-monospace">${fmt(r.tp_price)}</td>
         <td class="font-monospace">${fmt(r.sl_price)}</td>
-        <td>${r.bracket||'—'}</td>
+        <td>${r.bracket||'--'}</td>
         <td><span class="badge bg-${bc}">${r.status}</span></td>
         <td class="font-monospace">${fmt(r.fill_price)}</td>
         <td class="text-muted small">${(r.updated_at||'').slice(11,16)}</td>`;
@@ -1969,87 +1988,11 @@ function toggleAutoRef(){
 
 document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
 
-function _lastWeekday(){
-  const d = new Date();
-  d.setDate(d.getDate() - 1);
-  while(d.getDay() === 0 || d.getDay() === 6) d.setDate(d.getDate() - 1);
-  return d.toISOString().split('T')[0];
-}
-
-function loadLastDay(){
-  document.getElementById('shared-date-input').value = _lastWeekday();
-  onSharedDateChange();
-}
-
-// ── BUILD LINES DB ───────────────────────────────────────────────────────────
-let _buildPollTimer = null;
-
-async function buildLinesDB(force){
-  _enterBusy();
-  try{
-    const r = await (await fetch('/api/build_db',{
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({force})
-    })).json();
-    if(r.error){
-      document.getElementById('build-db-msg').textContent = '⚠ '+r.error;
-      return;
-    }
-    document.getElementById('build-db-panel').style.display = 'block';
-    document.getElementById('build-db-msg').textContent = 'Starting…';
-    document.getElementById('build-db-bar').style.width = '0%';
-    document.getElementById('build-db-tbody').innerHTML = '';
-    if(_buildPollTimer) clearInterval(_buildPollTimer);
-    _buildPollTimer = setInterval(_pollBuildStatus, 800);
-  }catch(e){ console.error(e); }
-  finally{ _exitBusy(); }
-}
-
-async function _pollBuildStatus(){
-  try{
-    const s = await (await fetch('/api/build_db/status')).json();
-    const pct = s.total > 0 ? Math.round(s.done / s.total * 100) : 0;
-    document.getElementById('build-db-bar').style.width = pct+'%';
-    document.getElementById('build-db-msg').textContent = s.running
-      ? (s.current ? s.current+' ('+s.done+'/'+s.total+')' : 'Running…')
-      : ('Done — '+s.done+'/'+s.total+' processed');
-    _renderBuildTable(s.log);
-    if(!s.running && _buildPollTimer){
-      clearInterval(_buildPollTimer);
-      _buildPollTimer = null;
-    }
-  }catch(e){ console.error(e); }
-}
-
-function _renderBuildTable(log){
-  const SYMS = ['MES','MNQ','MYM','M2K'];
-  const byDate = {};
-  for(const e of log){
-    if(!byDate[e.date]) byDate[e.date] = {};
-    byDate[e.date][e.symbol] = e;
-  }
-  const dates = Object.keys(byDate).sort().reverse();
-  const html = dates.map(d => {
-    const cells = SYMS.map(sym => {
-      const e = byDate[d]?.[sym];
-      if(!e) return '<td class="text-muted text-center">…</td>';
-      if(e.action==='done')   return `<td class="text-success text-center">✓ ${e.count}</td>`;
-      if(e.action==='skip')   return `<td class="text-muted text-center">↷ ${e.count}</td>`;
-      if(e.action==='no_csv') return '<td class="text-warning text-center">no csv</td>';
-      if(e.action==='no_rth') return '<td class="text-warning text-center">no rth</td>';
-      return '<td class="text-danger text-center">?</td>';
-    }).join('');
-    return `<tr><td>${d}</td>${cells}</tr>`;
-  }).join('');
-  document.getElementById('build-db-tbody').innerHTML = html;
-}
-
-// Initial load — set shared date picker to last market calendar day, max = today
+// ── Init ──────────────────────────────────────────────────────────────────────
 (function(){
-  const today = new Date().toISOString().split('T')[0];
-  const el = document.getElementById('shared-date-input');
-  el.max = today;
-  el.value = _lastWeekday();
+  const lw=_lastWeekday();
+  document.getElementById('range-from').value=lw;
+  document.getElementById('range-to').value=lw;
   refreshLines();
 })();
 </script>
@@ -2060,14 +2003,14 @@ function _renderBuildTable(log){
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Trading Dashboard — port 5003")
+    parser = argparse.ArgumentParser(description="Trading Dashboard -- port 5003")
     parser.add_argument("--port",  type=int, default=5003)
     parser.add_argument("--host",  default="0.0.0.0")
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
         if _s.connect_ex(("127.0.0.1", args.port)) == 0:
-            print(f"[trading_dashboard] port {args.port} already in use — exiting"); sys.exit(0)
+            print(f"[trading_dashboard] port {args.port} already in use -- exiting"); sys.exit(0)
     print(f"Trading Dashboard -> http://{args.host}:{args.port}")
     print(f"LAN access        -> http://192.168.1.132:{args.port}")
     app.run(host=args.host, port=args.port, debug=args.debug)
