@@ -193,21 +193,32 @@ def _load_ticks(symbol: str, d: date) -> list | None:
     return rows or None
 
 
-def _ohlcv_bars(ticks: list, interval_min: int = 5) -> list:
-    bars: dict = {}
+def _ohlcv_bars(ticks: list, interval_min: float = 5) -> list:
+    bars: dict       = {}
+    is_sub_min       = interval_min < 1
+    interval_sec     = max(1, int(round(interval_min * 60)))
+    interval_min_int = max(1, int(interval_min))
     for (t_min, price, iso) in ticks:
-        date_part  = iso[:10]                                  # "YYYY-MM-DD" from the CT timestamp
-        bucket_min = (t_min // interval_min) * interval_min
-        key = (date_part, bucket_min)
+        date_part = iso[:10]                                    # "YYYY-MM-DD" from CT timestamp
+        if is_sub_min:
+            try:
+                ts        = iso[11:19]                          # "HH:MM:SS"
+                t_abs_sec = int(ts[0:2]) * 3600 + int(ts[3:5]) * 60 + int(ts[6:8])
+            except (ValueError, IndexError):
+                t_abs_sec = t_min * 60
+            bucket_sec = (t_abs_sec // interval_sec) * interval_sec
+        else:
+            bucket_sec = (t_min // interval_min_int) * interval_min_int * 60
+        key = (date_part, bucket_sec)
         if key not in bars:
-            bars[key] = {"date": date_part, "t_min": bucket_min, "iso": iso,
+            bars[key] = {"date": date_part, "t_sec": bucket_sec, "iso": iso,
                          "open": price, "high": price, "low": price, "close": price, "vol": 0}
         b = bars[key]
         b["high"]  = max(b["high"], price)
         b["low"]   = min(b["low"],  price)
         b["close"] = price
         b["vol"]  += 1
-    return sorted(bars.values(), key=lambda x: (x["date"], x["t_min"]))
+    return sorted(bars.values(), key=lambda x: (x["date"], x["t_sec"]))
 
 
 # ── Line generation ────────────────────────────────────────────────────────────
@@ -649,7 +660,7 @@ def api_last_data_date():
 @app.route("/api/history/<symbol>")
 def api_history(symbol: str):
     req_date_str = request.args.get("date")
-    interval     = int(request.args.get("interval", 5))
+    interval     = float(request.args.get("interval", 5))
     start        = date.fromisoformat(req_date_str) if req_date_str else (date.today() - timedelta(days=1))
 
     ticks, used_date = None, None
@@ -669,11 +680,12 @@ def api_history(symbol: str):
         return jsonify({"bars": [], "date": None, "symbol": symbol, "error": "no data"})
 
     rth_bars = [b for b in _ohlcv_bars(ticks, interval)
-                if _RTH_START_MIN <= b["t_min"] < _RTH_END_MIN]
+                if _RTH_START_MIN * 60 <= b["t_sec"] < _RTH_END_MIN * 60]
     bars = []
     for b in rth_bars:
-        hh, mm = b["t_min"] // 60, b["t_min"] % 60
-        bars.append({"t": f"{b['date']}T{hh:02d}:{mm:02d}:00",
+        t  = b["t_sec"]
+        hh, mm, ss = t // 3600, (t % 3600) // 60, t % 60
+        bars.append({"t": f"{b['date']}T{hh:02d}:{mm:02d}:{ss:02d}",
                      "open": b["open"], "high": b["high"],
                      "low":  b["low"],  "close": b["close"], "vol": b["vol"]})
 
@@ -890,7 +902,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.4</span>
+  <span class="badge bg-secondary">v2.5</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -901,7 +913,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.4</span>
+    <span class="badge bg-secondary">v2.5</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
@@ -1042,6 +1054,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <button id="btn-range-1h"  class="btn btn-outline-secondary"        onclick="setGraphRange('1h',this)">Last 1h</button>
     </div>
     <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-int-30s" class="btn btn-outline-secondary"        onclick="setGraphInterval(0.5,this)">30s</button>
       <button id="btn-int-1"  class="btn btn-outline-secondary"        onclick="setGraphInterval(1,this)">1m</button>
       <button id="btn-int-5"  class="btn btn-outline-secondary active" onclick="setGraphInterval(5,this)">5m</button>
       <button id="btn-int-15" class="btn btn-outline-secondary"        onclick="setGraphInterval(15,this)">15m</button>
@@ -1065,7 +1078,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     </div>
   </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
-    ⚠ No data for selected date — loaded <strong id="mock-date-graph"></strong>
+    ⚠ No data for <strong id="mock-req-graph"></strong> — showing <strong id="mock-date-graph"></strong>
   </div>
   <div class="d-flex gap-4 align-items-center px-1 mb-1 small text-muted">
     <span>Trades&nbsp;<b id="sb-trades" class="text-info">—</b></span>
@@ -1115,7 +1128,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     </div>
   </div>
   <div id="mock-banner-bars" class="alert alert-warning py-1 px-2 mb-1 small" style="display:none">
-    ⚠ No data for selected date — loaded <strong id="mock-date-bars"></strong>
+    ⚠ No data for <strong id="mock-req-bars"></strong> — showing <strong id="mock-date-bars"></strong>
   </div>
   <div id="bars-chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
   <div class="d-flex gap-3 mt-2 flex-wrap small">
@@ -1369,7 +1382,7 @@ function setGraphRange(range, btn){
 
 function setGraphInterval(min, btn){
   _graphInterval = min;
-  document.querySelectorAll('#btn-int-1,#btn-int-5,#btn-int-15,#btn-int-30').forEach(b=>b.classList.remove('active'));
+  document.querySelectorAll('#btn-int-30s,#btn-int-1,#btn-int-5,#btn-int-15,#btn-int-30').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   loadGraph();
 }
@@ -1398,7 +1411,10 @@ async function loadGraph(){
     _chartBars = br.bars||[];
     const mock = br.mock_date;
     document.getElementById('mock-banner-graph').style.display=mock?'block':'none';
-    if(mock) document.getElementById('mock-date-graph').textContent=mock;
+    if(mock){
+      document.getElementById('mock-req-graph').textContent  = reqDate||'selected date';
+      document.getElementById('mock-date-graph').textContent = mock;
+    }
     document.getElementById('sb-trades').textContent =
       br.total_ticks!=null ? br.total_ticks.toLocaleString() : '—';
 
@@ -1641,7 +1657,10 @@ async function loadBars(){
 
     const mock = d.mock_date;
     document.getElementById('mock-banner-bars').style.display = mock?'block':'none';
-    if(mock) document.getElementById('mock-date-bars').textContent = mock;
+    if(mock){
+      document.getElementById('mock-req-bars').textContent  = reqDate||'selected date';
+      document.getElementById('mock-date-bars').textContent = mock;
+    }
     document.getElementById('bars-info').textContent =
       _barsProfile.length ? `${_barsProfile.length} price levels` : 'No data';
 
@@ -1845,27 +1864,17 @@ function _lastWeekday(){
   return d.toISOString().split('T')[0];
 }
 
-async function loadLastDay(){
-  _enterBusy();
-  try{
-    const d = await (await fetch('/api/last_data_date')).json();
-    document.getElementById('shared-date-input').value = d.date || _lastWeekday();
-  }catch(e){
-    document.getElementById('shared-date-input').value = _lastWeekday();
-  }finally{ _exitBusy(); }
+function loadLastDay(){
+  document.getElementById('shared-date-input').value = _lastWeekday();
+  onSharedDateChange();
 }
 
-// Initial load — set shared date picker to last actual data date, max = today
-(async function(){
+// Initial load — set shared date picker to last market calendar day, max = today
+(function(){
   const today = new Date().toISOString().split('T')[0];
   const el = document.getElementById('shared-date-input');
   el.max = today;
-  try{
-    const d = await (await fetch('/api/last_data_date')).json();
-    el.value = d.date || _lastWeekday();
-  }catch(e){
-    el.value = _lastWeekday();
-  }
+  el.value = _lastWeekday();
   refreshLines();
 })();
 </script>
