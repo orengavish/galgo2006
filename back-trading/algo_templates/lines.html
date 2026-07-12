@@ -1,0 +1,205 @@
+{% extends "base.html" %}
+{% block title %}Lines — Algo{% endblock %}
+
+{% block content %}
+<style>
+.line-form{display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;
+           background:#161b22;border:1px solid #30363d;border-radius:6px;padding:14px}
+.form-group{display:flex;flex-direction:column;gap:4px}
+.form-group label{font-size:10px;color:#6e7681;text-transform:uppercase;letter-spacing:.5px}
+.form-group input,.form-group select{width:120px}
+.form-group input.wide{width:160px}
+.armed-badge{display:inline-block;padding:1px 6px;border-radius:8px;font-size:10px;font-weight:bold;cursor:pointer}
+.armed-on{background:#1a4731;color:#3fb950}
+.armed-off{background:#21262d;color:#6e7681}
+.lt-supp{color:#3fb950}
+.lt-resi{color:#f85149}
+</style>
+
+<h2>Critical Lines</h2>
+
+<!-- Add line form -->
+<div class="line-form" style="margin-bottom:14px">
+  <div class="form-group">
+    <label>Symbol</label>
+    <select id="f-sym">
+      {% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+    </select>
+  </div>
+  <div class="form-group">
+    <label>Date</label>
+    <input type="text" id="f-date" placeholder="2026-07-07" class="wide">
+  </div>
+  <div class="form-group">
+    <label>Type</label>
+    <select id="f-type">
+      <option value="SUPPORT">SUPPORT</option>
+      <option value="RESISTANCE">RESISTANCE</option>
+    </select>
+  </div>
+  <div class="form-group">
+    <label>Price</label>
+    <input type="number" id="f-price" step="0.25" placeholder="5510.00">
+  </div>
+  <div class="form-group">
+    <label>Strength</label>
+    <select id="f-strength">
+      <option value="1">1 — Weak</option>
+      <option value="2" selected>2 — Normal</option>
+      <option value="3">3 — Strong</option>
+    </select>
+  </div>
+  <div class="form-group">
+    <label>&nbsp;</label>
+    <button class="btn-primary" onclick="addLine()" id="btn-add">+ Add Line</button>
+  </div>
+  <span class="msg" id="add-msg"></span>
+</div>
+
+<!-- Filter row -->
+<div style="display:flex;gap:10px;align-items:center;margin-bottom:8px">
+  <span style="font-size:11px;color:#6e7681">Filter:</span>
+  <select id="fil-sym" onchange="loadLines()">
+    <option value="">All symbols</option>
+    {% for s in symbols %}<option value="{{ s }}">{{ s }}</option>{% endfor %}
+  </select>
+  <label style="font-size:11px;color:#8b949e;display:flex;align-items:center;gap:4px;cursor:pointer">
+    <input type="checkbox" id="fil-armed" checked onchange="loadLines()" style="accent-color:#58a6ff">
+    Armed only
+  </label>
+</div>
+
+<!-- Lines table -->
+<div class="card" style="padding:10px">
+  <div style="overflow-x:auto">
+    <table>
+      <thead>
+        <tr>
+          <th>ID</th><th>Symbol</th><th>Date</th><th>Type</th>
+          <th>Price</th><th>Str</th><th>Armed</th><th>Actions</th>
+        </tr>
+      </thead>
+      <tbody id="lines-body">
+        <tr><td colspan="8" style="text-align:center;color:#6e7681;padding:20px">Loading…</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+// Set date default to today
+(function(){
+  const d = new Date();
+  const s = d.toISOString().slice(0,10);
+  document.getElementById('f-date').value = s;
+})();
+
+function ltClass(t){
+  return t==='SUPPORT'?'lt-supp':'lt-resi';
+}
+
+function lineRow(r){
+  const armedCls = r.armed ? 'armed-on' : 'armed-off';
+  const armedLbl = r.armed ? 'ARMED' : 'off';
+  const lt = r.line_type.slice(0,4);  // SUPP/RESI
+  return `<tr>
+    <td style="color:#6e7681">${r.id}</td>
+    <td style="font-weight:bold">${r.symbol}</td>
+    <td>${r.date}</td>
+    <td><span class="${ltClass(r.line_type)}">${lt}</span></td>
+    <td style="font-weight:bold">${parseFloat(r.price).toFixed(2)}</td>
+    <td style="color:#8b949e">${r.strength}</td>
+    <td>
+      <span class="armed-badge ${armedCls}"
+            onclick="toggleArm(${r.id}, ${r.armed})"
+            title="Click to toggle">${armedLbl}</span>
+    </td>
+    <td>
+      <button class="btn-danger" onclick="deleteLine(${r.id})"
+              style="font-size:10px;padding:2px 8px">Del</button>
+    </td>
+  </tr>`;
+}
+
+async function loadLines(){
+  const sym   = document.getElementById('fil-sym').value;
+  const armed = document.getElementById('fil-armed').checked;
+  let qs = '';
+  if(sym) qs += `?symbol=${sym}`;
+  if(armed) qs += (qs?'&':'?') + 'armed=1';
+  try {
+    const r = await fetch('/api/algo/lines' + qs);
+    const data = await r.json();
+    const tbody = document.getElementById('lines-body');
+    tbody.innerHTML = data.length
+      ? data.map(lineRow).join('')
+      : '<tr><td colspan="8" style="text-align:center;color:#6e7681;padding:20px">No lines</td></tr>';
+  } catch(e){ console.error(e); }
+}
+
+async function addLine(){
+  const sym   = document.getElementById('f-sym').value;
+  const date  = document.getElementById('f-date').value.trim();
+  const type  = document.getElementById('f-type').value;
+  const price = parseFloat(document.getElementById('f-price').value);
+  const str   = parseInt(document.getElementById('f-strength').value);
+  const msg   = document.getElementById('add-msg');
+  const btn   = document.getElementById('btn-add');
+
+  if(!date || isNaN(price)){
+    msg.textContent = 'Date and price required.';
+    msg.className = 'msg err';
+    return;
+  }
+
+  btn.disabled = true;
+  msg.textContent = '';
+  try {
+    const r = await fetch('/api/algo/lines', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({symbol: sym, date, line_type: type, price, strength: str})
+    });
+    const d = await r.json();
+    if(d.ok){
+      msg.textContent = `Added id=${d.id}`;
+      msg.className = 'msg ok';
+      document.getElementById('f-price').value = '';
+      loadLines();
+    } else {
+      msg.textContent = d.error || 'Error';
+      msg.className = 'msg err';
+    }
+  } catch(e){
+    msg.textContent = e.message;
+    msg.className = 'msg err';
+  }
+  btn.disabled = false;
+}
+
+async function toggleArm(id, currentArmed){
+  const newArmed = currentArmed ? 0 : 1;
+  try {
+    await fetch(`/api/algo/lines/${id}/arm`, {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({armed: newArmed === 1})
+    });
+    loadLines();
+  } catch(e){ console.error(e); }
+}
+
+async function deleteLine(id){
+  if(!confirm(`Delete line #${id}?`)) return;
+  try {
+    await fetch(`/api/algo/lines/${id}`, {method:'DELETE'});
+    loadLines();
+  } catch(e){ console.error(e); }
+}
+
+loadLines();
+setInterval(loadLines, 15000);
+</script>
+{% endblock %}
