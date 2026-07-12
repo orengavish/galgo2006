@@ -888,7 +888,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v1.7</span>
+  <span class="badge bg-secondary">v2.1</span>
 </nav>
 
 <div class="container-fluid py-2">
