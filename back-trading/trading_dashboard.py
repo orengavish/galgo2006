@@ -677,9 +677,11 @@ def api_history(symbol: str):
                      "open": b["open"], "high": b["high"],
                      "low":  b["low"],  "close": b["close"], "vol": b["vol"]})
 
+    total_ticks = sum(b["vol"] for b in rth_bars)
     mock = used_date.isoformat() if used_date != start else None
     return jsonify({"bars": bars, "date": used_date.isoformat(),
-                    "symbol": symbol, "mock_date": mock})
+                    "symbol": symbol, "mock_date": mock,
+                    "total_ticks": total_ticks})
 
 
 @app.route("/api/volume_profile/<symbol>")
@@ -888,7 +890,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.1</span>
+  <span class="badge bg-secondary">v2.2</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -899,7 +901,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.1</span>
+    <span class="badge bg-secondary">v2.2</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
@@ -1064,6 +1066,12 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   </div>
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small">
     ⚠ No data for selected date — loaded <strong id="mock-date-graph"></strong>
+  </div>
+  <div class="d-flex gap-4 align-items-center px-1 mb-1 small text-muted">
+    <span>Trades&nbsp;<b id="sb-trades" class="text-info">—</b></span>
+    <span>Bars&nbsp;<b id="sb-bars" class="text-light">—</b></span>
+    <span>Low&nbsp;<b id="sb-low" class="text-success">—</b></span>
+    <span>High&nbsp;<b id="sb-high" class="text-danger fw-bold">—</b></span>
   </div>
   <div id="chart" style="width:100%;height:460px;background:#1a1a2e;border-radius:4px;"></div>
   <div class="d-flex gap-3 mt-2 flex-wrap small">
@@ -1395,6 +1403,8 @@ async function loadGraph(){
     const mock = br.mock_date;
     document.getElementById('mock-banner-graph').style.display=mock?'block':'none';
     if(mock) document.getElementById('mock-date-graph').textContent=mock;
+    document.getElementById('sb-trades').textContent =
+      br.total_ticks!=null ? br.total_ticks.toLocaleString() : '—';
 
     const ms = parseInt(document.getElementById('min-str-lines').value)||1;
     const lineDate = reqDate || br.date || '';
@@ -1458,6 +1468,11 @@ function drawChart(){
   const yLow  = Math.min(...bars.map(b => b.low));
   const yHigh = Math.max(...bars.map(b => b.high));
   const yPad  = (yHigh - yLow) * 0.07;
+
+  // Sanity bar
+  document.getElementById('sb-bars').textContent = bars.length;
+  document.getElementById('sb-low').textContent  = yLow.toFixed(2);
+  document.getElementById('sb-high').textContent = yHigh.toFixed(2);
 
   let barTrace;
   if(_graphMode==='line'){
@@ -1866,7 +1881,6 @@ async function loadLastDay(){
   }catch(e){
     document.getElementById('shared-date-input').value = _lastWeekday();
   }finally{ _exitBusy(); }
-  await createLines();
 }
 
 // Initial load — set shared date picker to last actual data date, max = today
