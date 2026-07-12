@@ -890,7 +890,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v2.3</span>
+  <span class="badge bg-secondary">v2.4</span>
 </nav>
 
 <div class="container-fluid py-2">
@@ -901,7 +901,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v2.3</span>
+    <span class="badge bg-secondary">v2.4</span>
   </li>
 </ul>
 <div class="d-flex align-items-center gap-2 mb-2">
@@ -1104,10 +1104,6 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('MYM',this)">MYM</button></li>
       <li class="nav-item"><button class="nav-link" onclick="selectBarsSym('M2K',this)">M2K</button></li>
     </ul>
-    <div class="btn-group btn-group-sm" role="group">
-      <button id="btn-bars-px"    class="btn btn-outline-secondary active" onclick="setBarsTranspose(false,this)">Price X</button>
-      <button id="btn-bars-trans" class="btn btn-outline-secondary"        onclick="setBarsTranspose(true,this)">Transpose</button>
-    </div>
     <span id="bars-info" class="small text-muted ms-1"></span>
     <div id="bars-nav" class="d-flex align-items-center gap-1 ms-auto" style="display:none">
       <button class="btn btn-sm btn-outline-secondary px-2" title="Prev symbol" onclick="navBarsSym(-1)">◀S</button>
@@ -1407,7 +1403,8 @@ async function loadGraph(){
       br.total_ticks!=null ? br.total_ticks.toLocaleString() : '—';
 
     const ms = parseInt(document.getElementById('min-str-lines').value)||1;
-    const lineDate = reqDate || br.date || '';
+    // Only use historical date for lines when Analyze All has been run; otherwise use today's lines
+    const lineDate = _analyzedDates.length > 0 ? (reqDate || br.date || '') : '';
     const linesUrl = `/api/lines?symbol=${_graphSym}&min_strength=${ms}` + (lineDate?`&date=${lineDate}`:'');
     _chartLines = await (await fetch(linesUrl)).json();
     drawChart();
@@ -1616,20 +1613,13 @@ document.querySelectorAll('#mainTab .nav-link:not(#btn-graph-tab):not(#btn-bars-
 });
 
 // ── BARS (Volume Profile) ────────────────────────────────────────────────────
-let _barsSym='MES', _barsProfile=[], _barsBarsLines=[], _barsTransposed=false, _visBarsLines=[];
+let _barsSym='MES', _barsProfile=[], _barsBarsLines=[], _visBarsLines=[];
 
 function selectBarsSym(sym, btn){
   _barsSym = sym;
   document.querySelectorAll('#bars-sym-pills .nav-link').forEach(b=>b.classList.remove('active'));
   btn.classList.add('active');
   loadBars();
-}
-
-function setBarsTranspose(on, btn){
-  _barsTransposed = on;
-  document.querySelectorAll('#btn-bars-px,#btn-bars-trans').forEach(b=>b.classList.remove('active'));
-  btn.classList.add('active');
-  drawBarsChart();
 }
 
 function enabledBarsSources(){
@@ -1656,7 +1646,7 @@ async function loadBars(){
       _barsProfile.length ? `${_barsProfile.length} price levels` : 'No data';
 
     const ms       = parseInt(document.getElementById('min-str-lines').value)||1;
-    const lineDate = reqDate||d.date||'';
+    const lineDate = _analyzedDates.length > 0 ? (reqDate||d.date||'') : '';
     const linesUrl = `/api/lines?symbol=${_barsSym}&min_strength=${ms}`+(lineDate?`&date=${lineDate}`:'');
     _barsBarsLines = await (await fetch(linesUrl)).json();
     drawBarsChart();
@@ -1672,17 +1662,11 @@ function _barsLineTraces(){
   return _visBarsLines.map(l=>{
     const armed = l._armed!==undefined ? l._armed : !!l.armed;
     const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.35)';
-    const lw    = armed ? 2 : 1;
-    const dash  = armed ? 'solid' : 'dot';
-    if(_barsTransposed){
-      return {type:'scatter',mode:'lines',x:[0,maxCount],y:[l.price,l.price],
-        line:{color:col,width:lw,dash},name:l.algo_type,showlegend:false,
-        hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
-    } else {
-      return {type:'scatter',mode:'lines',x:[l.price,l.price],y:[0,maxCount],
-        line:{color:col,width:lw,dash},name:l.algo_type,showlegend:false,
-        hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
-    }
+    return {type:'scatter',mode:'lines',
+      x:[l.price,l.price],y:[0,maxCount],
+      line:{color:col,width:armed?3:1,dash:armed?'solid':'dot'},
+      name:l.algo_type,showlegend:false,
+      hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
   });
 }
 
@@ -1691,14 +1675,9 @@ function _barsAnnotations(){
   return _barsBarsLines.filter(l=>en.has(l.source)).map(l=>{
     const armed = l._armed!==undefined ? l._armed : !!l.armed;
     const col   = armed ? (SOURCE_COLORS[l.source]||'#888') : 'rgba(128,128,128,0.45)';
-    if(_barsTransposed){
-      return {xref:'paper',yref:'y',x:1,y:l.price,text:`${l.algo_type} ${l.price}`,
-        showarrow:false,xanchor:'right',font:{size:9,color:col}};
-    } else {
-      return {xref:'x',yref:'paper',x:l.price,y:1.0,text:l.algo_type,
-        showarrow:false,textangle:-90,xanchor:'center',yanchor:'top',
-        font:{size:8,color:col}};
-    }
+    return {xref:'x',yref:'paper',x:l.price,y:1.0,text:l.algo_type,
+      showarrow:false,textangle:-90,xanchor:'center',yanchor:'top',
+      font:{size:8,color:col}};
   });
 }
 
@@ -1711,23 +1690,16 @@ function drawBarsChart(){
   }
   const prices = _barsProfile.map(p=>p.price);
   const counts = _barsProfile.map(p=>p.count);
-  let barTrace;
-  if(_barsTransposed){
-    barTrace={type:'bar',orientation:'h',x:counts,y:prices,
-      marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
-      hovertemplate:'%{y:.2f}: %{x} ticks<extra></extra>'};
-  } else {
-    barTrace={type:'bar',x:prices,y:counts,
-      marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
-      hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
-  }
+  const barTrace={type:'bar',x:prices,y:counts,
+    marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
+    hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
   const lineTraces = _barsLineTraces();
   const layout={
     paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
     bargap:0.05,
-    xaxis:{gridcolor:'#333',title:{text:_barsTransposed?'Ticks':'Price',font:{size:10}}},
-    yaxis:{gridcolor:'#333',title:{text:_barsTransposed?'Price':'Ticks',font:{size:10}}},
+    xaxis:{gridcolor:'#333',title:{text:'Price',font:{size:10}}},
+    yaxis:{gridcolor:'#333',title:{text:'Ticks',font:{size:10}}},
     annotations:_barsAnnotations(),
     showlegend:false
   };
