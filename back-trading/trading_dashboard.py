@@ -1043,7 +1043,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.3</span>
+  <span class="badge bg-secondary">v3.4</span>
 </nav>
 
 <!-- Line detail modal -->
@@ -1094,7 +1094,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.3</span>
+    <span class="badge bg-secondary">v3.4</span>
   </li>
 </ul>
 
@@ -1977,8 +1977,11 @@ async function loadAllSymbols(){
 async function _loadOneSymAll(sym,reqDate){
   const el=document.getElementById(`chart-all-${sym}`);
   try{
-    const d=await(await fetch(`/api/history/${sym}?interval=${_allInterval}&date=${reqDate}`)).json();
-    const bars=d.bars||[];
+    const [hd,ld]=await Promise.all([
+      fetch(`/api/history/${sym}?interval=${_allInterval}&date=${reqDate}`).then(r=>r.json()),
+      fetch(`/api/lines?symbol=${sym}&date=${reqDate}`).then(r=>r.json())
+    ]);
+    const bars=hd.bars||[];
     if(!bars.length){
       Plotly.purge(el);
       el.innerHTML='<div class="d-flex align-items-center justify-content-center h-100 text-muted small">No data</div>';
@@ -1987,17 +1990,25 @@ async function _loadOneSymAll(sym,reqDate){
     const yLow=Math.min(...bars.map(b=>b.low));
     const yHigh=Math.max(...bars.map(b=>b.high));
     const yPad=(yHigh-yLow)*0.07;
-    const trace={type:'candlestick',x:bars.map(b=>b.t),
+    const x0=bars[0].t,x1=bars[bars.length-1].t;
+    const candleTrace={type:'candlestick',x:bars.map(b=>b.t),
       open:bars.map(b=>b.open),high:bars.map(b=>b.high),
       low:bars.map(b=>b.low),close:bars.map(b=>b.close),name:sym,
       increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}},
       showlegend:false};
+    const lineTraces=(Array.isArray(ld)?ld:[]).map(l=>{
+      const col=SOURCE_COLORS[l.source]||'#888';
+      return{type:'scatter',mode:'lines',x:[x0,x1],y:[l.price,l.price],
+        line:{color:col,width:2,dash:l.armed?'solid':'dot'},
+        hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`,
+        showlegend:false};
+    });
     const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
       font:{color:'#ccc',size:9},margin:{l:50,r:5,t:5,b:30},
       xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
       yaxis:{range:[yLow-yPad,yHigh+yPad],gridcolor:'#333'},
       showlegend:false,dragmode:'zoom'};
-    Plotly.newPlot(el,[trace],layout,{responsive:true,displayModeBar:false});
+    Plotly.newPlot(el,[candleTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
   }catch(e){
     el.innerHTML=`<div class="text-danger small p-2">${e}</div>`;
   }
