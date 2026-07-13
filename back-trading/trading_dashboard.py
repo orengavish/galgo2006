@@ -36,7 +36,7 @@ TICKS            = {"MES": 0.25, "MNQ": 0.25, "MYM": 1.0, "M2K": 0.10}
 DEFAULT_BRACKETS = [2.0, 4.0, 10.0]   # points
 
 _TRADER_URL = "http://127.0.0.1:5001"
-_HIST_DIR   = _ROOT / "june" / "trader" / "data" / "history"
+_HIST_DIR   = Path(r"C:\Projects\Galgo2026\june\trader\data\history")
 
 SOURCE_COLORS = {
     "ohlc":      "#4e79a7",
