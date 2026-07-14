@@ -1043,7 +1043,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.4</span>
+  <span class="badge bg-secondary">v3.5</span>
 </nav>
 
 <!-- Line detail modal -->
@@ -1094,7 +1094,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.4</span>
+    <span class="badge bg-secondary">v3.5</span>
   </li>
 </ul>
 
@@ -1611,9 +1611,10 @@ let _graphZoomState=null;
 let _graphNaturalYRange=null,_graphNaturalXRange=null;
 
 async function initGraphAndLoad(){
-  const{from,to}=_getDateRange();
   const syms=_sharedSyms();
-  const url=`/api/available_dates?date_from=${from}&date_to=${to}&symbols=${syms.join(',')}`;
+  const today=new Date().toISOString().slice(0,10);
+  const from14=new Date(Date.now()-14*86400000).toISOString().slice(0,10);
+  const url=`/api/available_dates?date_from=${from14}&date_to=${today}&symbols=${syms.join(',')}`;
   try{
     const d=await (await fetch(url)).json();
     _graphDates=d.dates||[];
