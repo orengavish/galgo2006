@@ -1081,7 +1081,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v3.10</span>
+    <span class="badge bg-secondary">v3.11</span>
   </div>
 </div>
 
@@ -1316,7 +1316,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     </div>
   </div>
   <!-- Draw mode controls (hidden in Auto mode) -->
-  <div id="draw-controls" class="d-flex align-items-center gap-2 mb-1 px-2 py-1 rounded" style="display:none!important;background:rgba(255,193,7,.07);border:1px solid rgba(255,193,7,.25)">
+  <div id="draw-controls" class="d-flex align-items-center gap-2 mb-1 px-2 py-1 rounded" style="display:none;background:rgba(255,193,7,.07);border:1px solid rgba(255,193,7,.25)">
     <span class="text-warning small">&#9998; Draw — dbl-click to add/remove</span>
     <label class="small mb-0 ms-2 user-select-none"><input type="checkbox" id="tog-auto-gray" onchange="drawChart()"> Auto (gray)</label>
     <span id="draw-dirty-dot" class="text-warning ms-1" style="display:none" title="Unsaved changes">&#9679;</span>
@@ -2158,11 +2158,14 @@ function _updateDirtyDot(){
 
 function _pixelToPrice(offsetY){
   const gd=document.getElementById('chart');
-  if(!gd._fullLayout)return null;
-  const ya=gd._fullLayout.yaxis;
+  const fl=gd._fullLayout;
+  if(!fl)return null;
+  const ya=fl.yaxis;
   if(!ya||!ya.range)return null;
   const[yMin,yMax]=ya.range;
-  const top=ya._offset||0,h=ya._length||gd.offsetHeight;
+  const top=(ya._offset!=null&&ya._offset>0)?ya._offset:(fl.margin?.t||10);
+  const h  =(ya._length >0                )?ya._length :(gd.offsetHeight-(fl.margin?.t||10)-(fl.margin?.b||40));
+  if(h<=0)return null;
   return yMax-((offsetY-top)/h)*(yMax-yMin);
 }
 function _pxTolerance(){
@@ -2176,24 +2179,32 @@ function _pxTolerance(){
 
 function _attachDblClick(){
   const el=document.getElementById('chart');
-  if(el._dblHandler)el.removeEventListener('dblclick',el._dblHandler,true);
+  if(el._dblHandler)el.removeEventListener('click',el._dblHandler,true);
+  let _dblT=0,_dblY=0;
   el._dblHandler=function(e){
     if(_drawMode!=='draw')return;
-    e.stopPropagation();e.preventDefault();
-    const price=_pixelToPrice(e.offsetY);
-    if(price===null)return;
-    const tol=_pxTolerance();
-    const idx=_manualLines.findIndex(ml=>Math.abs(ml.price-price)<=tol);
-    if(idx>=0){
-      _manualLines.splice(idx,1);
+    const now=Date.now();
+    if(now-_dblT<400&&Math.abs(e.offsetY-_dblY)<12){
+      // second click = double-click: add/remove line
+      e.stopPropagation();e.preventDefault();
+      _dblT=0;
+      const price=_pixelToPrice(e.offsetY);
+      if(price===null)return;
+      const tol=_pxTolerance();
+      const idx=_manualLines.findIndex(ml=>Math.abs(ml.price-price)<=tol);
+      if(idx>=0){
+        _manualLines.splice(idx,1);
+      }else{
+        const mid=_graphNaturalYRange?(_graphNaturalYRange[0]+_graphNaturalYRange[1])/2:price;
+        _manualLines.push({id:_manualNextId++,price,label:'',type:price>=mid?'RESISTANCE':'SUPPORT'});
+      }
+      _manualDirty=true;_updateDirtyDot();
+      drawChart();
     }else{
-      const mid=_graphNaturalYRange?(_graphNaturalYRange[0]+_graphNaturalYRange[1])/2:price;
-      _manualLines.push({id:_manualNextId++,price,label:'',type:price>=mid?'RESISTANCE':'SUPPORT'});
+      _dblT=now;_dblY=e.offsetY;
     }
-    _manualDirty=true;_updateDirtyDot();
-    drawChart();
   };
-  el.addEventListener('dblclick',el._dblHandler,true);
+  el.addEventListener('click',el._dblHandler,true);
 }
 
 function buildManualTraces(bars){
