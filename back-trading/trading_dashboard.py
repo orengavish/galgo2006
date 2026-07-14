@@ -1030,21 +1030,42 @@ body{font-size:.85rem;}
 body.busy-wait{cursor:wait!important;}
 body.busy-wait *{pointer-events:none!important;}
 body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
+#top-bar{background:#161b22;height:40px;border-bottom:1px solid #30363d;display:flex;align-items:center;padding:0 8px;gap:0;overflow:hidden}
+.top-tab{border:none!important;border-radius:0!important;background:transparent!important;color:#8b949e;font-size:.8rem;height:40px;border-bottom:2px solid transparent!important;display:flex;align-items:center;padding:0 12px;white-space:nowrap}
+.top-tab:hover{color:#ccc;background:rgba(255,255,255,.05)!important}
+.top-tab.active{color:#fff!important;border-bottom-color:#0d6efd!important}
 </style>
 </head>
 <body>
 
-<nav class="navbar navbar-dark bg-dark border-bottom px-3 py-1">
-  <span class="navbar-brand mb-0 fw-bold">Trading Dashboard</span>
-  <div class="d-flex gap-2 align-items-center flex-wrap">
+<div id="top-bar">
+  <ul class="nav mb-0 flex-shrink-0" id="mainTab" role="tablist" style="height:40px;gap:0;list-style:none;padding:0;margin:0;display:flex">
+    <li class="nav-item"><button class="nav-link top-tab active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-trades">Trades</button></li>
+    <li class="nav-item"><button class="nav-link top-tab" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Sub</button></li>
+  </ul>
+  <div class="vr mx-2 flex-shrink-0" style="height:20px;background:#30363d"></div>
+  <div class="d-flex align-items-center gap-2 small flex-shrink-0">
+    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="day" checked onchange="onDateRangeChange()"> 1D</label>
+    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="week" onchange="onDateRangeChange()"> 1W</label>
+    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="2weeks" onchange="onDateRangeChange()"> 2W</label>
+    <label class="mb-0 user-select-none"><input type="radio" name="date-range" value="custom" onchange="onDateRangeChange()"> Custom</label>
+    <input type="date" id="range-from" class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
+    <span id="range-sep" style="display:none" class="text-muted">–</span>
+    <input type="date" id="range-to"   class="form-control form-control-sm py-0" style="width:120px;display:none;font-size:.75rem;height:24px" onchange="onDateRangeChange()">
+  </div>
+  <div class="d-flex align-items-center gap-2 ms-auto flex-shrink-0">
     <span class="price-chip bg-secondary" id="chip-MES">MES —</span>
     <span class="price-chip bg-secondary" id="chip-MNQ">MNQ —</span>
     <span class="price-chip bg-secondary" id="chip-MYM">MYM —</span>
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
+    <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
+    <span class="badge bg-info text-dark">:5003</span>
+    <span class="badge bg-secondary">v3.8</span>
   </div>
-  <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.7</span>
-</nav>
+</div>
 
 <!-- Line detail modal -->
 <div class="modal fade" id="lineModal" tabindex="-1" aria-hidden="true">
@@ -1064,39 +1085,6 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 </div>
 
 <div class="container-fluid py-2">
-
-<!-- Shared controls: symbols + date range -->
-<div class="d-flex align-items-center gap-3 mb-2 pb-2 border-bottom border-secondary flex-wrap">
-  <span class="text-muted small fw-semibold">Symbols:</span>
-  <div id="shared-syms" class="d-flex gap-2">
-    <label class="small"><input class="form-check-input" type="checkbox" value="MES" checked> MES</label>
-    <label class="small"><input class="form-check-input" type="checkbox" value="MNQ" checked> MNQ</label>
-    <label class="small"><input class="form-check-input" type="checkbox" value="MYM" checked> MYM</label>
-    <label class="small"><input class="form-check-input" type="checkbox" value="M2K" checked> M2K</label>
-  </div>
-  <div class="vr"></div>
-  <span class="text-muted small fw-semibold">Date:</span>
-  <div class="d-flex align-items-center gap-2 flex-wrap">
-    <label class="small"><input type="radio" name="date-range" value="day" checked onchange="onDateRangeChange()"> Last Day</label>
-    <label class="small"><input type="radio" name="date-range" value="week" onchange="onDateRangeChange()"> Last Week</label>
-    <label class="small"><input type="radio" name="date-range" value="2weeks" onchange="onDateRangeChange()"> Last 2 Weeks</label>
-    <label class="small"><input type="radio" name="date-range" value="custom" onchange="onDateRangeChange()"> Custom:</label>
-    <input type="date" id="range-from" class="form-control form-control-sm" style="width:140px;display:none" onchange="onDateRangeChange()">
-    <span id="range-sep" style="display:none" class="text-muted small">–</span>
-    <input type="date" id="range-to"   class="form-control form-control-sm" style="width:140px;display:none" onchange="onDateRangeChange()">
-  </div>
-</div>
-
-<ul class="nav nav-tabs mb-2" id="mainTab" role="tablist">
-  <li class="nav-item"><button class="nav-link active" data-bs-toggle="tab" data-bs-target="#tab-lines">Lines</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-graph" id="btn-graph-tab">Graph</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-all" id="btn-all-tab">All Symbols</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
-  <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
-  <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.7</span>
-  </li>
-</ul>
 
 <div class="tab-content">
 
@@ -1444,7 +1432,7 @@ function _nWeekdaysBack(n){
 }
 
 // ── Shared Controls ───────────────────────────────────────────────────────────
-function _sharedSyms(){return checkedVals('shared-syms');}
+function _sharedSyms(){return['MES','MNQ','MYM','M2K'];}
 
 function _getDateRange(){
   const v=document.querySelector('input[name="date-range"]:checked')?.value||'day';
