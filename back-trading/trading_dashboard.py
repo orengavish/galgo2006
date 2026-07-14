@@ -1043,7 +1043,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.5</span>
+  <span class="badge bg-secondary">v3.6</span>
 </nav>
 
 <!-- Line detail modal -->
@@ -1094,7 +1094,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.5</span>
+    <span class="badge bg-secondary">v3.6</span>
   </li>
 </ul>
 
@@ -2143,7 +2143,7 @@ def main():
             print(f"[trading_dashboard] port {args.port} already in use -- exiting"); sys.exit(0)
     print(f"Trading Dashboard -> http://{args.host}:{args.port}")
     print(f"LAN access        -> http://192.168.1.132:{args.port}")
-    app.run(host=args.host, port=args.port, debug=args.debug)
+    app.run(host=args.host, port=args.port, debug=args.debug, threaded=True)
 
 
 if __name__ == "__main__":
