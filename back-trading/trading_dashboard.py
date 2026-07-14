@@ -1081,7 +1081,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v3.11</span>
+    <span class="badge bg-secondary">v3.12</span>
   </div>
 </div>
 
@@ -1107,24 +1107,18 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <div class="modal-dialog modal-sm">
     <div class="modal-content bg-dark border-warning">
       <div class="modal-header border-warning py-2">
-        <h6 class="modal-title text-warning font-monospace">Manual Line &mdash; <span id="ml-price-display"></span></h6>
+        <h6 class="modal-title text-warning font-monospace">&#9998; <span id="ml-price-display"></span></h6>
         <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
       </div>
       <div class="modal-body small">
-        <div class="mb-2">
-          <label class="form-label small text-muted mb-1">Label</label>
-          <input id="ml-name-input" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="e.g. Key level, Gap fill..." maxlength="60">
-        </div>
-        <div>
-          <label class="form-label small text-muted mb-1">Type</label>
-          <select id="ml-type-select" class="form-select form-select-sm bg-dark text-light border-secondary">
-            <option value="SUPPORT">Support</option>
-            <option value="RESISTANCE">Resistance</option>
-          </select>
+        <input id="ml-name-input" class="form-control form-control-sm bg-dark text-light border-secondary mb-3"
+               placeholder="Label (optional)" maxlength="60">
+        <div class="d-flex gap-2">
+          <button class="btn btn-success flex-fill fw-bold py-2" onclick="pickAndSave('SUPPORT')">&#9650; Support</button>
+          <button class="btn btn-danger  flex-fill fw-bold py-2" onclick="pickAndSave('RESISTANCE')">&#9660; Resistance</button>
         </div>
       </div>
-      <div class="modal-footer border-warning py-2">
-        <button class="btn btn-sm btn-warning" onclick="saveManualLineName()">OK</button>
+      <div class="modal-footer border-warning py-1">
         <button class="btn btn-sm btn-outline-danger" onclick="removeCurrentManualLine()">Remove</button>
         <button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
       </div>
@@ -2193,13 +2187,16 @@ function _attachDblClick(){
       const tol=_pxTolerance();
       const idx=_manualLines.findIndex(ml=>Math.abs(ml.price-price)<=tol);
       if(idx>=0){
-        _manualLines.splice(idx,1);
+        // double-click on existing line → open popup to edit/remove
+        _showManualNamePopup(_manualLines[idx]);
       }else{
         const mid=_graphNaturalYRange?(_graphNaturalYRange[0]+_graphNaturalYRange[1])/2:price;
-        _manualLines.push({id:_manualNextId++,price,label:'',type:price>=mid?'RESISTANCE':'SUPPORT'});
+        const ml={id:_manualNextId++,price,label:'',type:price>=mid?'RESISTANCE':'SUPPORT'};
+        _manualLines.push(ml);
+        _manualDirty=true;_updateDirtyDot();
+        drawChart();
+        _showManualNamePopup(ml);
       }
-      _manualDirty=true;_updateDirtyDot();
-      drawChart();
     }else{
       _dblT=now;_dblY=e.offsetY;
     }
@@ -2207,6 +2204,9 @@ function _attachDblClick(){
   el.addEventListener('click',el._dblHandler,true);
 }
 
+function _mlColor(ml){
+  return ml.type==='SUPPORT'?'#2ecc71':ml.type==='RESISTANCE'?'#e74c3c':'#f1c40f';
+}
 function buildManualTraces(bars){
   if(!_manualLines.length)return[];
   if(bars&&bars.length){
@@ -2214,20 +2214,19 @@ function buildManualTraces(bars){
     return _manualLines.map(ml=>({
       type:'scatter',mode:'lines',
       x:[x0,x1],y:[ml.price,ml.price],
-      line:{color:'#f1c40f',width:2.5,dash:'solid'},
+      line:{color:_mlColor(ml),width:2.5,dash:'solid'},
       name:`ml_${ml.id}`,
-      hovertemplate:`<b>${ml.label||'Manual'}</b> ${ml.price.toFixed(2)}<extra></extra>`,
+      hovertemplate:`<b>${ml.label||ml.type}</b> ${ml.price.toFixed(2)}<extra></extra>`,
       showlegend:false
     }));
   }
-  // bars-mode: use horizontal lines across the price (x) axis
   const xr=_graphNaturalXRange||[0,1];
   return _manualLines.map(ml=>({
     type:'scatter',mode:'lines',
     x:[xr[0],xr[1]],y:[ml.price,ml.price],
-    line:{color:'#f1c40f',width:2.5,dash:'solid'},
+    line:{color:_mlColor(ml),width:2.5,dash:'solid'},
     name:`ml_${ml.id}`,
-    hovertemplate:`<b>${ml.label||'Manual'}</b> ${ml.price.toFixed(2)}<extra></extra>`,
+    hovertemplate:`<b>${ml.label||ml.type}</b> ${ml.price.toFixed(2)}<extra></extra>`,
     showlegend:false
   }));
 }
@@ -2261,10 +2260,17 @@ function _showManualNamePopup(ml){
   document.getElementById('ml-type-select').value=ml.type||'SUPPORT';
   new bootstrap.Modal(document.getElementById('manualLineModal')).show();
 }
+function pickAndSave(type){
+  if(!_currentManualLine)return;
+  _currentManualLine.label=document.getElementById('ml-name-input').value;
+  _currentManualLine.type=type;
+  _manualDirty=true;_updateDirtyDot();
+  bootstrap.Modal.getInstance(document.getElementById('manualLineModal')).hide();
+  drawChart();
+}
 function saveManualLineName(){
   if(!_currentManualLine)return;
   _currentManualLine.label=document.getElementById('ml-name-input').value;
-  _currentManualLine.type=document.getElementById('ml-type-select').value;
   _manualDirty=true;_updateDirtyDot();
   bootstrap.Modal.getInstance(document.getElementById('manualLineModal')).hide();
   drawChart();
