@@ -556,15 +556,33 @@ def api_lines():
 
 @app.route("/api/lines/manual", methods=["POST"])
 def api_lines_manual():
-    body     = request.get_json(silent=True) or {}
+    body    = request.get_json(silent=True) or {}
+    db_path = _resolve_db()
+    _ensure_columns(db_path)
+    # batch mode: body has "lines" array
+    lines_in = body.get("lines")
+    if lines_in is not None:
+        saved = 0
+        with get_db(db_path) as con:
+            for ln in lines_in:
+                lbl   = ln.get("label", "")
+                note  = json.dumps({"label": lbl, "formula": "manual", "inputs": "", "from_date": ln.get("date", ""), "merged": []})
+                con.execute(
+                    "INSERT INTO critical_lines"
+                    " (symbol, date, line_type, price, strength, armed, source, algo_type, note)"
+                    " VALUES (?,?,?,?,?,1,'manual','MANUAL',?)",
+                    (ln.get("symbol","MES"), ln.get("date", date.today().isoformat()),
+                     ln.get("line_type","SUPPORT").upper(), float(ln.get("price",0)),
+                     int(ln.get("strength", 8)), note)
+                )
+                saved += 1
+        return jsonify({"saved": saved, "ok": True})
+    # single line (legacy)
     symbol   = body.get("symbol", "MES")
     price    = float(body.get("price", 0))
     ltype    = body.get("line_type", "SUPPORT").upper()
     strength = int(body.get("strength", 8))
     today    = date.today().isoformat()
-    db_path  = _resolve_db()
-    _ensure_columns(db_path)
-
     with get_db(db_path) as con:
         cur = con.execute(
             "INSERT INTO critical_lines"
@@ -1063,7 +1081,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v3.8</span>
+    <span class="badge bg-secondary">v3.9</span>
   </div>
 </div>
 
@@ -1079,6 +1097,53 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <div class="modal-footer border-secondary py-2">
         <button class="btn btn-sm btn-outline-warning" id="lm-toggle-btn" onclick="toggleCurrentLine()">Enable/Disable</button>
         <button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Close</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Manual line naming modal -->
+<div class="modal fade" id="manualLineModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content bg-dark border-warning">
+      <div class="modal-header border-warning py-2">
+        <h6 class="modal-title text-warning font-monospace">Manual Line &mdash; <span id="ml-price-display"></span></h6>
+        <button type="button" class="btn-close btn-close-white" data-bs-dismiss="modal"></button>
+      </div>
+      <div class="modal-body small">
+        <div class="mb-2">
+          <label class="form-label small text-muted mb-1">Label</label>
+          <input id="ml-name-input" class="form-control form-control-sm bg-dark text-light border-secondary" placeholder="e.g. Key level, Gap fill..." maxlength="60">
+        </div>
+        <div>
+          <label class="form-label small text-muted mb-1">Type</label>
+          <select id="ml-type-select" class="form-select form-select-sm bg-dark text-light border-secondary">
+            <option value="SUPPORT">Support</option>
+            <option value="RESISTANCE">Resistance</option>
+          </select>
+        </div>
+      </div>
+      <div class="modal-footer border-warning py-2">
+        <button class="btn btn-sm btn-warning" onclick="saveManualLineName()">OK</button>
+        <button class="btn btn-sm btn-outline-danger" onclick="removeCurrentManualLine()">Remove</button>
+        <button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Unsaved manual lines guard modal -->
+<div class="modal fade" id="unsavedModal" tabindex="-1" aria-hidden="true">
+  <div class="modal-dialog modal-sm">
+    <div class="modal-content bg-dark border-danger">
+      <div class="modal-header border-danger py-2">
+        <h6 class="modal-title text-danger">Unsaved manual lines</h6>
+      </div>
+      <div class="modal-body small text-muted">You have unsaved manual lines. Save to DB or discard?</div>
+      <div class="modal-footer border-danger py-2 gap-1">
+        <button class="btn btn-sm btn-success" onclick="_unsavedSave()">Save &amp; Leave</button>
+        <button class="btn btn-sm btn-outline-danger" onclick="_unsavedDiscard()">Discard</button>
+        <button class="btn btn-sm btn-secondary" data-bs-dismiss="modal">Cancel</button>
       </div>
     </div>
   </div>
@@ -1206,7 +1271,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
 
 <!-- ══════════════════════ GRAPH ══════════════════════ -->
 <div class="tab-pane fade" id="tab-graph">
-  <!-- Row 1: Sym pills | mode | interval | Reset Zoom -->
+  <!-- Row 1: Sym pills | Auto/Draw | mode | interval | Reset Zoom -->
   <div class="d-flex align-items-center flex-wrap gap-2 mb-1">
     <ul class="nav nav-pills mb-0" id="sym-pill-tabs">
       <li class="nav-item"><button class="nav-link active" onclick="selectSym('MES',this)">MES</button></li>
@@ -1214,6 +1279,10 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <li class="nav-item"><button class="nav-link" onclick="selectSym('MYM',this)">MYM</button></li>
       <li class="nav-item"><button class="nav-link" onclick="selectSym('M2K',this)">M2K</button></li>
     </ul>
+    <div class="btn-group btn-group-sm" role="group">
+      <button id="btn-drawmode-auto" class="btn btn-outline-info active" onclick="setDrawMode('auto',this)">Auto</button>
+      <button id="btn-drawmode-draw" class="btn btn-outline-warning"     onclick="setDrawMode('draw',this)">Draw</button>
+    </div>
     <div class="btn-group btn-group-sm" role="group">
       <button id="btn-mode-candle" class="btn btn-outline-secondary active" onclick="setGraphMode('candle',this)">Candle</button>
       <button id="btn-mode-line"   class="btn btn-outline-secondary"        onclick="setGraphMode('line',this)">Line</button>
@@ -1245,6 +1314,14 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
       <span id="day-info" class="small text-muted px-1" style="min-width:90px;text-align:center">&#8212;</span>
       <button class="btn btn-sm btn-outline-secondary px-2" title="Next day" onclick="navDay(1)">D&#9654;</button>
     </div>
+  </div>
+  <!-- Draw mode controls (hidden in Auto mode) -->
+  <div id="draw-controls" class="d-flex align-items-center gap-2 mb-1 px-2 py-1 rounded" style="display:none!important;background:rgba(255,193,7,.07);border:1px solid rgba(255,193,7,.25)">
+    <span class="text-warning small">&#9998; Draw — dbl-click to add/remove</span>
+    <label class="small mb-0 ms-2 user-select-none"><input type="checkbox" id="tog-auto-gray" onchange="drawChart()"> Auto (gray)</label>
+    <span id="draw-dirty-dot" class="text-warning ms-1" style="display:none" title="Unsaved changes">&#9679;</span>
+    <button class="btn btn-sm btn-success ms-auto" onclick="saveManualLines()">Save All</button>
+    <button class="btn btn-sm btn-outline-primary" onclick="sendManualLines()">Send</button>
   </div>
   <!-- Mock banner -->
   <div id="mock-banner-graph" class="alert alert-warning py-1 px-2 mb-1 small" style="display:none">
@@ -1619,6 +1696,11 @@ let _visibleLines=[];
 let _graphDates=[],_graphDateIdx=0,_graphCurrentDate=null;
 let _graphZoomState=null;
 let _graphNaturalYRange=null,_graphNaturalXRange=null;
+// ── Draw mode ─────────────────────────────────────────────────────────────────
+let _drawMode='auto'; // 'auto'|'draw'
+let _manualLines=[],_manualNextId=0,_manualDirty=false;
+let _currentManualLine=null;
+let _pendingTabTarget=null,_unsavedOnSave=null,_unsavedOnDiscard=null;
 
 async function initGraphAndLoad(){
   const syms=_sharedSyms();
@@ -1841,7 +1923,18 @@ function buildBarsAnnotations(){
 function _attachChartHandlers(){
   const el=document.getElementById('chart');
   el.on('plotly_click',function(evtData){
-    const cn=evtData.points[0].curveNumber;
+    if(!evtData?.points?.length)return;
+    const pt=evtData.points[0];
+    if(_drawMode==='draw'){
+      const nm=pt.data?.name||'';
+      if(nm.startsWith('ml_')){
+        const mlId=parseInt(nm.replace('ml_',''));
+        const ml=_manualLines.find(l=>l.id===mlId);
+        if(ml)_showManualNamePopup(ml);
+      }
+      return;
+    }
+    const cn=pt.curveNumber;
     if(cn===0)return;
     const line=_visibleLines[cn-1];
     if(line)openLinePopup(line);
@@ -1856,6 +1949,7 @@ function _attachChartHandlers(){
       _graphZoomState=null;
     }
   });
+  _attachDblClick();
 }
 
 function _applyZoom(layout){
@@ -1891,14 +1985,17 @@ function drawChart(){
       low:bars.map(b=>b.low),close:bars.map(b=>b.close),name:_graphSym,
       increasing:{line:{color:'#26a69a'}},decreasing:{line:{color:'#ef5350'}},showlegend:false};
   }
-  const lineTraces=buildLineTraces(bars);
+  const lineTraces=_drawMode==='draw'
+    ?[...buildAutoGrayTraces(bars),...buildManualTraces(bars)]
+    :buildLineTraces(bars);
+  const annotations=_drawMode==='draw'?[]:buildAnnotations(bars);
   const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},
     xaxis:{rangeslider:{visible:false},gridcolor:'#333'},
     yaxis:{range:[yLow-yPad,yHigh+yPad],gridcolor:'#333'},
-    annotations:buildAnnotations(bars),showlegend:false,dragmode:'zoom'};
+    annotations,showlegend:false,dragmode:'zoom'};
   _applyZoom(layout);
-  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
+  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false,doubleClick:false});
   _attachChartHandlers();
 }
 
@@ -1919,14 +2016,17 @@ function drawBarsMode(){
   const barTrace={type:'bar',x:prices,y:counts,
     marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
     hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
-  const lineTraces=buildBarsLineTraces();
+  const lineTraces=_drawMode==='draw'
+    ?[...buildAutoGrayTraces(null),...buildManualTraces(null)]
+    :buildBarsLineTraces();
+  const annotations=_drawMode==='draw'?[]:buildBarsAnnotations();
   const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},bargap:0.05,
     xaxis:{range:_graphNaturalXRange,gridcolor:'#333',title:{text:'Price',font:{size:10}}},
     yaxis:{gridcolor:'#333',title:{text:'Ticks',font:{size:10}}},
-    annotations:buildBarsAnnotations(),showlegend:false,dragmode:'zoom'};
+    annotations,showlegend:false,dragmode:'zoom'};
   _applyZoom(layout);
-  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false});
+  Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false,doubleClick:false});
   _attachChartHandlers();
 }
 
@@ -2027,6 +2127,184 @@ async function _loadOneSymAll(sym,reqDate){
 
 document.getElementById('btn-all-tab').addEventListener('click',function(){
   loadAllSymbols();
+});
+
+// ── DRAW MODE ─────────────────────────────────────────────────────────────────
+function setDrawMode(mode,btn){
+  if(_manualDirty&&_drawMode==='draw'&&mode==='auto'){
+    _pendingTabTarget=null;
+    _unsavedOnSave=async()=>{await saveManualLines();_applyDrawMode('auto',btn);};
+    _unsavedOnDiscard=()=>{_manualLines=[];_manualDirty=false;_applyDrawMode('auto',btn);};
+    new bootstrap.Modal(document.getElementById('unsavedModal')).show();
+    return;
+  }
+  _applyDrawMode(mode,btn);
+}
+function _applyDrawMode(mode,btn){
+  _drawMode=mode;
+  document.querySelectorAll('[id^="btn-drawmode-"]').forEach(b=>b.classList.remove('active'));
+  if(btn)btn.classList.add('active');
+  const dc=document.getElementById('draw-controls');
+  dc.style.display=mode==='draw'?'flex':'none';
+  if(mode==='draw'){_manualLines=[];_manualDirty=false;_updateDirtyDot();}
+  drawChart();
+}
+function _updateDirtyDot(){
+  document.getElementById('draw-dirty-dot').style.display=_manualDirty?'inline':'none';
+}
+
+function _pixelToPrice(offsetY){
+  const gd=document.getElementById('chart');
+  if(!gd._fullLayout)return null;
+  const ya=gd._fullLayout.yaxis;
+  if(!ya||!ya.range)return null;
+  const[yMin,yMax]=ya.range;
+  const top=ya._offset||0,h=ya._length||gd.offsetHeight;
+  return yMax-((offsetY-top)/h)*(yMax-yMin);
+}
+function _pxTolerance(){
+  const gd=document.getElementById('chart');
+  if(!gd._fullLayout)return 1;
+  const ya=gd._fullLayout.yaxis;
+  const[yMin,yMax]=(ya&&ya.range)||[0,1];
+  const h=ya._length||gd.offsetHeight;
+  return 2*(yMax-yMin)/h;
+}
+
+function _attachDblClick(){
+  const el=document.getElementById('chart');
+  if(el._dblHandler)el.removeEventListener('dblclick',el._dblHandler,true);
+  el._dblHandler=function(e){
+    if(_drawMode!=='draw')return;
+    e.stopPropagation();e.preventDefault();
+    const price=_pixelToPrice(e.offsetY);
+    if(price===null)return;
+    const tol=_pxTolerance();
+    const idx=_manualLines.findIndex(ml=>Math.abs(ml.price-price)<=tol);
+    if(idx>=0){
+      _manualLines.splice(idx,1);
+    }else{
+      const mid=_graphNaturalYRange?(_graphNaturalYRange[0]+_graphNaturalYRange[1])/2:price;
+      _manualLines.push({id:_manualNextId++,price,label:'',type:price>=mid?'RESISTANCE':'SUPPORT'});
+    }
+    _manualDirty=true;_updateDirtyDot();
+    drawChart();
+  };
+  el.addEventListener('dblclick',el._dblHandler,true);
+}
+
+function buildManualTraces(bars){
+  if(!_manualLines.length)return[];
+  if(bars&&bars.length){
+    const x0=bars[0].t,x1=bars[bars.length-1].t;
+    return _manualLines.map(ml=>({
+      type:'scatter',mode:'lines',
+      x:[x0,x1],y:[ml.price,ml.price],
+      line:{color:'#f1c40f',width:2.5,dash:'solid'},
+      name:`ml_${ml.id}`,
+      hovertemplate:`<b>${ml.label||'Manual'}</b> ${ml.price.toFixed(2)}<extra></extra>`,
+      showlegend:false
+    }));
+  }
+  // bars-mode: use horizontal lines across the price (x) axis
+  const xr=_graphNaturalXRange||[0,1];
+  return _manualLines.map(ml=>({
+    type:'scatter',mode:'lines',
+    x:[xr[0],xr[1]],y:[ml.price,ml.price],
+    line:{color:'#f1c40f',width:2.5,dash:'solid'},
+    name:`ml_${ml.id}`,
+    hovertemplate:`<b>${ml.label||'Manual'}</b> ${ml.price.toFixed(2)}<extra></extra>`,
+    showlegend:false
+  }));
+}
+function buildAutoGrayTraces(bars){
+  if(!document.getElementById('tog-auto-gray')?.checked)return[];
+  if(!_chartLines.length)return[];
+  if(bars&&bars.length){
+    const x0=bars[0].t,x1=bars[bars.length-1].t;
+    return _chartLines.map(l=>({
+      type:'scatter',mode:'lines',
+      x:[x0,x1],y:[l.price,l.price],
+      line:{color:'rgba(160,160,160,0.3)',width:1,dash:'dot'},
+      hovertemplate:`${l.algo_type} ${l.price.toFixed(2)}<extra></extra>`,
+      showlegend:false
+    }));
+  }
+  const xr=_graphNaturalXRange||[0,1];
+  return _chartLines.map(l=>({
+    type:'scatter',mode:'lines',
+    x:[xr[0],xr[1]],y:[l.price,l.price],
+    line:{color:'rgba(160,160,160,0.3)',width:1,dash:'dot'},
+    hovertemplate:`${l.algo_type} ${l.price.toFixed(2)}<extra></extra>`,
+    showlegend:false
+  }));
+}
+
+function _showManualNamePopup(ml){
+  _currentManualLine=ml;
+  document.getElementById('ml-price-display').textContent=ml.price.toFixed(2);
+  document.getElementById('ml-name-input').value=ml.label||'';
+  document.getElementById('ml-type-select').value=ml.type||'SUPPORT';
+  new bootstrap.Modal(document.getElementById('manualLineModal')).show();
+}
+function saveManualLineName(){
+  if(!_currentManualLine)return;
+  _currentManualLine.label=document.getElementById('ml-name-input').value;
+  _currentManualLine.type=document.getElementById('ml-type-select').value;
+  _manualDirty=true;_updateDirtyDot();
+  bootstrap.Modal.getInstance(document.getElementById('manualLineModal')).hide();
+  drawChart();
+}
+function removeCurrentManualLine(){
+  if(!_currentManualLine)return;
+  _manualLines=_manualLines.filter(ml=>ml.id!==_currentManualLine.id);
+  _manualDirty=true;_updateDirtyDot();
+  bootstrap.Modal.getInstance(document.getElementById('manualLineModal')).hide();
+  drawChart();
+}
+
+async function saveManualLines(){
+  const reqDate=_graphDates[_graphDateIdx]||'';
+  if(!reqDate||!_manualLines.length){_manualDirty=false;_updateDirtyDot();return;}
+  const payload=_manualLines.map(ml=>({
+    symbol:_graphSym,date:reqDate,price:ml.price,
+    line_type:ml.type||'SUPPORT',label:ml.label||'',strength:8
+  }));
+  try{
+    await fetch('/api/lines/manual',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({lines:payload})});
+    _manualDirty=false;_updateDirtyDot();
+    refreshLines();
+  }catch(e){console.error(e);}
+}
+async function sendManualLines(){
+  await saveManualLines();
+  document.querySelector('[data-bs-target="#tab-trades"]').click();
+}
+
+function _unsavedSave(){
+  bootstrap.Modal.getInstance(document.getElementById('unsavedModal'))?.hide();
+  if(_unsavedOnSave)_unsavedOnSave();
+}
+function _unsavedDiscard(){
+  bootstrap.Modal.getInstance(document.getElementById('unsavedModal'))?.hide();
+  if(_unsavedOnDiscard)_unsavedOnDiscard();
+}
+
+// Tab-switch guard
+document.querySelectorAll('#mainTab .top-tab').forEach(btn=>{
+  btn.addEventListener('click',function(e){
+    if(!_manualDirty||_drawMode!=='draw')return;
+    const activeTarget=document.querySelector('#mainTab .top-tab.active')?.dataset?.bsTarget;
+    if(activeTarget!=='#tab-graph')return;
+    if(btn.dataset?.bsTarget==='#tab-graph')return;
+    e.preventDefault();e.stopImmediatePropagation();
+    const target=btn;
+    _unsavedOnSave=async()=>{await saveManualLines();target.click();};
+    _unsavedOnDiscard=()=>{_manualLines=[];_manualDirty=false;_updateDirtyDot();target.click();};
+    new bootstrap.Modal(document.getElementById('unsavedModal')).show();
+  },true);
 });
 
 // ── CREATE TRADES ─────────────────────────────────────────────────────────────
