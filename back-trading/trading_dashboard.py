@@ -1043,7 +1043,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
   </div>
   <span class="badge bg-info text-dark">:5003</span>
-  <span class="badge bg-secondary">v3.6</span>
+  <span class="badge bg-secondary">v3.7</span>
 </nav>
 
 <!-- Line detail modal -->
@@ -1094,7 +1094,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-trades">Create Trades</button></li>
   <li class="nav-item"><button class="nav-link" data-bs-toggle="tab" data-bs-target="#tab-submitted" id="btn-sub-tab">Submitted</button></li>
   <li class="nav-item ms-auto d-flex align-items-center pe-1">
-    <span class="badge bg-secondary">v3.6</span>
+    <span class="badge bg-secondary">v3.7</span>
   </li>
 </ul>
 
@@ -1512,20 +1512,42 @@ async function _pollBuildStatus(){
 
 function _renderBuildTable(log){
   const SYMS=['MES','MNQ','MYM','M2K'];
+  const HOLIDAYS=new Set([
+    '2026-01-01','2026-01-19','2026-02-16','2026-04-03',
+    '2026-05-25','2026-07-03','2026-09-07','2026-11-26','2026-12-25',
+    '2027-01-01','2027-01-18','2027-02-15','2027-04-02',
+    '2027-05-31','2027-07-05','2027-09-06','2027-11-25','2027-12-24'
+  ]);
   const byDate={};
   for(const e of log){if(!byDate[e.date])byDate[e.date]={};byDate[e.date][e.symbol]=e;}
-  const dates=Object.keys(byDate).sort().reverse();
-  const html=dates.map(d=>{
+  const rows=[];
+  const now=new Date();
+  for(let i=1;i<=14;i++){
+    const d=new Date(now);d.setDate(now.getDate()-i);
+    const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),dd=String(d.getDate()).padStart(2,'0');
+    rows.push(`${y}-${m}-${dd}`);
+  }
+  const html=rows.map(d=>{
+    const dow=new Date(d+'T12:00:00Z').getDay();
+    const isWeekend=dow===0||dow===6;
+    const isHoliday=HOLIDAYS.has(d);
+    if(isWeekend||isHoliday){
+      const tag=dow===6?'SAT':dow===0?'SUN':'HOL';
+      return`<tr style="opacity:0.25"><td class="text-muted">${d} <span class="badge bg-secondary" style="font-size:9px">${tag}</span></td>${SYMS.map(()=>'<td></td>').join('')}</tr>`;
+    }
+    const data=byDate[d];
+    const allNoCsv=data&&SYMS.every(s=>!data[s]||data[s].action==='no_csv');
+    const rowStyle=allNoCsv?'opacity:0.35':'';
     const cells=SYMS.map(sym=>{
-      const e=byDate[d]?.[sym];
-      if(!e)return'<td class="text-muted text-center">...</td>';
+      const e=data?.[sym];
+      if(!e)return'<td class="text-muted text-center small">—</td>';
       if(e.action==='done')  return`<td class="text-success text-center">+ ${e.count}</td>`;
       if(e.action==='skip')  return`<td class="text-muted text-center">~ ${e.count}</td>`;
-      if(e.action==='no_csv')return'<td class="text-warning text-center">no csv</td>';
-      if(e.action==='no_rth')return'<td class="text-warning text-center">no rth</td>';
+      if(e.action==='no_csv')return`<td class="text-center" style="color:#5a5020;opacity:0.6">no csv</td>`;
+      if(e.action==='no_rth')return`<td class="text-warning text-center">no rth</td>`;
       return'<td class="text-danger text-center">?</td>';
     }).join('');
-    return`<tr><td>${d}</td>${cells}</tr>`;
+    return`<tr style="${rowStyle}"><td>${d}</td>${cells}</tr>`;
   }).join('');
   document.getElementById('build-db-tbody').innerHTML=html;
 }
@@ -2124,6 +2146,10 @@ document.getElementById('btn-sub-tab').addEventListener('click',loadSubmitted);
   document.getElementById('range-from').value=lw;
   document.getElementById('range-to').value=lw;
   refreshLines();
+  _renderBuildTable([]);
+  fetch('/api/build_db/status').then(r=>r.json()).then(s=>{
+    if(s.log&&s.log.length)_renderBuildTable(s.log);
+  }).catch(()=>{});
 })();
 </script>
 </body>
