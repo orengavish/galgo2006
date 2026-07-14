@@ -1081,7 +1081,7 @@ body.busy-wait button,body.busy-wait input,body.busy-wait select{opacity:.55;}
     <span class="price-chip bg-secondary" id="chip-M2K">M2K —</span>
     <span class="text-muted ms-1" style="font-size:.75rem">Trading Dashboard</span>
     <span class="badge bg-info text-dark">:5003</span>
-    <span class="badge bg-secondary">v3.9</span>
+    <span class="badge bg-secondary">v3.10</span>
   </div>
 </div>
 
@@ -1903,7 +1903,7 @@ function buildBarsLineTraces(){
   return _visibleLines.map(l=>{
     const armed=l._armed!==undefined?l._armed:!!l.armed;
     const col=armed?(SOURCE_COLORS[l.source]||'#888'):'rgba(128,128,128,0.35)';
-    return{type:'scatter',mode:'lines',x:[l.price,l.price],y:[0,maxCount],
+    return{type:'scatter',mode:'lines',x:[0,maxCount],y:[l.price,l.price],
       line:{color:col,width:armed?3:1,dash:armed?'solid':'dot'},
       name:l.algo_type,showlegend:false,
       hovertemplate:`<b>${l.algo_type}</b> ${l.price.toFixed(2)}<extra></extra>`};
@@ -1915,8 +1915,8 @@ function buildBarsAnnotations(){
   return _chartLines.filter(l=>en.has(l.source)).map(l=>{
     const armed=l._armed!==undefined?l._armed:!!l.armed;
     const col=armed?(SOURCE_COLORS[l.source]||'#888'):'rgba(128,128,128,0.45)';
-    return{xref:'x',yref:'paper',x:l.price,y:1.0,text:l.algo_type,
-      showarrow:false,textangle:-90,xanchor:'center',yanchor:'top',font:{size:8,color:col}};
+    return{xref:'paper',yref:'y',x:1,y:l.price,text:l.algo_type,
+      showarrow:false,xanchor:'right',font:{size:9,color:col}};
   });
 }
 
@@ -2011,19 +2011,22 @@ function drawBarsMode(){
   const counts=_barsProfile.map(p=>p.count);
   const priceMin=Math.min(...prices);
   const priceMax=Math.max(...prices);
-  const xPad=(priceMax-priceMin)*0.05||1;
-  _graphNaturalXRange=[priceMin-xPad,priceMax+xPad];
-  const barTrace={type:'bar',x:prices,y:counts,
+  const pricePad=(priceMax-priceMin)*0.05||1;
+  const countMax=Math.max(...counts,1);
+  const countPad=countMax*0.05;
+  _graphNaturalXRange=[0,countMax+countPad];
+  _graphNaturalYRange=[priceMin-pricePad,priceMax+pricePad];
+  const barTrace={type:'bar',orientation:'h',x:counts,y:prices,
     marker:{color:'#4e79a7',opacity:0.75},showlegend:false,
-    hovertemplate:'%{x:.2f}: %{y} ticks<extra></extra>'};
+    hovertemplate:'%{y:.2f}: %{x} ticks<extra></extra>'};
   const lineTraces=_drawMode==='draw'
     ?[...buildAutoGrayTraces(null),...buildManualTraces(null)]
     :buildBarsLineTraces();
   const annotations=_drawMode==='draw'?[]:buildBarsAnnotations();
   const layout={paper_bgcolor:'#1a1a2e',plot_bgcolor:'#1a1a2e',
     font:{color:'#ccc'},margin:{l:55,r:10,t:10,b:40},bargap:0.05,
-    xaxis:{range:_graphNaturalXRange,gridcolor:'#333',title:{text:'Price',font:{size:10}}},
-    yaxis:{gridcolor:'#333',title:{text:'Ticks',font:{size:10}}},
+    xaxis:{range:_graphNaturalXRange,gridcolor:'#333',title:{text:'Ticks',font:{size:10}}},
+    yaxis:{range:_graphNaturalYRange,gridcolor:'#333',title:{text:'Price',font:{size:10}}},
     annotations,showlegend:false,dragmode:'zoom'};
   _applyZoom(layout);
   Plotly.newPlot('chart',[barTrace,...lineTraces],layout,{responsive:true,displayModeBar:false,doubleClick:false});
